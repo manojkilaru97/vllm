@@ -322,74 +322,63 @@ class OpenAIServingChat(OpenAIServing):
         delta_text: str,
         function_name_returned: bool,
     ) -> tuple[Optional[DeltaMessage], bool]:
+        # BUFFERING APPROACH: Wait until we have a complete tool call before sending
+        # This provides consistent experience with auto tool choice
+        
         try:
             obj = partial_json_parser.loads(current_text)
         except partial_json_parser.core.exceptions.MalformedJSON:
-            logger.debug('not enough tokens to parse into JSON yet')
-            obj = None
+            logger.debug('not enough tokens to parse into JSON yet - buffering')
+            # Still building the JSON, don't send anything yet
+            return None, function_name_returned
 
         # check if the current text is a valid array
         # containing a partial tool calling object
-        # if not repeat
+        # if not, continue buffering
         if obj is None or not isinstance(obj, list) or not len(obj) > 0:
-            function_name_returned = False
-            delta_message = None
+            logger.debug('Invalid or incomplete tool call structure - buffering')
+            return None, function_name_returned
+        
+        # take the last tool call from the generated list
+        current_tool_call = obj[-1]
+        
+        # Check if we have a complete tool call (both name and parameters)
+        if "name" not in current_tool_call or "parameters" not in current_tool_call:
+            logger.debug('Tool call missing name or parameters - buffering')
+            return None, function_name_returned
+        
+        # We have a complete tool call! Send it all at once
+        if not function_name_returned:
+            # This is the first time we're sending this tool call
+            function_name_returned = True
+            
+            # Extract the complete arguments
+            try:
+                # Get the complete parameters as a JSON string
+                arguments = json.dumps(current_tool_call["parameters"], ensure_ascii=False)
+            except (TypeError, ValueError) as e:
+                logger.debug(f'Failed to serialize tool call parameters: {e} - buffering')
+                return None, function_name_returned
+            
+            # Send the complete tool call with name, arguments, and ID
+            delta_message = DeltaMessage(tool_calls=[
+                DeltaToolCall(
+                    id=random_tool_call_id(),
+                    function=DeltaFunctionCall(
+                        name=current_tool_call["name"],
+                        arguments=arguments
+                    ),
+                    index=len(obj) - 1,
+                    type="function"
+                )
+            ])
+            
+            logger.debug(f'Sending complete tool call: name={current_tool_call["name"]}, args={arguments}')
+            return delta_message, function_name_returned
         else:
-            _, finishes_previous_tool = OpenAIServingChat._filter_delta_text(
-                delta_text, previous_text)
-            # take the last tool call from the generated list
-            current_tool_call = obj[-1]
-
-            # once parameters have been generated the name is complete as well
-            if not finishes_previous_tool and ("name" not in current_tool_call
-                                               or "parameters"
-                                               not in current_tool_call):
-                function_name_returned = False
-                delta_message = None
-            else:
-                if not function_name_returned:
-                    # get partly generated arguments from the latest tool call
-                    param_match = re.search(r'.*"parameters":\s*(.*)',
-                                            current_text)
-                    arguments = param_match.group(1) if param_match else ""
-                    arguments, _ = OpenAIServingChat._filter_delta_text(
-                        arguments, previous_text)
-
-                    # if this iteration finishes a previous tool call but a
-                    # new incomplete tool is already generated, take the
-                    # previous from the list
-                    if (finishes_previous_tool
-                            and "parameters" not in current_tool_call):
-                        current_tool_call = obj[-2]
-
-                    function_name_returned = True
-                    delta_message = DeltaMessage(tool_calls=[
-                        DeltaToolCall(id=random_tool_call_id(),
-                                      function=DeltaFunctionCall(
-                                          name=current_tool_call["name"],
-                                          arguments=arguments),
-                                      index=len(obj) - 1,
-                                      type="function")
-                    ])
-
-                else:
-                    delta_text, _ = OpenAIServingChat._filter_delta_text(
-                        delta_text, previous_text)
-
-                    if delta_text != "":
-                        delta_message = DeltaMessage(tool_calls=[
-                            DeltaToolCall(
-                                function=DeltaFunctionCall(
-                                    # OpenAI API returns None
-                                    # instead of name every time
-                                    name=None,
-                                    arguments=delta_text),
-                                index=len(obj) - 1)
-                        ])
-                    else:
-                        delta_message = None
-
-        return delta_message, function_name_returned
+            # Tool call already sent, don't send fragments
+            logger.debug('Tool call already sent completely - skipping fragments')
+            return None, function_name_returned
 
     async def chat_completion_stream_generator(
         self,
@@ -439,6 +428,10 @@ class OpenAIServingChat(OpenAIServing):
             all_previous_token_ids = None
         else:
             previous_texts, all_previous_token_ids = None, None
+
+        # Initialize per-request buffering state for named tool choices
+        named_tool_choice_buffers = [""] * num_choices  # Buffer for named tool choice
+        named_tool_choice_sent = [False] * num_choices  # Track if complete tool call was sent
 
         try:
             if self.reasoning_parser:
@@ -592,6 +585,43 @@ class OpenAIServingChat(OpenAIServing):
 
                     # handle streaming deltas for tools with named tool_choice
                     if tool_choice_function_name:
+                        # BUFFERING APPROACH for named tool choice: accumulate text until we have complete JSON
+                        named_tool_choice_buffers[i] += delta_text
+                        
+                        if not named_tool_choice_sent[i]:
+                            # Try to parse the accumulated buffer as JSON
+                            try:
+                                # Look for complete JSON structure: {"a": value, "b": value}
+                                buffer = named_tool_choice_buffers[i].strip()
+                                
+                                # Try to parse as complete JSON
+                                parsed_args = json.loads(buffer)
+                                
+                                # We have complete JSON! Send it all at once
+                                logger.debug(f'Named tool choice: sending complete args for {tool_choice_function_name}: {buffer}')
+                                
+                                delta_tool_call = DeltaToolCall(
+                                    id=random_tool_call_id(),
+                                    type="function",
+                                    function=DeltaFunctionCall(
+                                        name=tool_choice_function_name,
+                                        arguments=buffer
+                                    ),
+                                    index=i
+                                )
+                                
+                                delta_message = DeltaMessage(tool_calls=[delta_tool_call])
+                                named_tool_choice_sent[i] = True
+                                
+                            except (json.JSONDecodeError, ValueError):
+                                # JSON not complete yet, continue buffering
+                                logger.debug(f'Named tool choice: JSON not complete yet, buffering. Current: {repr(buffer[:50])}...')
+                                delta_message = None
+                        else:
+                            # Already sent the complete tool call, ignore fragments
+                            logger.debug('Named tool choice: complete tool call already sent, skipping fragments')
+                            delta_message = None
+
                         if (self.reasoning_parser
                                 and not reasoning_parser.is_reasoning_end(
                                     previous_token_ids)):
@@ -617,30 +647,6 @@ class OpenAIServingChat(OpenAIServing):
                                     delta_message.content = None
                                 else:
                                     current_text = ""
-                        else:
-                            # Just to add remaining `content`
-                            if self.reasoning_parser:
-                                delta_text = previous_text + delta_text
-                                current_text = ""
-
-                            if function_name_returned[i]:
-                                delta_tool_call = DeltaToolCall(
-                                    function=DeltaFunctionCall(
-                                        arguments=delta_text),
-                                    index=i)
-                            else:
-                                delta_tool_call = DeltaToolCall(
-                                    id=random_tool_call_id(),
-                                    type="function",
-                                    function=DeltaFunctionCall(
-                                        name=tool_choice_function_name,
-                                        arguments=delta_text),
-                                    index=i)
-                                function_name_returned[i] = True
-
-                            delta_message = DeltaMessage(tool_calls=[
-                                delta_tool_call,
-                            ])
 
                     elif request.tool_choice == "required":
                         assert previous_texts is not None
