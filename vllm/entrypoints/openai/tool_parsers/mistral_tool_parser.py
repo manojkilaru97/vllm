@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import re
 from collections.abc import Sequence
 from random import choices
 from string import ascii_letters, digits
 from typing import Union
+from json import JSONDecodeError
 
 import partial_json_parser
-import regex as re
 from partial_json_parser.core.options import Allow
 from pydantic import Field
 
@@ -79,6 +80,9 @@ class MistralToolParser(ToolParser):
                 "Mistral Tool Parser could not locate the tool call token in "
                 "the tokenizer!")
 
+        self.streaming_tool_call_active = False
+        self.streaming_tool_call_buffer = ""
+
     def adjust_request(
             self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         if not isinstance(
@@ -133,7 +137,7 @@ class MistralToolParser(ToolParser):
                 # NOTE: This use case should not happen if the model is trained
                 # correctly. It's a easy possible fix so it's included, but
                 # can be brittle for very complex / highly nested tool calls
-                print(tool_content)
+                logger.debug("Tool content failed to parse; attempting regex fallback. Raw tool_content: %s", tool_content)
                 raw_tool_call = self.tool_call_regex.findall(tool_content)[0]
                 function_call_arr = json.loads(raw_tool_call)
 
@@ -174,21 +178,64 @@ class MistralToolParser(ToolParser):
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
 
-        # if the tool call token is not in the tokens generated so far, append
-        # output to contents since it's not a tool
-        if self.bot_token not in current_text:
-            return DeltaMessage(content=delta_text)
+        # Phase 1: Determine if we are in tool call mode and update buffer.
+        if not self.streaming_tool_call_active:
+            if self.bot_token_id in delta_token_ids:
+                # Transitioning to tool call mode
+                self.streaming_tool_call_active = True
+                self.prev_tool_call_arr = []
+                self.current_tool_id = -1
+                self.current_tool_name_sent = False
+                self.streamed_args_for_tool = []
+                
+                # Initialize the buffer.
+                # current_text includes the current delta.
+                if self.bot_token in current_text:
+                    # Get text after the LAST occurrence of bot_token.
+                    buffer_candidate = current_text.rsplit(self.bot_token, 1)[-1]
+                else:
+                    # bot_token_id was in delta_token_ids, but the string [TOOL_CALLS]
+                    # isn't in current_text. delta_text is the best candidate.
+                    buffer_candidate = delta_text
+                
+                # If this initial buffer_candidate starts with bot_token, remove it.
+                if buffer_candidate.startswith(self.bot_token):
+                    self.streaming_tool_call_buffer = buffer_candidate[len(self.bot_token):]
+                else:
+                    self.streaming_tool_call_buffer = buffer_candidate
+                
+                logger.debug(f"Tool mode activated. Initialized buffer: '{self.streaming_tool_call_buffer}'")
 
-        # if the tool call token ID IS in the tokens generated so far, that
-        # means we're parsing as tool calls now
+            else:
+                # Not in tool call mode and not transitioning.
+                return DeltaMessage(content=delta_text)
+        else: # self.streaming_tool_call_active is True
+            # Already in tool call mode, so append delta_text.
+            self.streaming_tool_call_buffer += delta_text
+            logger.debug(f"Appending to buffer: '{delta_text}'. Current buffer: '{self.streaming_tool_call_buffer}'")
 
-        # handle if we detected the BOT token which means the start of tool
-        # calling
-        if (self.bot_token_id in delta_token_ids
-                and len(delta_token_ids) == 1):
-            # if it's the only token, return None, so we don't send a chat
-            # completion any don't send a control token
+        # Phase 2: Process the buffer (if in tool call mode)
+        # The check for active streaming mode is implicitly handled by reaching here.
+        # If not active, the first block would have returned DeltaMessage.
+
+        # Add this check:
+        if not self.streaming_tool_call_buffer.strip():
+            logger.debug(
+                "Streaming buffer is empty or all whitespace, waiting for "
+                "more tokens.")
             return None
+
+        # Ensure the buffer looks like JSON before attempting to parse.
+        stripped_buf = self.streaming_tool_call_buffer.lstrip()
+        if self.fn_name_regex is None and stripped_buf and stripped_buf[0] not in "[{":
+            # It might be in the `name{` format or still incomplete. Wait for more tokens.
+            logger.debug(
+                "Buffer does not yet start with '[' or '{' (and fn_name_regex is None). Current head: '%s'. Waiting for more tokens.",
+                stripped_buf[:20])
+            return None
+
+        # The rest of the method will use self.streaming_tool_call_buffer
+        # instead of current_text.split(self.bot_token)[-1]
 
         # bit mask flags for partial JSON parsing. If the name hasn't been
         # sent yet, don't allow sending
@@ -197,162 +244,159 @@ class MistralToolParser(ToolParser):
         flags = Allow.ALL if self.current_tool_name_sent \
             else Allow.ALL & ~Allow.STR
         try:
+            parsable_text_for_json = self.streaming_tool_call_buffer
+            # Optional: Handle single quotes if Mistral uses them and partial_json_parser needs double
+            # parsable_text_for_json = self.streaming_tool_call_buffer.replace("'", "\"")
 
-            # replace BOT token with empty string, and convert single quotes
-            # to double to allow parsing as JSON since mistral uses single
-            # quotes instead of double for tool calls
-            parsable_arr = current_text.split(self.bot_token)[-1]
-
-            # tool calls are generated in an array, so do partial JSON
-            # parsing on the entire array
             try:
                 tool_call_arr: list[dict] = partial_json_parser.loads(
-                    parsable_arr, flags)
-            except partial_json_parser.core.exceptions.MalformedJSON:
-                logger.debug('not enough tokens to parse into JSON yet')
-                return None
+                    parsable_text_for_json, flags)
+            except (partial_json_parser.core.exceptions.MalformedJSON, JSONDecodeError) as e:
+                logger.debug(f"partial_json_parser.loads failed: {e}. Attempting regex fallback if enabled.")
+                # Attempt fallback parsing using the `fn_name_regex` pattern if available.
+                if self.fn_name_regex is not None:
+                    matches = self.fn_name_regex.findall(parsable_text_for_json)
+                    function_call_arr: list[dict] = []
+                    for match in matches:
+                        fn_name, args_str = match
+                        try:
+                            args_json = json.loads(args_str)
+                        except JSONDecodeError:
+                            # Arguments JSON is incomplete; wait for more tokens.
+                            logger.debug("Arguments for %s not yet complete ('%s'), waiting for more tokens.", fn_name, args_str)
+                            return None
+                        function_call_arr.append({"name": fn_name, "arguments": args_json})
+                    if function_call_arr:
+                        tool_call_arr = function_call_arr
+                    else:
+                        # No complete function calls parsed yet.
+                        logger.debug("Regex fallback: No complete function calls parsed yet. Returning None.")
+                        return None
+                else:
+                    logger.debug("fn_name_regex is None. Cannot use fallback. Returning None.")
+                    return None
 
             # select as the current tool call the one we're on the state at
+            # This definition of current_tool_call is for the general state after parsing.
+            # Specific blocks might need to re-evaluate based on current_tool_id.
 
-            current_tool_call: dict = tool_call_arr[self.current_tool_id] \
-                if len(tool_call_arr) > 0 else {}
+            # Storing the result of the latest parse. This will be copied to self.prev_tool_call_arr before returning or at the end.
+            latest_parsed_tool_arr = list(tool_call_arr)
 
-            # case -- if no tokens have been streamed for the tool, e.g.
-            #   only the array brackets, stream nothing
-            if len(tool_call_arr) == 0:
-                return None
+            # Block 1: Handling start of a new tool in the array, or transition between tools
+            if len(latest_parsed_tool_arr) > 0 and len(latest_parsed_tool_arr) > self.current_tool_id + 1:
+                delta_for_leaving_previous_tool = None
+                if self.current_tool_id >= 0: # If there was a previous tool active
+                    if self.current_tool_id < len(self.prev_tool_call_arr) and self.current_tool_id < len(latest_parsed_tool_arr):
+                        # Check if the previous tool's arguments were already fully sent by a combined delta.
+                        # If self.streamed_args_for_tool[self.current_tool_id] is non-empty, it implies we've sent args.
+                        # We only need to flush if latest_parsed_tool_arr has *more* args for it.
+                        prev_tool_complete_args_json = json.dumps(self.prev_tool_call_arr[self.current_tool_id].get("arguments", {}), ensure_ascii=False)
+                        current_args_for_prev_tool_json = json.dumps(latest_parsed_tool_arr[self.current_tool_id].get("arguments", {}), ensure_ascii=False)
+                        
+                        # We want to find what's new in current_args_for_prev_tool_json compared to what was *last known for this tool in prev_tool_call_arr*.
+                        # The extract_intermediate_diff is designed for prev_args_json to be a SUBSET.
+                        # If we sent a combined call, self.streamed_args_for_tool holds the full args.
+                        # Let's use extract_intermediate_diff based on what was last parsed for that tool vs current.
+                        
+                        argument_diff_for_flush = extract_intermediate_diff(current_args_for_prev_tool_json, prev_tool_complete_args_json)
 
-            # case: we are starting a new tool in the array
-            #   -> array has > 0 length AND length has moved past cursor
-            elif (len(tool_call_arr) > 0
-                  and len(tool_call_arr) > self.current_tool_id + 1):
-
-                # if we're moving on to a new call, first make sure we
-                # haven't missed anything in the previous one that was
-                # auto-generated due to JSON completions, but wasn't
-                # streamed to the client yet.
-                if self.current_tool_id >= 0:
-                    diff: Union[str, None] = current_tool_call.get("arguments")
-
-                    if diff:
-                        diff = json.dumps(diff, ensure_ascii=False).replace(
-                            self.streamed_args_for_tool[self.current_tool_id],
-                            "")
-                        delta = DeltaMessage(tool_calls=[
-                            DeltaToolCall(index=self.current_tool_id,
-                                          function=DeltaFunctionCall(
-                                              arguments=diff).model_dump(
-                                                  exclude_none=True))
-                        ])
-                        self.streamed_args_for_tool[
-                            self.current_tool_id] += diff
+                        if argument_diff_for_flush:
+                            # Only flush if the diff is not what we already claim to have streamed.
+                            # This avoids re-sending if the combined delta already sent everything.
+                            # However, this check is tricky. The most straightforward is to send any diff if the structures differ.
+                            logger.debug("Flushing arguments for previous tool %d: %s", self.current_tool_id, argument_diff_for_flush)
+                            delta_for_leaving_previous_tool = DeltaMessage(tool_calls=[
+                                DeltaToolCall(index=self.current_tool_id,
+                                              # ID is not resent for just arg updates typically
+                                              function=DeltaFunctionCall(arguments=argument_diff_for_flush).model_dump(exclude_none=True))
+                            ])
+                            self.streamed_args_for_tool[self.current_tool_id] += argument_diff_for_flush # Append delta
+                        else:
+                            logger.debug(f"  No new argument_diff to flush for previous tool {self.current_tool_id}.")
                     else:
-                        delta = None
+                        logger.debug(f"  Skipping flush for tool {self.current_tool_id}: index out of bounds for prev_tool_call_arr (len {len(self.prev_tool_call_arr)}) or latest_parsed_tool_arr (len {len(latest_parsed_tool_arr)}).")
+
+                # Update state for the NEW tool
+                self.current_tool_id = len(latest_parsed_tool_arr) - 1
+                self.current_tool_name_sent = False # Reset for the new tool
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+                self.streamed_args_for_tool[self.current_tool_id] = "" # Reset for new tool
+
+                logger.debug(f"Transitioned to new tool index {self.current_tool_id}. Name sent: {self.current_tool_name_sent}. Streamed args for new tool reset.")
+
+                if delta_for_leaving_previous_tool:
+                    logger.debug(f"Returning delta for leaving/flushing previous tool: {delta_for_leaving_previous_tool}")
+                    self.prev_tool_call_arr = list(latest_parsed_tool_arr) # Reflect the parse that led to this flush
+                    return delta_for_leaving_previous_tool
+                logger.debug("No delta for previous tool, falling through to process new tool's name/args.")
+
+            # Block 2: Mark name as seen (no delta sending here)
+            if self.current_tool_id != -1 and not self.current_tool_name_sent:
+                if self.current_tool_id < len(latest_parsed_tool_arr):
+                    current_tool_obj_for_name_check = latest_parsed_tool_arr[self.current_tool_id]
+                    function_name_found = current_tool_obj_for_name_check.get("name")
+                    if function_name_found:
+                        self.current_tool_name_sent = True
+                        logger.debug(f"  Name '{function_name_found}' found for tool {self.current_tool_id}. Marking current_tool_name_sent=True. No delta sent here.")
+                        # DO NOT return here, fall through to Block 3 to attempt combined send.
+                        # DO NOT update self.prev_tool_call_arr here yet.
+                    else:
+                        logger.debug(f"  Function name is None for tool {self.current_tool_id} in current parse. Waiting for more tokens for name.")
                 else:
-                    delta = None
-                # re-set stuff pertaining to progress in the current tool
-                self.current_tool_id = len(tool_call_arr) - 1
-                self.current_tool_name_sent = False
-                self.streamed_args_for_tool.append("")
-                logger.debug("starting on new tool %d", self.current_tool_id)
-                return delta
+                    logger.debug(f"  current_tool_id {self.current_tool_id} is out of bounds for latest_parsed_tool_arr (len {len(latest_parsed_tool_arr)}) for name check. Waiting for more tokens.")
 
-            # case: update an existing tool - this is handled below
+            # Block 3: Sending combined arguments and name for the current tool_id
+            if self.current_tool_id != -1 and self.current_tool_name_sent:
+                # Check if we have already sent this tool's combined information
+                if not self.streamed_args_for_tool[self.current_tool_id]: # If empty, means we haven't sent args/combined for this tool yet
+                    if self.current_tool_id < len(latest_parsed_tool_arr):
+                        current_tool_obj = latest_parsed_tool_arr[self.current_tool_id]
+                        
+                        function_name = current_tool_obj.get("name")
+                        arguments_obj = current_tool_obj.get("arguments")
 
-            # if the current tool name hasn't been sent, send if available
-            # - otherwise send nothing
-            if not self.current_tool_name_sent:
-                function_name = current_tool_call.get("name")
-                if function_name:
-
-                    delta = DeltaMessage(tool_calls=[
-                        DeltaToolCall(index=self.current_tool_id,
-                                      type="function",
-                                      id=MistralToolCall.generate_random_id(),
-                                      function=DeltaFunctionCall(
-                                          name=function_name).model_dump(
-                                              exclude_none=True))
-                    ])
-                    self.current_tool_name_sent = True
+                        # We need both name and arguments to be considered "complete" by the parser for a combined send.
+                        # The fn_name_regex path ensures 'arguments' is complete JSON.
+                        # partial_json_parser with Allow.STR for args might give partial strings.
+                        # For this combined send, we rely on `arguments_obj` being the fully intended structure.
+                        if function_name and arguments_obj is not None: # arguments_obj can be {} for no args.
+                            
+                            tool_id_for_delta = MistralToolCall.generate_random_id()
+                            arguments_json_str = json.dumps(arguments_obj, ensure_ascii=False)
+                            
+                            logger.debug(f"Sending COMBINED delta for tool {self.current_tool_id}: Name='{function_name}', Args='{arguments_json_str}', ID='{tool_id_for_delta}'")
+                            combined_delta = DeltaMessage(tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_id,
+                                    id=tool_id_for_delta,
+                                    type="function",
+                                    function=DeltaFunctionCall(name=function_name, arguments=arguments_json_str).model_dump(exclude_none=True)
+                                )
+                            ])
+                            
+                            self.streamed_args_for_tool[self.current_tool_id] = arguments_json_str # Mark full args as streamed
+                            self.prev_tool_call_arr = list(latest_parsed_tool_arr)
+                            return combined_delta
+                        else:
+                            logger.debug(f"  Name or arguments not sufficiently complete/present for tool {self.current_tool_id} to send combined delta this cycle. Name: '{function_name}', Args: '{arguments_obj}'. Waiting for more tokens.")
+                    else:
+                        logger.debug(f"  current_tool_id {self.current_tool_id} is out of bounds for latest_parsed_tool_arr (len {len(latest_parsed_tool_arr)}) for combined delta. Waiting for more tokens.")
                 else:
-                    delta = None
-
-            # now we know we're on the same tool call and we're streaming
-            # arguments
-            else:
-
-                prev_arguments = self.prev_tool_call_arr[
-                    self.current_tool_id].get("arguments")
-                cur_arguments = current_tool_call.get("arguments")
-
-                new_text = delta_text.replace("\'", "\"")
-                if ('"}' in new_text):
-                    new_text = new_text[:new_text.rindex('"}')]
-
-                if not cur_arguments and not prev_arguments:
-
-                    delta = None
-                elif not cur_arguments and prev_arguments:
-                    logger.error(
-                        "INVARIANT - impossible to have arguments reset "
-                        "mid-arguments")
-                    delta = None
-                elif cur_arguments and not prev_arguments:
-                    cur_arguments_json = json.dumps(cur_arguments,
-                                                    ensure_ascii=False)[:-2]
-                    logger.debug("finding %s in %s", new_text,
-                                 cur_arguments_json)
-
-                    if (new_text not in cur_arguments_json):
-                        return None
-                    arguments_delta = cur_arguments_json[:cur_arguments_json.
-                                                         rindex(new_text) +
-                                                         len(new_text)]
-                    logger.debug("First tokens in arguments received: %s",
-                                 arguments_delta)
-                    delta = DeltaMessage(tool_calls=[
-                        DeltaToolCall(index=self.current_tool_id,
-                                      function=DeltaFunctionCall(
-                                          arguments=arguments_delta).
-                                      model_dump(exclude_none=True))
-                    ])
-                    self.streamed_args_for_tool[
-                        self.current_tool_id] += arguments_delta
-
-                elif cur_arguments and prev_arguments:
-                    cur_args_json = json.dumps(cur_arguments,
-                                               ensure_ascii=False)
-                    prev_args_json = json.dumps(prev_arguments,
-                                                ensure_ascii=False)
-                    logger.debug("Searching for diff between \n%s\n%s",
-                                 cur_args_json, prev_args_json)
-
-                    argument_diff = extract_intermediate_diff(
-                        cur_args_json, prev_args_json)
-                    logger.debug("got arguments diff: %s", argument_diff)
-                    delta = DeltaMessage(tool_calls=[
-                        DeltaToolCall(index=self.current_tool_id,
-                                      function=DeltaFunctionCall(
-                                          arguments=argument_diff).model_dump(
-                                              exclude_none=True))
-                    ])
-                    self.streamed_args_for_tool[
-                        self.current_tool_id] += argument_diff
-                else:
-                    # try parsing it with regular JSON - if it works we're
-                    # at the end, and we need to send the difference between
-                    # tokens streamed so far and the valid JSON
-                    delta = None
-
-            # check to see if the name is defined and has been sent. if so,
-            # stream the name - otherwise keep waiting
-            # finish by setting old and returning None as base case
-            self.prev_tool_call_arr = tool_call_arr
-            return delta
+                    logger.debug(f"  Arguments for tool {self.current_tool_id} already streamed ('{self.streamed_args_for_tool[self.current_tool_id]}'). Not sending combined delta again. Waiting for more tokens or new tool.")
+            
+            # If no specific delta was generated and returned by the blocks above
+            self.prev_tool_call_arr = list(latest_parsed_tool_arr) # Update prev_tool_call_arr to current parse if nothing was sent
+            logger.debug("No new tool call delta to send this cycle (after all blocks). prev_tool_call_arr updated. Returning None.")
+            return None
 
         except Exception:
             logger.exception("Error trying to handle streaming tool call.")
             logger.debug(
                 "Skipping chunk as a result of tool streaming extraction "
-                "error")
+                "error. Buffer was: '%s'", self.streaming_tool_call_buffer) # Log buffer on error
+            # Optionally, reset state if error is unrecoverable for current stream.
+            # self.streaming_tool_call_active = False
+            # self.streaming_tool_call_buffer = ""
             return None
