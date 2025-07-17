@@ -1146,7 +1146,7 @@ class ModelConfig:
             return self.hf_text_config.head_dim
 
         # FIXME(woosuk): This may not be true for all models.
-        if self.hf_text_config.attention_head_dim is not None:
+        if "attention_head_dim" in self.hf_text_config:
             return self.hf_text_config.attention_head_dim
         else:
             return (self.hf_text_config.hidden_size //
