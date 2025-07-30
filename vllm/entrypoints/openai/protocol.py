@@ -6,7 +6,7 @@
 import json
 import time
 from http import HTTPStatus
-from typing import Annotated, Any, ClassVar, Literal, Optional, Union, List
+from typing import Annotated, Any, ClassVar, Literal, Optional, Union, Tuple
 
 import regex as re
 import torch
@@ -194,13 +194,14 @@ class ThinkingLogitsProcessor:
     """A logits processor that limit the number of thinking tokens."""
 
     def __init__(self, max_tokens: int, min_tokens: int):
-        self.is_thinking_done = False
+        self.is_done = False
+        self.is_running = False
         self.max_tokens = max_tokens
         self.min_tokens = min_tokens
 
     def __call__(
         self,
-        input_ids: List[int],
+        input_ids: Tuple[int, ...],
         logits: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -213,26 +214,31 @@ class ThinkingLogitsProcessor:
         Returns:
             Processed logits tensor.
         """
-        if not self.is_thinking_done:
-            if len(input_ids) >= self.min_tokens:
-                if input_ids[-1] in NEWLINE_TOKENS or len(input_ids) >= self.max_tokens:
-                    # "</think>\n\n" is [1885, 74045, 3318]
-                    # 1. first we force </
-                    # 2. then we force think>
-                    # 3. finally we force \n\n
 
-                    logits = torch.full_like(logits, float('-inf'))
+        if not self.is_done:
+            if len(input_ids) >= 3 and input_ids[-3:] == (1885, 74045, 3318):
+                self.is_done = True
+                self.is_running = False
+            elif len(input_ids) >= self.min_tokens and (input_ids[-1] in NEWLINE_TOKENS or len(input_ids) == self.max_tokens):
+                self.is_running = True
 
-                    # state 2
-                    if input_ids[-1] == 1885:
-                        logits[74045] = 1.0
-                    # state 3
-                    elif input_ids[-1] == 74045:
-                        logits[3318] = 1.0
-                        self.is_thinking_done = True
-                    # state 1
-                    else:
-                        logits[1885] = 1.0
+        if self.is_running:
+            # "</think>\n\n" is [1885, 74045, 3318]
+            # 1. first we force </
+            # 2. then we force think
+            # 3. finally we force >\n\n
+
+            logits = torch.full_like(logits, float('-inf'))
+
+            # state 2
+            if input_ids[-1] == 1885:
+                logits[74045] = 1.0
+            # state 3
+            elif input_ids[-1] == 74045:
+                logits[3318] = 1.0
+            # state 1
+            else:
+                logits[1885] = 1.0
 
         return logits
 
