@@ -180,10 +180,43 @@ class VideoMediaIO(MediaIO[npt.NDArray]):
         video_loader_backend = envs.VLLM_VIDEO_LOADER_BACKEND
         self.video_loader = VIDEO_LOADER_REGISTRY.load(video_loader_backend)
 
+    def _overlay_timestamps(self, frames: npt.NDArray, fps: float) -> npt.NDArray:
+        """Overlay running timestamp on each frame with a black border."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            return frames  # Pillow not available – skip
+
+        border_h = 28  # match patch size
+        font_size = 20
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        processed = []
+        for idx, frame in enumerate(frames):
+            pil = Image.fromarray(frame)
+            w, h = pil.size
+            new_img = Image.new("RGB", (w, h + border_h), color="black")
+            new_img.paste(pil, (0, 0))
+            draw = ImageDraw.Draw(new_img)
+            timestamp = f"{idx / fps:.2f}s"
+            text_w, text_h = draw.textsize(timestamp, font=font)
+            text_x = (w - text_w) // 2
+            text_y = h + (border_h - text_h) // 2
+            draw.text((text_x, text_y), timestamp, fill="white", font=font)
+            processed.append(np.asarray(new_img))
+        return np.stack(processed, axis=0)
+
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray, dict[str, Any]]:
-        return self.video_loader.load_bytes(data,
-                                            num_frames=self.num_frames,
-                                            **self.kwargs)
+        frames, meta = self.video_loader.load_bytes(data,
+                                                    num_frames=self.num_frames,
+                                                    **self.kwargs)
+        if self.kwargs.get("add_timestamps"):
+            fps_val = self.kwargs.get("fps", meta.get("fps", 1))
+            frames = self._overlay_timestamps(frames, fps_val)
+        return frames, meta
 
     def load_base64(self, media_type: str,
                     data: str) -> tuple[npt.NDArray, dict[str, Any]]:

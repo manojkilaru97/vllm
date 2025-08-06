@@ -172,6 +172,23 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        # Register NVCF assets (videos/images) if provided via request headers.
+        if raw_request is not None:
+            headers = raw_request.headers
+            if "NVCF-ASSET-DIR" in headers and "NVCF-FUNCTION-ASSET-IDS" in headers:
+                from pathlib import Path
+                from vllm.multimodal.utils import MediaConnector
+                nvcf_asset_dir = Path(headers["NVCF-ASSET-DIR"])
+                if not (nvcf_asset_dir.exists() and nvcf_asset_dir.is_dir()):
+                    raise RuntimeError(
+                        f"NVCF asset directory {nvcf_asset_dir} does not exist or is not a directory.")
+                asset_ids = [aid.strip() for aid in headers["NVCF-FUNCTION-ASSET-IDS"].split(",") if aid.strip()]
+                MediaConnector.set_default_nvcf_assets({aid: nvcf_asset_dir / aid for aid in asset_ids})
+            else:
+                # Clear the default assets if not provided in the current request.
+                from vllm.multimodal.utils import MediaConnector as _MC
+                _MC.set_default_nvcf_assets(None)
+
         try:
             lora_request = self._maybe_get_adapters(
                 request, supports_default_mm_loras=True)
@@ -181,6 +198,18 @@ class OpenAIServingChat(OpenAIServing):
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
             tool_parser = self.tool_parser
+
+            # Per-request MM processor overrides (fps, max_pixels)
+            if (hasattr(request, 'fps') and request.fps is not None) or (
+                hasattr(request, 'max_pixels') and request.max_pixels is not None):
+                mm_kwargs = dict(request.mm_processor_kwargs or {})
+                if getattr(request, 'fps', None) is not None:
+                    mm_kwargs['fps'] = request.fps
+                if getattr(request, 'max_pixels', None) is not None:
+                    mm_kwargs['max_pixels'] = request.max_pixels
+                if getattr(request, 'add_timestamps', None):
+                    mm_kwargs['add_timestamps'] = True
+                request.mm_processor_kwargs = mm_kwargs
 
             if isinstance(tokenizer, MistralTokenizer):
                 # because of issues with pydantic we need to potentially

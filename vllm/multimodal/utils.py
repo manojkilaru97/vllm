@@ -36,12 +36,24 @@ else:
 
 class MediaConnector:
 
+    _default_nvcf_assets: Optional[dict[str, Path]] = None
+
+    @classmethod
+    def set_default_nvcf_assets(cls, assets: Optional[dict[str, Path]]):
+        """Set the default NVCF assets mapping for all MediaConnector
+        instances. This function can be called by higher level serving
+        components (e.g. API server) when they parse the request headers for
+        NVCF assets.
+        """
+        cls._default_nvcf_assets = assets
+
     def __init__(
         self,
         media_io_kwargs: Optional[dict[str, dict[str, Any]]] = None,
         connection: HTTPConnection = global_http_connection,
         *,
         allowed_local_media_path: str = "",
+        nvcf_assets: Optional[dict[str, Path]] = None,
     ) -> None:
         """
         Args:
@@ -83,11 +95,20 @@ class MediaConnector:
         data_spec, data = url_spec.path.split(",", 1)
         media_type, data_type = data_spec.split(";", 1)
 
-        if data_type != "base64":
-            msg = "Only base64 data URLs are supported for now."
+        if data_type == "base64":
+            return media_io.load_base64(media_type, data)
+        elif data_type == "asset_id":
+            # Retrieve the asset from the provided mapping.
+            assets = self._default_nvcf_assets
+            if assets is None or data not in assets:
+                raise ValueError(
+                    f"The NVCF asset ID {data} is not available. Make sure the client "
+                    "passes 'NVCF-ASSET-DIR' and 'NVCF-FUNCTION-ASSET-IDS' headers correctly."
+                )
+            return media_io.load_file(assets[data])
+        else:
+            msg = "Only base64 and asset_id data URLs are supported for now."
             raise NotImplementedError(msg)
-
-        return media_io.load_base64(media_type, data)
 
     def _load_file_url(
         self,
