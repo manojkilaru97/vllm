@@ -190,6 +190,28 @@ class OpenAIServingChat(OpenAIServing):
                 _MC.set_default_nvcf_assets(None)
 
         try:
+            # Convert inline <video src="..."/> tags in string messages into
+            # structured content parts so MediaConnector can load the videos.
+            import re
+            inline_video_pattern = re.compile(r"<video\s+src=\"([^\"]+)\"\s*/?>", re.IGNORECASE)
+            if isinstance(request.messages, list):
+                new_messages = []
+                for msg in request.messages:
+                    msg_dict = msg if isinstance(msg, dict) else msg.model_dump()
+                    content = msg_dict.get("content")
+                    if isinstance(content, str) and "<video" in content:
+                        urls = inline_video_pattern.findall(content)
+                        # Remove the inline tags from the text content
+                        cleaned_text = inline_video_pattern.sub("", content)
+                        structured = []
+                        if cleaned_text.strip():
+                            structured.append({"type": "text", "text": cleaned_text})
+                        for url in urls:
+                            structured.append({"type": "video_url", "video_url": {"url": url}})
+                        msg_dict["content"] = structured
+                    new_messages.append(msg_dict)
+                request.messages = new_messages
+
             lora_request = self._maybe_get_adapters(
                 request, supports_default_mm_loras=True)
 
@@ -199,9 +221,11 @@ class OpenAIServingChat(OpenAIServing):
 
             tool_parser = self.tool_parser
 
-            # Per-request MM processor overrides (fps, max_pixels)
+            # Per-request MM processor overrides (fps, max_pixels, add_timestamps)
             if (hasattr(request, 'fps') and request.fps is not None) or (
-                hasattr(request, 'max_pixels') and request.max_pixels is not None):
+                hasattr(request, 'max_pixels') and request.max_pixels is not None) or (
+                getattr(request, 'add_timestamps', None)):
+                # Update mm_processor_kwargs (these are consumed by HF processors)
                 mm_kwargs = dict(request.mm_processor_kwargs or {})
                 if getattr(request, 'fps', None) is not None:
                     mm_kwargs['fps'] = request.fps
@@ -210,6 +234,22 @@ class OpenAIServingChat(OpenAIServing):
                 if getattr(request, 'add_timestamps', None):
                     mm_kwargs['add_timestamps'] = True
                 request.mm_processor_kwargs = mm_kwargs
+
+                # CRITICAL: Update media_io_kwargs BEFORE _preprocess_chat is called
+                # so that VideoMediaIO gets the add_timestamps flag
+                original_media_io_kwargs = self.model_config.media_io_kwargs
+                media_io_kwargs = dict(original_media_io_kwargs or {})
+                video_io_kwargs = dict(media_io_kwargs.get('video', {}))
+                
+                if getattr(request, 'fps', None) is not None:
+                    video_io_kwargs['fps'] = request.fps
+                if getattr(request, 'add_timestamps', None):
+                    video_io_kwargs['add_timestamps'] = True
+                    
+                if video_io_kwargs:
+                    media_io_kwargs['video'] = video_io_kwargs
+                    # Temporarily modify model_config for this request
+                    self.model_config.media_io_kwargs = media_io_kwargs
 
             if isinstance(tokenizer, MistralTokenizer):
                 # because of issues with pydantic we need to potentially
