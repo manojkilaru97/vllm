@@ -164,6 +164,16 @@ schema. Example: `[{"type": "text", "text": "Hello world!"}]`"""
     """Enable the /get_tokenizer_info endpoint. May expose chat
     templates and other tokenizer configuration."""
 
+    # Video content safety guardrail options
+    enable_video_guardrail: bool = False
+    """Enable Cosmos video content safety guardrail pre-check for requests containing videos."""
+    video_guardrail_checkpoint_dir: Optional[str] = None
+    """Root directory containing guardrail assets (expects subpath nvidia/Cosmos-Guardrail1/video_content_safety_filter)."""
+    video_guardrail_cosmos_repo: Optional[str] = None
+    """Filesystem path to a checked-out cosmos-predict1 repository to import guardrail modules from."""
+    video_guardrail_gpu_memory_gb: float = 3.0
+    """Approximate GPU memory in GiB to reserve for the guardrail models (subtracted from KV cache via gpu_memory_utilization)."""
+
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         from vllm.engine.arg_utils import get_kwargs

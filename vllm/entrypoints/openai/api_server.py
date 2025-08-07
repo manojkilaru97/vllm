@@ -1740,6 +1740,9 @@ async def init_app_state(
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
 
+    # Expose serve args so request handlers can access guardrail settings
+    state.serve_args = args
+
 
 def create_server_socket(addr: tuple[str, int]) -> socket.socket:
     family = socket.AF_INET
@@ -1832,6 +1835,28 @@ async def run_server_worker(listen_address,
     log_config = load_log_config(args.log_config_file)
     if log_config is not None:
         uvicorn_kwargs['log_config'] = log_config
+
+    # Optionally reserve GPU memory for video guardrail by reducing KV cache utilization
+    try:
+        if getattr(args, "enable_video_guardrail", False) and getattr(
+                args, "video_guardrail_gpu_memory_gb", None) is not None:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                total_bytes = torch.cuda.get_device_properties(0).total_memory
+                total_gb = total_bytes / (1024**3)
+                reserve_gb = float(args.video_guardrail_gpu_memory_gb)
+                if total_gb > 0 and reserve_gb > 0:
+                    frac = max(0.0, min(1.0, reserve_gb / total_gb))
+                    # reduce gpu_memory_utilization by reserved fraction
+                    current = float(getattr(args, "gpu_memory_utilization", 0.9))
+                    new_util = max(0.05, current - frac)
+                    if new_util < current:
+                        logger.info(
+                            "Adjusting gpu_memory_utilization from %.3f to %.3f to reserve %.2f GiB for guardrail",
+                            current, new_util, reserve_gb)
+                        setattr(args, "gpu_memory_utilization", new_util)
+    except Exception as e:
+        logger.warning("Failed to adjust GPU memory utilization for guardrail: %s", e)
 
     async with build_async_engine_client(
             args,

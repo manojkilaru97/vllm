@@ -212,6 +212,65 @@ class OpenAIServingChat(OpenAIServing):
                     new_messages.append(msg_dict)
                 request.messages = new_messages
 
+            # Guardrail pre-check: if any video content is present, run Cosmos Video Content Safety Filter
+            try:
+                has_video = False
+                video_urls: list[str] = []
+                if isinstance(request.messages, list):
+                    for msg in request.messages:
+                        content = msg.get("content") if isinstance(msg, dict) else None
+                        if isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "video_url":
+                                    url = ((part.get("video_url") or {}).get("url")
+                                           if isinstance(part.get("video_url"), dict) else None)
+                                    if isinstance(url, str) and url:
+                                        has_video = True
+                                        video_urls.append(url)
+                if has_video:
+                    # Lazy import cosmos guardrail if configured
+                    app = raw_request.app if raw_request is not None else None
+                    args = getattr(app.state, "serve_args", None)
+                    enable_guard = bool(getattr(args, "enable_video_guardrail", False)) if args else False
+                    if enable_guard:
+                        cosmos_repo = getattr(args, "video_guardrail_cosmos_repo", None)
+                        checkpoint_dir = getattr(args, "video_guardrail_checkpoint_dir", None)
+                        if cosmos_repo and checkpoint_dir:
+                            import sys
+                            if cosmos_repo not in sys.path:
+                                sys.path.append(cosmos_repo)
+                            try:
+                                from cosmos_predict1.auxiliary.guardrail.common.presets import create_video_guardrail_runner
+                            except Exception as e:
+                                return self.create_error_response(
+                                    f"Video guardrail unavailable: {e}",
+                                    err_type="GuardrailInitError")
+
+                            # Fetch frames for each video and run guardrail
+                            from vllm.multimodal.utils import MediaConnector
+                            connector = MediaConnector(
+                                media_io_kwargs=self.model_config.media_io_kwargs,
+                                allowed_local_media_path=getattr(self.model_config, "allowed_local_media_path", ""),
+                            )
+                            # Build guardrail runner (runs on GPU if available)
+                            runner = create_video_guardrail_runner(checkpoint_dir)
+
+                            # Iterate urls, load sampled frames with VideoMediaIO and test
+                            for u in video_urls:
+                                frames, _meta = connector.fetch_video(u)
+                                safe, msg = runner.run_safety_check(frames)
+                                if not safe:
+                                    # 422 Unprocessable Entity with classifier message
+                                    from http import HTTPStatus
+                                    return self.create_error_response(
+                                        message=f"Unsafe video content detected: {msg}",
+                                        err_type="ContentSafetyError",
+                                        status_code=HTTPStatus.UNPROCESSABLE_ENTITY)
+                    # else: guardrail disabled; proceed
+            except Exception as e:
+                # Fail closed? Manager requested blocking unsafe only; if guard fails, continue but log
+                logger.warning("Video guardrail check failed: %s", e)
+
             lora_request = self._maybe_get_adapters(
                 request, supports_default_mm_loras=True)
 
