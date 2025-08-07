@@ -145,8 +145,12 @@ class OpenCVVideoBackend(VideoLoader):
                     frames[i] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     i += 1
 
-        assert i == num_frames, (f"Expected reading {num_frames} frames, "
-                                 f"but only loaded {i} frames from video.")
+        # Some videos (variable frame rate, truncated streams) may decode
+        # fewer frames than requested. Be tolerant: keep what we decoded.
+        if i != num_frames:
+            # Slice to the actual number of decoded frames and adjust indices
+            frames = frames[:i]
+            frame_idx = frame_idx[:i]
 
         # Use transformers transformers.video_utils.VideoMetadata format
         metadata = {
