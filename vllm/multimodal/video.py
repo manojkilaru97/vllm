@@ -145,15 +145,20 @@ class OpenCVVideoBackend(VideoLoader):
                     frames[i] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     i += 1
 
-        assert i == num_frames, (f"Expected reading {num_frames} frames, "
-                                 f"but only loaded {i} frames from video.")
+        # Some videos (variable frame rate, truncated streams) may decode
+        # fewer frames than requested. Be tolerant: keep what we decoded.
+        if i != num_frames:
+            # Slice to the actual number of decoded frames and adjust indices
+            frames = frames[:i]
+            frame_idx = frame_idx[:i]
 
         # Use transformers transformers.video_utils.VideoMetadata format
         metadata = {
             "total_num_frames": total_frames_num,
             "fps": original_fps,
             "duration": duration,
-            "video_backend": "opencv"
+            "video_backend": "opencv",
+            "frame_indices": frame_idx
         }
 
         return frames, metadata
@@ -180,10 +185,62 @@ class VideoMediaIO(MediaIO[npt.NDArray]):
         video_loader_backend = envs.VLLM_VIDEO_LOADER_BACKEND
         self.video_loader = VIDEO_LOADER_REGISTRY.load(video_loader_backend)
 
+    def _overlay_timestamps(self, frames: npt.NDArray, fps: float, frame_indices: list[int] = None) -> npt.NDArray:
+        """Overlay running timestamp on each frame with a black border."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            return frames  # Pillow not available – skip
+
+        border_h = 28  # match patch size
+        font_size = 20
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        processed = []
+        for idx, frame in enumerate(frames):
+            pil = Image.fromarray(frame)
+            w, h = pil.size
+            new_img = Image.new("RGB", (w, h + border_h), color="black")
+            new_img.paste(pil, (0, 0))
+            draw = ImageDraw.Draw(new_img)
+            
+            # Use actual frame index from original video if available, otherwise fall back to sequential
+            if frame_indices is not None and idx < len(frame_indices):
+                actual_frame_idx = frame_indices[idx]
+                timestamp = f"{actual_frame_idx / fps:.2f}s"
+            else:
+                timestamp = f"{idx / fps:.2f}s"
+                
+            # Compute text size: prefer textbbox, fallback to font.getsize
+            try:
+                bbox = draw.textbbox((0, 0), timestamp, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+            except Exception:
+                try:
+                    text_w, text_h = font.getsize(timestamp)
+                except Exception:
+                    # Last resort: approximate
+                    text_w, text_h = len(timestamp) * font_size // 2, font_size
+            text_x = (w - text_w) // 2
+            text_y = h + (border_h - text_h) // 2
+            draw.text((text_x, text_y), timestamp, fill="white", font=font)
+            processed.append(np.asarray(new_img))
+        return np.stack(processed, axis=0)
+
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray, dict[str, Any]]:
-        return self.video_loader.load_bytes(data,
-                                            num_frames=self.num_frames,
-                                            **self.kwargs)
+        frames, meta = self.video_loader.load_bytes(data,
+                                                    num_frames=self.num_frames,
+                                                    **self.kwargs)
+        if self.kwargs.get("add_timestamps"):
+            # Always use the video's actual FPS for timestamp calculation, not the inference FPS
+            video_fps = meta.get("fps", 1)
+            frame_indices = meta.get("frame_indices")
+            frames = self._overlay_timestamps(frames, video_fps, frame_indices)
+        return frames, meta
 
     def load_base64(self, media_type: str,
                     data: str) -> tuple[npt.NDArray, dict[str, Any]]:

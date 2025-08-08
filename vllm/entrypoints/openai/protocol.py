@@ -491,6 +491,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description=("Additional kwargs to pass to the HF processor."),
     )
+    fps: Optional[int] = Field(default=None, description="Frames-per-second override for video processing on this request.")
+    max_pixels: Optional[int] = Field(default=None, description="Maximum pixels (width*height) allowed per frame for this request.")
+    add_timestamps: Optional[bool] = Field(default=False, description="If true, overlay timestamps onto each video frame before processing.")
+
     guided_json: Optional[Union[str, dict, BaseModel]] = Field(
         default=None,
         description=("If specified, the output will follow the JSON schema."),

@@ -6,7 +6,7 @@ import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
-from typing import Callable, Final, Optional, Union
+from typing import Any, Callable, Dict, Final, List, Optional, Tuple, Union
 
 import jinja2
 import partial_json_parser
@@ -147,6 +147,9 @@ class OpenAIServingChat(OpenAIServing):
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
+        
+        # Video safety guardrail components (initialized lazily)
+        self._video_safety_guardrail: Optional["VideoSafetyGuardrail"] = None
 
     async def create_chat_completion(
         self,
@@ -172,7 +175,86 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        # Register NVCF assets (videos/images) if provided via request headers.
+        if raw_request is not None:
+            headers = raw_request.headers
+            if "NVCF-ASSET-DIR" in headers and "NVCF-FUNCTION-ASSET-IDS" in headers:
+                from pathlib import Path
+                from vllm.multimodal.utils import MediaConnector
+                nvcf_asset_dir = Path(headers["NVCF-ASSET-DIR"])
+                if not (nvcf_asset_dir.exists() and nvcf_asset_dir.is_dir()):
+                    raise RuntimeError(
+                        f"NVCF asset directory {nvcf_asset_dir} does not exist or is not a directory.")
+                asset_ids = [aid.strip() for aid in headers["NVCF-FUNCTION-ASSET-IDS"].split(",") if aid.strip()]
+                MediaConnector.set_default_nvcf_assets({aid: nvcf_asset_dir / aid for aid in asset_ids})
+            else:
+                # Clear the default assets if not provided in the current request.
+                from vllm.multimodal.utils import MediaConnector as _MC
+                _MC.set_default_nvcf_assets(None)
+
         try:
+            # Convert inline <video src="..."/> tags in string messages into
+            # structured content parts so MediaConnector can load the videos.
+            import re
+            inline_video_pattern = re.compile(r"<video\s+src=\"([^\"]+)\"\s*/?>", re.IGNORECASE)
+            if isinstance(request.messages, list):
+                new_messages = []
+                for msg in request.messages:
+                    msg_dict = msg if isinstance(msg, dict) else msg.model_dump()
+                    content = msg_dict.get("content")
+                    if isinstance(content, str) and "<video" in content:
+                        urls = inline_video_pattern.findall(content)
+                        # Remove the inline tags from the text content
+                        cleaned_text = inline_video_pattern.sub("", content)
+                        structured = []
+                        if cleaned_text.strip():
+                            structured.append({"type": "text", "text": cleaned_text})
+                        for url in urls:
+                            structured.append({"type": "video_url", "video_url": {"url": url}})
+                        msg_dict["content"] = structured
+                    new_messages.append(msg_dict)
+                request.messages = new_messages
+
+            # Guardrail pre-check: if any video content is present, run Cosmos Video Content Safety Filter
+            try:
+                has_video = False
+                video_urls: list[str] = []
+                if isinstance(request.messages, list):
+                    for msg in request.messages:
+                        content = msg.get("content") if isinstance(msg, dict) else None
+                        if isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "video_url":
+                                    url = ((part.get("video_url") or {}).get("url")
+                                           if isinstance(part.get("video_url"), dict) else None)
+                                    if isinstance(url, str) and url:
+                                        has_video = True
+                                        video_urls.append(url)
+                logger.debug("Video guardrail: Found video URL: %s", url)
+                
+                logger.debug("Video guardrail: has_video=%s, video_count=%d", has_video, len(video_urls))
+                if has_video:
+                    # Apply video content safety guardrail if enabled
+                    app = raw_request.app if raw_request is not None else None
+                    args = getattr(app.state, "serve_args", None)
+                    enable_guard = bool(getattr(args, "enable_video_guardrail", False)) if args else False
+                    
+                    logger.debug("Video guardrail: enable_guard=%s", enable_guard)
+                    if enable_guard:
+                        try:
+                            logger.debug("Video guardrail: Starting safety check for %d videos", len(video_urls))
+                            guardrail_response = await self._check_video_safety(video_urls, args)
+                            if guardrail_response is not None:
+                                logger.warning("Video guardrail: BLOCKED unsafe content")
+                                return guardrail_response
+                            logger.debug("Video guardrail: Content passed safety check")
+                        except Exception as e:
+                            logger.warning("Video guardrail check failed: %s", e)
+                            # Continue processing - fail open for non-critical guardrail errors
+            except Exception as e:
+                # Fail closed? Manager requested blocking unsafe only; if guard fails, continue but log
+                logger.warning("Video guardrail check failed: %s", e)
+
             lora_request = self._maybe_get_adapters(
                 request, supports_default_mm_loras=True)
 
@@ -181,6 +263,36 @@ class OpenAIServingChat(OpenAIServing):
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
             tool_parser = self.tool_parser
+
+            # Per-request MM processor overrides (fps, max_pixels, add_timestamps)
+            if (hasattr(request, 'fps') and request.fps is not None) or (
+                hasattr(request, 'max_pixels') and request.max_pixels is not None) or (
+                getattr(request, 'add_timestamps', None)):
+                # Update mm_processor_kwargs (these are consumed by HF processors)
+                mm_kwargs = dict(request.mm_processor_kwargs or {})
+                if getattr(request, 'fps', None) is not None:
+                    mm_kwargs['fps'] = request.fps
+                if getattr(request, 'max_pixels', None) is not None:
+                    mm_kwargs['max_pixels'] = request.max_pixels
+                if getattr(request, 'add_timestamps', None):
+                    mm_kwargs['add_timestamps'] = True
+                request.mm_processor_kwargs = mm_kwargs
+
+                # CRITICAL: Update media_io_kwargs BEFORE _preprocess_chat is called
+                # so that VideoMediaIO gets the add_timestamps flag
+                original_media_io_kwargs = self.model_config.media_io_kwargs
+                media_io_kwargs = dict(original_media_io_kwargs or {})
+                video_io_kwargs = dict(media_io_kwargs.get('video', {}))
+                
+                if getattr(request, 'fps', None) is not None:
+                    video_io_kwargs['fps'] = request.fps
+                if getattr(request, 'add_timestamps', None):
+                    video_io_kwargs['add_timestamps'] = True
+                    
+                if video_io_kwargs:
+                    media_io_kwargs['video'] = video_io_kwargs
+                    # Temporarily modify model_config for this request
+                    self.model_config.media_io_kwargs = media_io_kwargs
 
             if isinstance(tokenizer, MistralTokenizer):
                 # because of issues with pydantic we need to potentially
@@ -1382,3 +1494,381 @@ class OpenAIServingChat(OpenAIServing):
         prompt_token_ids = render_for_completion(messages)
         engine_prompt = EngineTokensPrompt(prompt_token_ids=prompt_token_ids)
         return messages, [prompt_token_ids], [engine_prompt]
+
+    async def _check_video_safety(
+        self,
+        video_urls: List[str],
+        args: Any
+    ) -> Optional[ErrorResponse]:
+        """
+        Check video content safety using the Cosmos video content safety filter.
+        
+        Args:
+            video_urls: List of video URLs to check
+            args: Server arguments containing guardrail configuration
+            
+        Returns:
+            ErrorResponse if unsafe content is detected, None if safe
+        """
+        try:
+            # Initialize guardrail lazily
+            if self._video_safety_guardrail is None:
+                self._video_safety_guardrail = VideoSafetyGuardrail(args)
+            
+            # Check each video
+            for video_url in video_urls:
+                is_safe, reason = await self._video_safety_guardrail.check_video(
+                    video_url, self.model_config
+                )
+                if not is_safe:
+                    from http import HTTPStatus
+                    return self.create_error_response(
+                        message=f"Unsafe video content detected: {reason}",
+                        err_type="ContentSafetyError",
+                        status_code=HTTPStatus.UNPROCESSABLE_ENTITY
+                    )
+            
+            return None  # All videos are safe
+            
+        except Exception as e:
+            logger.error("Video safety check failed: %s", e)
+            raise
+
+
+class VideoSafetyGuardrail:
+    """
+    Production-ready video content safety guardrail using Cosmos models.
+    
+    This class implements the Video Content Safety Filter from the
+    nvidia/Cosmos-Guardrail1 model, providing real-time video content
+    safety classification with configurable thresholds.
+    """
+    
+    def __init__(self, args: Any):
+        """Initialize the video safety guardrail."""
+        self.args = args
+        self.threshold = getattr(args, "video_guardrail_threshold", 0.5)
+        self.checkpoint_root = getattr(args, "video_guardrail_checkpoint_dir", None)
+        
+        # Validate configuration
+        if not self.checkpoint_root:
+            raise ValueError("Video guardrail requires --video-guardrail-checkpoint-dir")
+        
+        # Initialize models
+        self._encoder: Optional["SigLIPEncoder"] = None
+        self._safety_model: Optional["VideoSafetyNet"] = None
+        self._device = "cuda" if self._is_cuda_available() else "cpu"
+        self._dtype = self._get_torch_dtype()
+        
+        logger.info(
+            "Initialized VideoSafetyGuardrail with threshold=%.3f, device=%s",
+            self.threshold, self._device
+        )
+
+    def _is_cuda_available(self) -> bool:
+        """Check if CUDA is available with proper error handling."""
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            logger.warning("PyTorch not available, falling back to CPU")
+            return False
+
+    def _get_torch_dtype(self):
+        """Get the appropriate torch dtype."""
+        try:
+            import torch
+            return torch.float32
+        except ImportError:
+            return None
+
+    def _load_models(self):
+        """Load the SigLIP encoder and video safety classifier."""
+        if self._encoder is not None and self._safety_model is not None:
+            return  # Already loaded
+            
+        try:
+            import os
+            import torch
+            import torch.nn as nn
+            from transformers import SiglipModel, SiglipProcessor
+            
+            # Resolve checkpoint directory
+            base_paths = [
+                os.path.join(self.checkpoint_root, "nvidia", "Cosmos-Guardrail1", "video_content_safety_filter"),
+                os.path.join(self.checkpoint_root, "Cosmos-Guardrail1", "video_content_safety_filter")
+            ]
+            
+            base_dir = None
+            for path in base_paths:
+                if os.path.isdir(path):
+                    base_dir = path
+                    break
+                    
+            if not base_dir:
+                raise FileNotFoundError(
+                    f"Video guardrail checkpoints not found under {self.checkpoint_root}. "
+                    f"Tried paths: {base_paths}"
+                )
+            
+            logger.info("Loading video safety models from: %s", base_dir)
+            
+            # Initialize SigLIP encoder
+            self._encoder = SigLIPEncoder(base_dir, self._device, self._dtype)
+            
+            # Initialize and load safety classifier
+            self._safety_model = VideoSafetyNet()
+            ckpt_path = os.path.join(base_dir, "safety_filter.pt")
+            
+            if not os.path.exists(ckpt_path):
+                raise FileNotFoundError(f"Safety filter checkpoint not found: {ckpt_path}")
+                
+            state = torch.load(ckpt_path, map_location="cpu")
+            model_state = state.get("model", state)
+            self._safety_model.load_state_dict(model_state, strict=False)
+            self._safety_model.to(self._device, dtype=self._dtype).eval()
+            
+            logger.info("Successfully loaded video safety models")
+            
+        except Exception as e:
+            logger.error("Failed to load video safety models: %s", e)
+            raise RuntimeError(f"Video guardrail initialization failed: {e}") from e
+
+    async def check_video(
+        self,
+        video_url: str,
+        model_config: Any
+    ) -> Tuple[bool, str]:
+        """
+        Check if a video contains safe content.
+        
+        Args:
+            video_url: URL of the video to check
+            model_config: Model configuration for media processing
+            
+        Returns:
+            Tuple of (is_safe, reason) where is_safe is True if content is safe,
+            and reason provides details about the classification
+        """
+        try:
+            # Load models if not already loaded
+            self._load_models()
+            
+            # Fetch video frames
+            frames, metadata = await self._fetch_video_frames(video_url, model_config)
+
+            # Normalize frames into a Python list of frame arrays to avoid
+            # ambiguous truth-value checks on numpy arrays
+            try:
+                import numpy as _np  # local import to avoid top-level dependency
+                if isinstance(frames, _np.ndarray):
+                    # Expect shape [num_frames, H, W, C] or similar
+                    if frames.ndim >= 4:
+                        frames = [frames[i] for i in range(frames.shape[0])]
+                    elif frames.ndim == 3:
+                        # Single frame array
+                        frames = [frames]
+            except Exception:
+                # If numpy is unavailable, proceed assuming frames is already a list
+                pass
+
+            if frames is None or len(frames) == 0:
+                return False, "No valid frames found in video"
+            
+            # Sample frames at ~2 FPS, but cap the total number of sampled frames
+            step = self._calculate_sampling_step(frames, metadata)
+            max_samples = int(getattr(self.args, "video_guardrail_max_sampled_frames", 60) or 60)
+            
+            # Check each sampled frame
+            unsafe_frames = 0
+            total_checked = 0
+            min_safe_prob = 1.0
+            
+            sampled_indices = list(range(0, len(frames), step))
+            if len(sampled_indices) > max_samples:
+                # Evenly subsample to max_samples
+                import numpy as _np
+                sampled_indices = list(_np.linspace(0, len(frames) - 1, max_samples, dtype=int))
+
+            for idx in sampled_indices:
+                try:
+                    safe_prob = self._get_frame_safety_probability(frames[idx])
+                    min_safe_prob = min(min_safe_prob, safe_prob)
+                    total_checked += 1
+                    
+                    if safe_prob < self.threshold:
+                        unsafe_frames += 1
+                        logger.debug(
+                            "Unsafe frame detected at index %d: safe_prob=%.3f < threshold=%.3f",
+                            idx, safe_prob, self.threshold
+                        )
+                        # Fail fast on first unsafe frame
+                        return False, f"safe_prob={safe_prob:.3f} < {self.threshold}"
+                        
+                except Exception as e:
+                    logger.debug("Failed to process frame %d: %s", idx, e)
+                    continue
+            
+            if total_checked == 0:
+                return False, "No frames could be processed"
+                
+            logger.debug(
+                "Video safety check completed: %d/%d frames checked, min_safe_prob=%.3f",
+                total_checked, len(frames), min_safe_prob
+            )
+            
+            return True, f"safe (min_prob={min_safe_prob:.3f})"
+            
+        except Exception as e:
+            logger.error("Video safety check failed for %s: %s", video_url, e)
+            raise
+
+    async def _fetch_video_frames(
+        self,
+        video_url: str,
+        model_config: Any
+    ) -> Tuple[List[Any], Dict[str, Any]]:
+        """Fetch frames from video URL."""
+        try:
+            from vllm.multimodal.utils import MediaConnector
+            
+            connector = MediaConnector(
+                media_io_kwargs=model_config.media_io_kwargs,
+                allowed_local_media_path=getattr(model_config, "allowed_local_media_path", ""),
+            )
+            
+            frames, metadata = connector.fetch_video(video_url)
+            return frames, metadata or {}
+            
+        except Exception as e:
+            logger.error("Failed to fetch video frames from %s: %s", video_url, e)
+            raise
+
+    def _calculate_sampling_step(
+        self,
+        frames: List[Any],
+        metadata: Dict[str, Any]
+    ) -> int:
+        """Calculate the frame sampling step to achieve ~2 FPS."""
+        try:
+            fps = int(metadata.get("fps", 0)) if metadata else 0
+            if fps > 0:
+                # Sample at 2 FPS
+                step = max(1, fps // 2)
+            else:
+                # Fallback: sample ~30 frames across video length
+                step = max(1, len(frames) // 30)
+                
+            logger.debug(
+                "Calculated sampling step=%d for %d frames (fps=%s)",
+                step, len(frames), fps or "unknown"
+            )
+            return step
+            
+        except Exception:
+            # Conservative fallback
+            return max(1, len(frames) // 30)
+
+    def _get_frame_safety_probability(self, frame_array) -> float:
+        """Get safety probability for a single frame."""
+        try:
+            import torch
+            from PIL import Image
+            
+            # Convert frame to PIL Image
+            pil_image = Image.fromarray(frame_array)
+            
+            # Encode image using SigLIP
+            with torch.inference_mode():
+                features = self._encoder.encode_image(pil_image)
+                
+                # Classify using safety model
+                logits = self._safety_model(features)
+                probs = torch.softmax(logits, dim=-1)
+                
+                # Handle different tensor shapes
+                if probs.dim() == 1:
+                    # Single sample, shape: [num_classes]
+                    safe_prob = float(probs[0].item())
+                elif probs.dim() == 2:
+                    # Batch dimension, shape: [batch_size, num_classes]
+                    safe_prob = float(probs[0, 0].item())
+                else:
+                    raise ValueError(f"Unexpected probs tensor shape: {probs.shape}")
+                
+                logger.debug("Frame safety probability: %.3f", safe_prob)
+                return safe_prob
+                
+        except Exception as e:
+            logger.error("Failed to get frame safety probability: %s", e)
+            raise
+
+
+class SigLIPEncoder:
+    """SigLIP image encoder for video content safety classification."""
+    
+    def __init__(self, base_dir: str, device: str, dtype):
+        """Initialize the SigLIP encoder."""
+        self.device = device
+        self.dtype = dtype
+        
+        try:
+            from transformers import SiglipModel, SiglipProcessor
+            
+            model_name = "google/siglip-so400m-patch14-384"
+            self.model = SiglipModel.from_pretrained(
+                model_name,
+                cache_dir=base_dir,
+                local_files_only=True
+            )
+            self.processor = SiglipProcessor.from_pretrained(
+                model_name,
+                cache_dir=base_dir,
+                local_files_only=True
+            )
+            
+            self.model.to(self.device, dtype=self.dtype).eval()
+            logger.info("Initialized SigLIP encoder on device: %s", self.device)
+            
+        except Exception as e:
+            logger.error("Failed to initialize SigLIP encoder: %s", e)
+            raise
+
+    def encode_image(self, pil_image):
+        """Encode a PIL image to normalized features."""
+        import torch
+        
+        inputs = self.processor(
+            images=pil_image,
+            return_tensors="pt"
+        ).to(self.device, dtype=self.dtype)
+        
+        features = self.model.get_image_features(**inputs)
+        # L2 normalize features
+        normalized_features = features / features.norm(dim=-1, keepdim=True)
+        return normalized_features
+
+
+import torch.nn as _nn  # local alias to avoid top import churn
+
+
+class VideoSafetyNet(_nn.Module):
+    """Video safety classification network (matches checkpoint key layout)."""
+
+    def __init__(self, input_size: int = 1152, num_classes: int = 7) -> None:
+        super().__init__()
+        # Match the checkpoint structure exactly: network.layers.*
+        self.network = _nn.Module()
+        self.network.layers = _nn.Sequential(
+            _nn.Linear(input_size, 512),
+            _nn.BatchNorm1d(512),
+            _nn.ReLU(),
+            _nn.Linear(512, 256),
+            _nn.BatchNorm1d(256),
+            _nn.ReLU(),
+            _nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        return self.network.layers(x)
+
