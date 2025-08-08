@@ -318,7 +318,7 @@ class OpenAIServingChat(OpenAIServing):
                                             6: "Self-Harm",
                                         }
 
-                                        def __init__(self, checkpoint_root: str, device: str):
+                                        def __init__(self, checkpoint_root: str, device: str, unsafe_threshold: float):
                                             self.device = device
                                             self.dtype = torch.float32
                                             # Detect guardrail asset base directory
@@ -358,6 +358,7 @@ class OpenAIServingChat(OpenAIServing):
                                                         new_state[f"network.{k}"] = v
                                                 self.model.load_state_dict(new_state, strict=False)
                                             self.model.to(self.device, dtype=self.dtype).eval()
+                                            self.unsafe_threshold = max(0.0, min(1.0, unsafe_threshold))
 
                                         @torch.inference_mode()
                                         def first_unsafe(self, frames: np.ndarray):  # type: ignore[name-defined]
@@ -372,8 +373,9 @@ class OpenAIServingChat(OpenAIServing):
                                                 feat = self.encoder.encode_image(pil)
                                                 logits = self.model.network(feat)
                                                 probs = torch.softmax(logits, dim=-1)
-                                                cls = int(torch.argmax(probs, dim=-1).item())
-                                                if cls != 0:
+                                                safe_prob = float(probs[0, 0].item())
+                                                if (1.0 - safe_prob) >= self.unsafe_threshold:
+                                                    cls = int(torch.argmax(probs, dim=-1).item())
                                                     return self.CLASS_IDX_TO_NAME.get(cls, f"class_{cls}")
                                             return None
                             except Exception as e:
@@ -394,7 +396,9 @@ class OpenAIServingChat(OpenAIServing):
                                     video_filter = VideoContentSafetyFilter(checkpoint_dir=checkpoint_dir, device=device)  # type: ignore
                                     runner = GuardrailRunner(safety_models=[video_filter], generic_safe_msg="Video is safe")  # type: ignore
                                 else:
-                                    vf = _MinimalVideoFilter(checkpoint_root=checkpoint_dir, device=device)
+                                    # Pull threshold from serve args; default 0.5
+                                    unsafe_threshold = float(getattr(args, "video_guardrail_threshold", 0.5)) if args else 0.5
+                                    vf = _MinimalVideoFilter(checkpoint_root=checkpoint_dir, device=device, unsafe_threshold=unsafe_threshold)
                                     runner = None
                             except Exception as e:
                                 return self.create_error_response(

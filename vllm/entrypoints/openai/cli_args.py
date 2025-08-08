@@ -173,6 +173,8 @@ schema. Example: `[{"type": "text", "text": "Hello world!"}]`"""
     """Filesystem path to a checked-out cosmos-predict1 repository to import guardrail modules from."""
     video_guardrail_gpu_memory_gb: float = 3.0
     """Approximate GPU memory in GiB to reserve for the guardrail models (subtracted from KV cache via gpu_memory_utilization)."""
+    video_guardrail_threshold: float = 0.5
+    """Unsafe probability threshold in [0,1]. On the minimal guardrail path, a video is blocked if (1 - p_safe) >= threshold."""
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
