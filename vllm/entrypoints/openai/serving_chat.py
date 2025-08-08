@@ -230,17 +230,24 @@ class OpenAIServingChat(OpenAIServing):
                                     if isinstance(url, str) and url:
                                         has_video = True
                                         video_urls.append(url)
+                                        logger.info("Video guardrail: Found video URL: %s", url)
+                
+                logger.info("Video guardrail: has_video=%s, video_count=%d", has_video, len(video_urls))
                 if has_video:
                     # Apply video content safety guardrail if enabled
                     app = raw_request.app if raw_request is not None else None
                     args = getattr(app.state, "serve_args", None)
                     enable_guard = bool(getattr(args, "enable_video_guardrail", False)) if args else False
                     
+                    logger.info("Video guardrail: enable_guard=%s", enable_guard)
                     if enable_guard:
                         try:
+                            logger.info("Video guardrail: Starting safety check for %d videos", len(video_urls))
                             guardrail_response = await self._check_video_safety(video_urls, args)
                             if guardrail_response is not None:
+                                logger.warning("Video guardrail: BLOCKED unsafe content")
                                 return guardrail_response
+                            logger.info("Video guardrail: Content passed safety check")
                         except Exception as e:
                             logger.warning("Video guardrail check failed: %s", e)
                             # Continue processing - fail open for non-critical guardrail errors
@@ -1649,8 +1656,23 @@ class VideoSafetyGuardrail:
             
             # Fetch video frames
             frames, metadata = await self._fetch_video_frames(video_url, model_config)
-            
-            if not frames:
+
+            # Normalize frames into a Python list of frame arrays to avoid
+            # ambiguous truth-value checks on numpy arrays
+            try:
+                import numpy as _np  # local import to avoid top-level dependency
+                if isinstance(frames, _np.ndarray):
+                    # Expect shape [num_frames, H, W, C] or similar
+                    if frames.ndim >= 4:
+                        frames = [frames[i] for i in range(frames.shape[0])]
+                    else:
+                        # Single frame; wrap to list
+                        frames = [frames]
+            except Exception:
+                # If numpy is unavailable, proceed assuming frames is already a list
+                pass
+
+            if frames is None or len(frames) == 0:
                 return False, "No valid frames found in video"
             
             # Sample frames at ~2 FPS
@@ -1757,8 +1779,17 @@ class VideoSafetyGuardrail:
                 logits = self._safety_model(features)
                 probs = torch.softmax(logits, dim=-1)
                 
-                # Return probability of "Safe" class (class 0)
-                safe_prob = float(probs[0, 0].item())
+                # Handle different tensor shapes
+                if probs.dim() == 1:
+                    # Single sample, shape: [num_classes]
+                    safe_prob = float(probs[0].item())
+                elif probs.dim() == 2:
+                    # Batch dimension, shape: [batch_size, num_classes]
+                    safe_prob = float(probs[0, 0].item())
+                else:
+                    raise ValueError(f"Unexpected probs tensor shape: {probs.shape}")
+                
+                logger.debug("Frame safety probability: %.3f", safe_prob)
                 return safe_prob
                 
         except Exception as e:
