@@ -235,9 +235,9 @@ class OpenAIServingChat(OpenAIServing):
                     if enable_guard:
                         cosmos_repo = getattr(args, "video_guardrail_cosmos_repo", None)
                         checkpoint_dir = getattr(args, "video_guardrail_checkpoint_dir", None)
-                        if cosmos_repo and checkpoint_dir:
+                        if checkpoint_dir:
                             import sys
-                            if cosmos_repo not in sys.path:
+                            if cosmos_repo and cosmos_repo not in sys.path:
                                 sys.path.append(cosmos_repo)
                             try:
                                 import torch  # type: ignore
@@ -252,9 +252,12 @@ class OpenAIServingChat(OpenAIServing):
                                         _core.ModelParallelConfig = ModelParallelConfig  # type: ignore
                                         _sys.modules['megatron'] = _megatron
                                         _sys.modules['megatron.core'] = _core
-                                    from cosmos_predict1.auxiliary.guardrail.video_content_safety_filter.video_content_safety_filter import VideoContentSafetyFilter  # type: ignore
-                                    from cosmos_predict1.auxiliary.guardrail.common.core import GuardrailRunner  # type: ignore
-                                    impl = "cosmos"
+                                    if cosmos_repo:
+                                        from cosmos_predict1.auxiliary.guardrail.video_content_safety_filter.video_content_safety_filter import VideoContentSafetyFilter  # type: ignore
+                                        from cosmos_predict1.auxiliary.guardrail.common.core import GuardrailRunner  # type: ignore
+                                        impl = "cosmos"
+                                    else:
+                                        raise ImportError("cosmos repo not provided")
                                 except Exception:
                                     impl = "minimal"
                                 # Minimal fallback that avoids heavy Cosmos deps while using the same weights
