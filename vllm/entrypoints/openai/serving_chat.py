@@ -240,7 +240,139 @@ class OpenAIServingChat(OpenAIServing):
                             if cosmos_repo not in sys.path:
                                 sys.path.append(cosmos_repo)
                             try:
-                                from cosmos_predict1.auxiliary.guardrail.common.presets import create_video_guardrail_runner
+                                import torch  # type: ignore
+                                # Try using Cosmos implementation first (best case)
+                                try:
+                                    import types, sys as _sys  # type: ignore
+                                    if 'megatron.core' not in _sys.modules:
+                                        _megatron = types.ModuleType('megatron')
+                                        _core = types.ModuleType('megatron.core')
+                                        class ModelParallelConfig:  # type: ignore
+                                            pass
+                                        _core.ModelParallelConfig = ModelParallelConfig  # type: ignore
+                                        _sys.modules['megatron'] = _megatron
+                                        _sys.modules['megatron.core'] = _core
+                                    from cosmos_predict1.auxiliary.guardrail.video_content_safety_filter.video_content_safety_filter import VideoContentSafetyFilter  # type: ignore
+                                    from cosmos_predict1.auxiliary.guardrail.common.core import GuardrailRunner  # type: ignore
+                                    impl = "cosmos"
+                                except Exception:
+                                    impl = "minimal"
+                                # Minimal fallback that avoids heavy Cosmos deps while using the same weights
+                                if impl == "minimal":
+                                    import os
+                                    import numpy as np  # type: ignore
+                                    import torch.nn as nn  # type: ignore
+                                    from transformers import SiglipModel, SiglipProcessor  # type: ignore
+
+                                    class _MinimalSafetyClassifier(nn.Module):
+                                        def __init__(self, input_size: int = 1152, num_classes: int = 7):
+                                            super().__init__()
+                                            self.layers = nn.Sequential(
+                                                nn.Linear(input_size, 512),
+                                                nn.BatchNorm1d(512),
+                                                nn.ReLU(),
+                                                nn.Linear(512, 256),
+                                                nn.BatchNorm1d(256),
+                                                nn.ReLU(),
+                                                nn.Linear(256, num_classes),
+                                            )
+
+                                        def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[name-defined]
+                                            return self.layers(x)
+
+                                    class _MinimalVideoSafetyModel(nn.Module):
+                                        def __init__(self, input_size: int = 1152, num_classes: int = 7):
+                                            super().__init__()
+                                            # Match checkpoint key prefix "network.*"
+                                            self.network = _MinimalSafetyClassifier(input_size=input_size, num_classes=num_classes)
+
+                                    class _MinimalSiglipEncoder:
+                                        def __init__(self, cache_dir: str, device: str, dtype: torch.dtype, local_only: bool):  # type: ignore[name-defined]
+                                            self.device = device
+                                            self.dtype = dtype
+                                            model_name = "google/siglip-so400m-patch14-384"
+                                            self.model = SiglipModel.from_pretrained(
+                                                model_name, cache_dir=cache_dir, local_files_only=local_only)
+                                            self.processor = SiglipProcessor.from_pretrained(
+                                                model_name, cache_dir=cache_dir, local_files_only=local_only)
+                                            self.model.to(self.device, dtype=self.dtype).eval()
+
+                                        @torch.inference_mode()
+                                        def encode_image(self, pil_image):  # PIL.Image.Image
+                                            inputs = self.processor(images=pil_image, return_tensors="pt").to(self.device, dtype=self.dtype)
+                                            image_features = self.model.get_image_features(**inputs)
+                                            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                                            return image_features
+
+                                    class _MinimalVideoFilter:
+                                        CLASS_IDX_TO_NAME = {
+                                            0: "Safe",
+                                            1: "Sexual_Content",
+                                            2: "Violence",
+                                            3: "Drugs",
+                                            4: "Child_Abuse",
+                                            5: "Hate_and_Harassment",
+                                            6: "Self-Harm",
+                                        }
+
+                                        def __init__(self, checkpoint_root: str, device: str):
+                                            self.device = device
+                                            self.dtype = torch.float32
+                                            # Detect guardrail asset base directory
+                                            local_base = None
+                                            alt = os.path.join(checkpoint_root, "video_content_safety_filter")
+                                            alt2 = os.path.join(checkpoint_root, "nvidia/Cosmos-Guardrail1/video_content_safety_filter")
+                                            if os.path.isdir(alt):
+                                                local_base = alt
+                                            elif os.path.isdir(alt2):
+                                                local_base = alt2
+
+                                            if local_base is not None:
+                                                ckpt_dir = local_base
+                                                local_only = True
+                                            else:
+                                                # Fallback to a writable cache for online fetch
+                                                ckpt_dir = os.path.expanduser("/root/.cache/cosmos_guardrail")
+                                                os.makedirs(ckpt_dir, exist_ok=True)
+                                                local_only = False
+
+                                            self.encoder = _MinimalSiglipEncoder(
+                                                cache_dir=ckpt_dir, device=device, dtype=self.dtype, local_only=local_only)
+                                            self.model = _MinimalVideoSafetyModel(input_size=1152, num_classes=7)
+                                            ckpt_path = os.path.join(local_base or ckpt_dir, "safety_filter.pt")
+                                            state = torch.load(ckpt_path, map_location="cpu")
+                                            model_state = state.get("model", state)
+                                            # Try strict load first; if mismatch, adapt keys
+                                            try:
+                                                self.model.load_state_dict(model_state, strict=True)
+                                            except Exception:
+                                                # Rename keys if they lack or include 'network.' prefix
+                                                new_state = {}
+                                                for k, v in model_state.items():
+                                                    if k.startswith("network."):
+                                                        new_state[k] = v
+                                                    else:
+                                                        new_state[f"network.{k}"] = v
+                                                self.model.load_state_dict(new_state, strict=False)
+                                            self.model.to(self.device, dtype=self.dtype).eval()
+
+                                        @torch.inference_mode()
+                                        def first_unsafe(self, frames: np.ndarray):  # type: ignore[name-defined]
+                                            # Sample up to ~30 frames evenly
+                                            num_frames = len(frames)
+                                            if num_frames <= 0:
+                                                return None
+                                            step = max(1, num_frames // 30)
+                                            for idx in range(0, num_frames, step):
+                                                from PIL import Image  # type: ignore
+                                                pil = Image.fromarray(frames[idx])
+                                                feat = self.encoder.encode_image(pil)
+                                                logits = self.model.network(feat)
+                                                probs = torch.softmax(logits, dim=-1)
+                                                cls = int(torch.argmax(probs, dim=-1).item())
+                                                if cls != 0:
+                                                    return self.CLASS_IDX_TO_NAME.get(cls, f"class_{cls}")
+                                            return None
                             except Exception as e:
                                 return self.create_error_response(
                                     f"Video guardrail unavailable: {e}",
@@ -252,20 +384,39 @@ class OpenAIServingChat(OpenAIServing):
                                 media_io_kwargs=self.model_config.media_io_kwargs,
                                 allowed_local_media_path=getattr(self.model_config, "allowed_local_media_path", ""),
                             )
-                            # Build guardrail runner (runs on GPU if available)
-                            runner = create_video_guardrail_runner(checkpoint_dir)
+                            # Build guardrail runner using ONLY the video content safety filter
+                            device = "cuda" if torch.cuda.is_available() else "cpu"
+                            try:
+                                if impl == "cosmos":
+                                    video_filter = VideoContentSafetyFilter(checkpoint_dir=checkpoint_dir, device=device)  # type: ignore
+                                    runner = GuardrailRunner(safety_models=[video_filter], generic_safe_msg="Video is safe")  # type: ignore
+                                else:
+                                    vf = _MinimalVideoFilter(checkpoint_root=checkpoint_dir, device=device)
+                                    runner = None
+                            except Exception as e:
+                                return self.create_error_response(
+                                    f"Video guardrail init failed: {e}",
+                                    err_type="GuardrailInitError")
 
                             # Iterate urls, load sampled frames with VideoMediaIO and test
                             for u in video_urls:
                                 frames, _meta = connector.fetch_video(u)
-                                safe, msg = runner.run_safety_check(frames)
-                                if not safe:
-                                    # 422 Unprocessable Entity with classifier message
-                                    from http import HTTPStatus
-                                    return self.create_error_response(
-                                        message=f"Unsafe video content detected: {msg}",
-                                        err_type="ContentSafetyError",
-                                        status_code=HTTPStatus.UNPROCESSABLE_ENTITY)
+                                if impl == "cosmos":
+                                    safe, msg = runner.run_safety_check(frames)  # type: ignore[union-attr]
+                                    if not safe:
+                                        from http import HTTPStatus
+                                        return self.create_error_response(
+                                            message=f"Unsafe video content detected: {msg}",
+                                            err_type="ContentSafetyError",
+                                            status_code=HTTPStatus.UNPROCESSABLE_ENTITY)
+                                else:
+                                    unsafe_reason = vf.first_unsafe(frames)
+                                    if unsafe_reason is not None:
+                                        from http import HTTPStatus
+                                        return self.create_error_response(
+                                            message=f"Unsafe video content detected: {unsafe_reason}",
+                                            err_type="ContentSafetyError",
+                                            status_code=HTTPStatus.UNPROCESSABLE_ENTITY)
                     # else: guardrail disabled; proceed
             except Exception as e:
                 # Fail closed? Manager requested blocking unsafe only; if guard fails, continue but log
