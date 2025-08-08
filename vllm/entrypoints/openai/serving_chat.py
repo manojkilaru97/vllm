@@ -1595,8 +1595,7 @@ class VideoSafetyGuardrail:
             
             # Resolve checkpoint directory
             base_paths = [
-                os.path.join(self.checkpoint_root, "nvidia", "Cosmos-Guardrail1", "video_content_safety_filter"),
-                os.path.join(self.checkpoint_root, "Cosmos-Guardrail1", "video_content_safety_filter")
+                os.path.join(self.checkpoint_root, "video_content_safety_filter")
             ]
             
             base_dir = None
