@@ -11,6 +11,8 @@ from typing import Any, Final
 import jinja2
 import partial_json_parser
 import regex as re
+import base64
+from pathlib import Path
 from fastapi import Request
 from openai_harmony import Message as OpenAIMessage
 from partial_json_parser.core.options import Allow
@@ -245,6 +247,21 @@ class OpenAIServingChat(OpenAIServing):
             raise self.engine_client.dead_error
 
         try:
+            # Resolve NVCF image assets in-place before preprocessing
+            if raw_request is not None:
+                try:
+                    request.messages = self._resolve_nvcf_image_assets(
+                        request.messages, raw_request)
+                except Exception as e:
+                    logger.exception("Error while resolving NVCF assets")
+                    return self.create_error_response(str(e))
+            # Strip raw multimodal special tokens from plain text to avoid
+            # backend crashes when no corresponding media is provided.
+            try:
+                request.messages = self._strip_mm_special_tokens_in_messages(
+                    request.messages)
+            except Exception:
+                logger.exception("Error while stripping MM special tokens")
             lora_request = self._maybe_get_adapters(
                 request, supports_default_mm_loras=True
             )
@@ -1690,6 +1707,51 @@ class OpenAIServingChat(OpenAIServing):
 
         return response
 
+    def _strip_mm_special_tokens_in_messages(self, messages: list[dict]) -> list[dict]:
+        """
+        Remove raw multimodal special tokens typed inside text content.
+
+        This prevents crashes when users include tokens like '<|image|>' or
+        '<image>' without supplying corresponding multimodal data. Structured
+        content parts (e.g., {'type': 'image_url', ...}) are preserved.
+        """
+        token_pattern = (
+            r"(?i)"  # case-insensitive
+            r"(<\|begin_of_image\|>|<\|image_start\|>|<\|image_end\|>|"
+            r"<\|image\|>|<\|audio\|>|<\|video\|>|<image>|</image>|"
+            r"<audio>|</audio>|<video>|</video>|<\|patch\|>)"
+        )
+        mm_token_re = re.compile(token_pattern)
+
+        def clean_text(text: str) -> str:
+            cleaned = mm_token_re.sub(" ", text)
+            return re.sub(r"\s+", " ", cleaned).strip()
+
+        def clean_message(msg: dict) -> dict:
+            if not isinstance(msg, dict):
+                return msg
+            new_msg = dict(msg)
+            content = new_msg.get("content")
+            if isinstance(content, str):
+                new_msg["content"] = clean_text(content)
+            elif isinstance(content, list):
+                new_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text" and isinstance(
+                                part.get("text"), str):
+                            new_part = dict(part)
+                            new_part["text"] = clean_text(part["text"])
+                            new_parts.append(new_part)
+                        else:
+                            new_parts.append(part)
+                    else:
+                        new_parts.append(part)
+                new_msg["content"] = new_parts
+            return new_msg
+
+        return [clean_message(m) for m in messages]
+
     def _get_top_logprobs(
         self,
         logprobs: dict[int, Logprob],
@@ -1777,6 +1839,105 @@ class OpenAIServingChat(OpenAIServing):
                 )
 
         return ChatCompletionLogProbs(content=logprobs_content)
+
+    def _resolve_nvcf_image_assets(
+        self, messages: list[dict], raw_request: Request
+    ) -> list[dict]:
+        """
+        Convert any NVCF image asset references to base64 data URLs and, when
+        present inside plain text content with <img src="...">, transform the
+        message into structured parts to ensure image loading by the multimodal
+        parser.
+
+        Supported inputs:
+        - Structured: {"type":"image_url", "image_url":{"url":"data:image/...;asset_id,<id>"}}
+        - Text with HTML: "... <img src=\"data:image/...;asset_id,<id>\"/> ..."
+        Headers used:
+        - NVCF-ASSET-DIR: absolute directory containing assets
+        - NVCF-FUNCTION-ASSET-IDS: comma-separated allowed asset ids
+        """
+        headers = raw_request.headers
+        asset_dir = headers.get("NVCF-ASSET-DIR")
+        allowed_ids_hdr = headers.get("NVCF-FUNCTION-ASSET-IDS")
+
+        if not asset_dir or not allowed_ids_hdr:
+            # Nothing to resolve
+            return messages
+
+        asset_root = Path(asset_dir)
+        if not asset_root.exists() or not asset_root.is_dir():
+            raise ValueError(f"Invalid NVCF-ASSET-DIR: {asset_dir}")
+
+        allowed_ids = {s.strip() for s in allowed_ids_hdr.split(',') if s.strip()}
+
+        def to_base64_data_url(data_url: str) -> str:
+            # data:image/<type>;asset_id,<id>
+            m = re.match(r"^data:(image/[^;]+);asset_id,([^,]+)$", data_url)
+            if not m:
+                return data_url
+            mime = m.group(1)
+            asset_id = m.group(2)
+            if asset_id not in allowed_ids:
+                raise ValueError(f"Asset id '{asset_id}' not permitted by NVCF-FUNCTION-ASSET-IDS")
+            file_path = (asset_root / asset_id).resolve()
+            # prevent traversal
+            if asset_root not in file_path.parents and file_path != asset_root:
+                raise ValueError("Asset path escapes NVCF-ASSET-DIR")
+            with open(file_path, 'rb') as f:
+                data_b64 = base64.b64encode(f.read()).decode('ascii')
+            return f"data:{mime};base64,{data_b64}"
+
+        def transform_message(msg: dict) -> dict:
+            content = msg.get("content")
+            # Case 1: structured content list
+            if isinstance(content, list):
+                new_parts = []
+                for part in content:
+                    if isinstance(part, dict) and "image_url" in part:
+                        url_obj = part["image_url"]
+                        if isinstance(url_obj, dict):
+                            url = url_obj.get("url")
+                            if isinstance(url, str) and ";asset_id," in url:
+                                url_obj["url"] = to_base64_data_url(url)
+                        elif isinstance(url_obj, str) and ";asset_id," in url_obj:
+                            part["image_url"] = {"url": to_base64_data_url(url_obj)}
+                        new_parts.append(part)
+                    else:
+                        new_parts.append(part)
+                msg["content"] = new_parts
+                return msg
+
+            # Case 2: plain text possibly containing <img src="...">
+            if isinstance(content, str):
+                pattern = re.compile(r"<img\s+[^>]*src=\"([^\"]+)\"[^>]*/?>")
+                idx = 0
+                parts = []
+                for m in pattern.finditer(content):
+                    start, end = m.span()
+                    url = m.group(1)
+                    if start > idx:
+                        text_chunk = content[idx:start]
+                        if text_chunk:
+                            parts.append({"type": "text", "text": text_chunk})
+                    if url.startswith("data:image/") and ";asset_id," in url:
+                        b64_url = to_base64_data_url(url)
+                        parts.append({"type": "image_url", "image_url": {"url": b64_url}})
+                    else:
+                        # keep as text if not asset_id pattern
+                        parts.append({"type": "text", "text": m.group(0)})
+                    idx = end
+                if parts:
+                    # trailing text
+                    if idx < len(content):
+                        tail = content[idx:]
+                        if tail:
+                            parts.append({"type": "text", "text": tail})
+                    msg["content"] = parts
+                return msg
+
+            return msg
+
+        return [transform_message(dict(m)) for m in messages]
 
     def _should_stream_with_auto_tool_parsing(self, request: ChatCompletionRequest):
         """
