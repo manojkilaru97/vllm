@@ -773,6 +773,7 @@ FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG CUDA_VERSION
+ARG VLLM_WITH_OTEL=0
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -806,6 +807,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
             # clean up -dev packages, keep runtime libraries
             rm -rf /var/lib/apt/lists/* \
         ); \
+    fi; \
+    if [ "$VLLM_WITH_OTEL" = "1" ]; then \
+        uv pip install --system \
+          'opentelemetry-sdk>=1.26.0,<1.27.0' \
+          'opentelemetry-api>=1.26.0,<1.27.0' \
+          'opentelemetry-exporter-otlp>=1.26.0,<1.27.0' \
+          'opentelemetry-semantic-conventions-ai>=0.4.1,<0.5.0'; \
     fi
 
 ENV VLLM_USAGE_SOURCE production-docker-image
