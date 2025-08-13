@@ -65,6 +65,9 @@ class StreamingXMLToolCallParser:
         self.current_param_is_first = False
         self.should_emit_end_newline = False
         self.start_quote_emitted = False
+        # Track whether we already emitted the JSON object close for
+        # the current function to avoid accidental duplicate "}" chunks.
+        self.function_json_closed = False
 
         self.streaming_buffer = ""
         self.last_processed_pos = 0
@@ -277,21 +280,6 @@ class StreamingXMLToolCallParser:
                         self._end_element("parameter")
                     if self.current_function_open or self.current_function_name:
                         self._end_element("function")
-                    # Output final tool_call tail delta
-                    final_delta = DeltaMessage(
-                        role=None,
-                        content=None,
-                        reasoning=None,
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.tool_call_index - 1,
-                                id=self.current_call_id,
-                                type="function",
-                                function=DeltaFunctionCall(name=None, arguments=""),
-                            )
-                        ],
-                    )
-                    self._emit_delta(final_delta)
                     # Reset XML parser and current call state
                     self._reset_xml_parser_after_tool_call()
                 # Parse preprocessed element
@@ -642,6 +630,7 @@ class StreamingXMLToolCallParser:
             function_name = self._extract_function_name(name, attrs)
             self.current_function_name = function_name
             self.current_function_open = True
+            self.function_json_closed = False
             if function_name:
                 delta = DeltaMessage(
                     tool_calls=[
@@ -897,32 +886,35 @@ class StreamingXMLToolCallParser:
             self.start_quote_emitted = False
 
         elif name.startswith("function") or name == "function":
-            # if there are parameters, close JSON object
-            if self.parameters:
-                delta = DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.tool_call_index - 1,
-                            id=self.current_call_id,
-                            type="function",
-                            function=DeltaFunctionCall(name=None, arguments="}"),
-                        )
-                    ]
-                )
-                self._emit_delta(delta)
-            # return empty object
-            else:
-                delta = DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.tool_call_index - 1,
-                            id=self.current_call_id,
-                            type="function",
-                            function=DeltaFunctionCall(name=None, arguments="{}"),
-                        )
-                    ]
-                )
-                self._emit_delta(delta)
+            # Avoid duplicate close braces for the same function.
+            if not self.function_json_closed:
+                # if there are parameters, close JSON object
+                if self.parameters:
+                    delta = DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.tool_call_index - 1,
+                                id=self.current_call_id,
+                                type="function",
+                                function=DeltaFunctionCall(name=None, arguments="}"),
+                            )
+                        ]
+                    )
+                    self._emit_delta(delta)
+                # return empty object
+                else:
+                    delta = DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.tool_call_index - 1,
+                                id=self.current_call_id,
+                                type="function",
+                                function=DeltaFunctionCall(name=None, arguments="{}"),
+                            )
+                        ]
+                    )
+                    self._emit_delta(delta)
+                self.function_json_closed = True
             self.current_function_open = False
 
         elif name == "tool_call":
@@ -934,18 +926,6 @@ class StreamingXMLToolCallParser:
                     self._end_element("parameter")
                 # Close function, ensure output '}' or '{}'
                 self._end_element("function")
-            # Final Delta
-            delta = DeltaMessage(
-                tool_calls=[
-                    DeltaToolCall(
-                        index=self.tool_call_index - 1,
-                        id=self.current_call_id,
-                        type="function",
-                        function=DeltaFunctionCall(name=None, arguments=""),
-                    )
-                ]
-            )
-            self._emit_delta(delta)
 
             # Check if there's text content to output (between tool_calls)
             if self.text_content_buffer.strip():
@@ -1157,6 +1137,7 @@ class StreamingXMLToolCallParser:
         self.should_emit_end_newline = False
         self.start_quote_emitted = False
         self.text_content_buffer = ""
+        self.function_json_closed = False
 
         # Reset preprocessing and deferred parsing state
         self._pre_inside_parameter = False
@@ -1282,6 +1263,22 @@ class Qwen3XMLToolParser(ToolParser):
 
         # Parse the delta text and get the result
         result = self.parser.parse_single_streaming_chunks(delta_text)
+        if result and result.tool_calls:
+            filtered_tool_calls: list[DeltaToolCall] = []
+            for tool_call in result.tool_calls:
+                fn = tool_call.function
+                if (
+                    fn is not None
+                    and fn.name in (None, "")
+                    and fn.arguments in (None, "")
+                ):
+                    continue
+                filtered_tool_calls.append(tool_call)
+            if len(filtered_tool_calls) != len(result.tool_calls):
+                result = DeltaMessage(
+                    content=result.content,
+                    tool_calls=filtered_tool_calls if filtered_tool_calls else None,
+                )
 
         # Update tool call tracking arrays based on incremental parsing results
         if result and result.tool_calls:

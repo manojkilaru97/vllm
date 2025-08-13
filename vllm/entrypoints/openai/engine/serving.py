@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import json
+import sys
 import time
+import traceback
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -36,10 +38,10 @@ from vllm.entrypoints.openai.completion.protocol import (
     CompletionResponse,
 )
 from vllm.entrypoints.openai.engine.protocol import (
+    ErrorInfo,
     ErrorResponse,
     FunctionCall,
     FunctionDefinition,
-    GenerationError,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.responses.context import (
@@ -59,6 +61,17 @@ from vllm.entrypoints.openai.speech_to_text.protocol import (
     TranscriptionRequest,
     TranscriptionResponse,
     TranslationRequest,
+)
+from vllm.entrypoints.pooling.classify.protocol import (
+    ClassificationChatRequest,
+    ClassificationCompletionRequest,
+    ClassificationResponse,
+)
+from vllm.entrypoints.pooling.embed.protocol import (
+    EmbeddingBytesResponse,
+    EmbeddingChatRequest,
+    EmbeddingCompletionRequest,
+    EmbeddingResponse,
 )
 from vllm.entrypoints.pooling.pooling.protocol import (
     IOProcessorRequest,
@@ -81,7 +94,7 @@ from vllm.entrypoints.serve.tokenize.protocol import (
     TokenizeCompletionRequest,
     TokenizeResponse,
 )
-from vllm.entrypoints.utils import create_error_response, get_max_tokens
+from vllm.entrypoints.utils import get_max_tokens, sanitize_message
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs.data import (
     ProcessorInputs,
@@ -114,8 +127,18 @@ from vllm.utils import random_uuid
 from vllm.utils.async_utils import (
     collect_from_async_generator,
     merge_async_iterators,
+    tokenizer_lock,
 )
 from vllm.utils.mistral import is_mistral_tokenizer
+
+
+class GenerationError(Exception):
+    """raised when finish_reason indicates internal server error (500)"""
+
+    def __init__(self, message: str = "Internal server error"):
+        super().__init__(message)
+        self.status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+
 
 logger = init_logger(__name__)
 
@@ -138,13 +161,19 @@ CompletionLikeRequest: TypeAlias = (
     CompletionRequest
     | TokenizeCompletionRequest
     | DetokenizeRequest
+    | EmbeddingCompletionRequest
+    | ClassificationCompletionRequest
     | RerankRequest
     | ScoreRequest
     | PoolingCompletionRequest
 )
 
 ChatLikeRequest: TypeAlias = (
-    ChatCompletionRequest | TokenizeChatRequest | PoolingChatRequest
+    ChatCompletionRequest
+    | TokenizeChatRequest
+    | EmbeddingChatRequest
+    | ClassificationChatRequest
+    | PoolingChatRequest
 )
 
 SpeechToTextRequest: TypeAlias = TranscriptionRequest | TranslationRequest
@@ -164,9 +193,11 @@ AnyResponse: TypeAlias = (
     | TranscriptionResponse
     | TokenizeResponse
     | PoolingResponse
+    | ClassificationResponse
     | ScoreResponse
     | GenerateResponse
 )
+
 
 RequestT = TypeVar("RequestT", bound=AnyRequest)
 
@@ -191,7 +222,8 @@ class ServeContext(Generic[RequestT]):
 
 class OpenAIServing:
     request_id_prefix: ClassVar[str] = """
-    A short string prepended to every request’s ID.
+    A short string prepended to every request’s ID (e.g. "embd", "classify")
+    so you can easily tell “this ID came from Embedding vs Classification.”
     """
 
     def __init__(
@@ -201,6 +233,7 @@ class OpenAIServing:
         *,
         request_logger: RequestLogger | None,
         return_tokens_as_token_ids: bool = False,
+        log_error_stack: bool = False,
     ):
         super().__init__()
 
@@ -210,6 +243,8 @@ class OpenAIServing:
 
         self.request_logger = request_logger
         self.return_tokens_as_token_ids = return_tokens_as_token_ids
+
+        self.log_error_stack = log_error_stack
 
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
@@ -391,7 +426,8 @@ class OpenAIServing:
                 tokens = beam.tokens[tokenized_length:-1]
             else:
                 tokens = beam.tokens[tokenized_length:]
-            beam.text = tokenizer.decode(tokens)
+            with tokenizer_lock(tokenizer):
+                beam.text = tokenizer.decode(tokens)
 
         yield RequestOutput(
             request_id=request_id,
@@ -420,7 +456,8 @@ class OpenAIServing:
         ctx: ServeContext,
     ) -> ErrorResponse | None:
         """
-        Default preprocessing hook. Subclasses may override to prepare `ctx`.
+        Default preprocessing hook. Subclasses may override
+        to prepare `ctx` (classification, embedding, etc.).
         """
         return None
 
@@ -499,79 +536,133 @@ class OpenAIServing:
         """Schedule the request and get the result generator."""
         generators: list[AsyncGenerator[PoolingRequestOutput, None]] = []
 
-        trace_headers = (
-            None
-            if ctx.raw_request is None
-            else await self._get_trace_headers(ctx.raw_request.headers)
-        )
-
-        pooling_params = self._create_pooling_params(ctx)
-        if isinstance(pooling_params, ErrorResponse):
-            return pooling_params
-
-        if ctx.engine_prompts is None:
-            return self.create_error_response("Engine prompts not available")
-
-        for i, engine_prompt in enumerate(ctx.engine_prompts):
-            request_id_item = f"{ctx.request_id}-{i}"
-
-            self._log_inputs(
-                request_id_item,
-                engine_prompt,
-                params=pooling_params,
-                lora_request=ctx.lora_request,
+        try:
+            trace_headers = (
+                None
+                if ctx.raw_request is None
+                else await self._get_trace_headers(ctx.raw_request.headers)
             )
 
-            generator = self.engine_client.encode(
-                engine_prompt,
-                pooling_params,
-                request_id_item,
-                lora_request=ctx.lora_request,
-                trace_headers=trace_headers,
-                priority=getattr(ctx.request, "priority", 0),
-            )
+            pooling_params = self._create_pooling_params(ctx)
+            if isinstance(pooling_params, ErrorResponse):
+                return pooling_params
 
-            generators.append(generator)
+            if ctx.engine_prompts is None:
+                return self.create_error_response("Engine prompts not available")
 
-        ctx.result_generator = merge_async_iterators(*generators)
+            for i, engine_prompt in enumerate(ctx.engine_prompts):
+                request_id_item = f"{ctx.request_id}-{i}"
 
-        return None
+                self._log_inputs(
+                    request_id_item,
+                    engine_prompt,
+                    params=pooling_params,
+                    lora_request=ctx.lora_request,
+                )
+
+                generator = self.engine_client.encode(
+                    engine_prompt,
+                    pooling_params,
+                    request_id_item,
+                    lora_request=ctx.lora_request,
+                    trace_headers=trace_headers,
+                    priority=getattr(ctx.request, "priority", 0),
+                )
+
+                generators.append(generator)
+
+            ctx.result_generator = merge_async_iterators(*generators)
+
+            return None
+
+        except Exception as e:
+            return self.create_error_response(e)
 
     async def _collect_batch(
         self,
         ctx: ServeContext,
     ) -> ErrorResponse | None:
         """Collect batch results from the result generator."""
-        if ctx.engine_prompts is None:
-            return self.create_error_response("Engine prompts not available")
+        try:
+            if ctx.engine_prompts is None:
+                return self.create_error_response("Engine prompts not available")
 
-        num_prompts = len(ctx.engine_prompts)
-        final_res_batch: list[PoolingRequestOutput | None]
-        final_res_batch = [None] * num_prompts
+            num_prompts = len(ctx.engine_prompts)
+            final_res_batch: list[PoolingRequestOutput | None]
+            final_res_batch = [None] * num_prompts
 
-        if ctx.result_generator is None:
-            return self.create_error_response("Result generator not available")
+            if ctx.result_generator is None:
+                return self.create_error_response("Result generator not available")
 
-        async for i, res in ctx.result_generator:
-            final_res_batch[i] = res
+            async for i, res in ctx.result_generator:
+                final_res_batch[i] = res
 
-        if None in final_res_batch:
-            return self.create_error_response(
-                "Failed to generate results for all prompts"
-            )
+            if None in final_res_batch:
+                return self.create_error_response(
+                    "Failed to generate results for all prompts"
+                )
 
-        ctx.final_res_batch = [res for res in final_res_batch if res is not None]
+            ctx.final_res_batch = [res for res in final_res_batch if res is not None]
 
-        return None
+            return None
 
-    @staticmethod
+        except Exception as e:
+            return self.create_error_response(e)
+
     def create_error_response(
+        self,
         message: str | Exception,
         err_type: str = "BadRequestError",
         status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
         param: str | None = None,
     ) -> ErrorResponse:
-        return create_error_response(message, err_type, status_code, param)
+        exc: Exception | None = None
+
+        if isinstance(message, Exception):
+            exc = message
+
+            from vllm.exceptions import VLLMValidationError
+
+            if isinstance(exc, VLLMValidationError):
+                err_type = "BadRequestError"
+                status_code = HTTPStatus.BAD_REQUEST
+                param = exc.parameter
+            elif isinstance(exc, (ValueError, TypeError, RuntimeError, OverflowError)):
+                # Common validation errors from user input
+                err_type = "BadRequestError"
+                status_code = HTTPStatus.BAD_REQUEST
+                param = None
+            elif isinstance(exc, NotImplementedError):
+                err_type = "NotImplementedError"
+                status_code = HTTPStatus.NOT_IMPLEMENTED
+                param = None
+            elif exc.__class__.__name__ == "TemplateError":
+                # jinja2.TemplateError (avoid importing jinja2)
+                err_type = "BadRequestError"
+                status_code = HTTPStatus.BAD_REQUEST
+                param = None
+            else:
+                err_type = "InternalServerError"
+                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                param = None
+
+            message = str(exc)
+
+        if self.log_error_stack:
+            exc_type, _, _ = sys.exc_info()
+            if exc_type is not None:
+                traceback.print_exc()
+            else:
+                traceback.print_stack()
+
+        return ErrorResponse(
+            error=ErrorInfo(
+                message=sanitize_message(message),
+                type=err_type,
+                code=status_code.value,
+                param=param,
+            )
+        )
 
     def create_streaming_error_response(
         self,
@@ -598,6 +689,16 @@ class OpenAIServing:
                 request_id,
             )
             raise GenerationError("Internal server error")
+
+    def _convert_generation_error_to_response(
+        self, e: GenerationError
+    ) -> ErrorResponse:
+        """Convert GenerationError to ErrorResponse."""
+        return self.create_error_response(
+            str(e),
+            err_type="InternalServerError",
+            status_code=e.status_code,
+        )
 
     def _convert_generation_error_to_streaming_response(
         self, e: GenerationError
@@ -717,7 +818,8 @@ class OpenAIServing:
         token_num = len(input_ids)
         max_model_len = self.model_config.max_model_len
 
-        # Note: ScoreRequest doesn't have max_tokens
+        # Note: EmbeddingRequest, ClassificationRequest,
+        # and ScoreRequest doesn't have max_tokens
         if isinstance(
             request,
             (
@@ -725,6 +827,8 @@ class OpenAIServing:
                 ScoreTextRequest,
                 ScoreQueriesDocumentsRequest,
                 RerankRequest,
+                ClassificationCompletionRequest,
+                ClassificationChatRequest,
             ),
         ):
             # Note: input length can be up to the entire model context length
@@ -734,6 +838,8 @@ class OpenAIServing:
                     ScoreDataRequest: "score",
                     ScoreTextRequest: "score",
                     ScoreQueriesDocumentsRequest: "score",
+                    ClassificationCompletionRequest: "classification",
+                    ClassificationChatRequest: "classification",
                 }
                 operation = operations.get(type(request), "embedding generation")
                 raise VLLMValidationError(
@@ -775,15 +881,11 @@ class OpenAIServing:
 
         if max_tokens is not None and token_num + max_tokens > max_model_len:
             raise VLLMValidationError(
-                f"This model's maximum context length is "
-                f"{max_model_len} tokens. However, you requested "
-                f"{max_tokens} output tokens and your prompt contains "
-                f"{token_num} input tokens, for a total of "
-                f"{token_num + max_tokens} tokens "
-                f"({token_num} + {max_tokens} = "
-                f"{token_num + max_tokens} > {max_model_len}). "
-                f"Please reduce the length of the input prompt or the "
-                f"number of requested output tokens.",
+                "'max_tokens' or 'max_completion_tokens' is too large: "
+                f"{max_tokens}. This model's maximum context length is "
+                f"{max_model_len} tokens and your request has "
+                f"{token_num} input tokens ({max_tokens} > {max_model_len}"
+                f" - {token_num}).",
                 parameter="max_tokens",
                 value=max_tokens,
             )
@@ -883,8 +985,6 @@ class OpenAIServing:
                 tokenize=is_mistral_tokenizer(renderer.tokenizer),
             ),
         )
-
-        mm_config = self.model_config.multimodal_config
 
         tok_params = request.build_tok_params(self.model_config)
         chat_params = request.build_chat_params(
@@ -1100,6 +1200,97 @@ class OpenAIServing:
             return None
 
     @staticmethod
+    def _has_kimi_k2_markers(text: str) -> bool:
+        """Check if text contains Kimi K2 tool call markers."""
+        markers = [
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>",
+            "<|tool_call_argument_begin|>",
+        ]
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _extract_kimi_k2_tool_calls(content: str) -> list[tuple[str, str]]:
+        """
+        Extract tool calls from Kimi K2 marker format.
+        Returns: List of (function_name, arguments_json) tuples.
+        """
+        import re as re_std
+        tool_calls = []
+
+        # Pattern to match each tool call block
+        pattern = r"<\|tool_call_begin\|>\s*(?:functions\.)?(\w+):\d+\s*<\|tool_call_argument_begin\|>\s*(.*?)\s*<\|tool_call_end\|>"
+        matches = re_std.findall(pattern, content, re_std.DOTALL)
+
+        for func_name, args in matches:
+            tool_calls.append((func_name, args.strip()))
+
+        return tool_calls
+
+    @staticmethod
+    def _extract_kimi_k2_single_arguments(text: str) -> str | None:
+        """Extract arguments from a single Kimi K2 tool call format."""
+        arg_begin = "<|tool_call_argument_begin|>"
+        arg_end = "<|tool_call_end|>"
+
+        if arg_begin in text:
+            start = text.find(arg_begin) + len(arg_begin)
+            end_pos = text.find(arg_end, start)
+            if end_pos > start:
+                return text[start:end_pos].strip()
+            else:
+                return text[start:].strip()
+        return None
+
+    @staticmethod
+    def _looks_like_xml_tool_call(text: str) -> bool:
+        """Best-effort detection for XML-style tool-call envelopes."""
+        markers = ("<tool_call>", "</tool_call>", "<function=", "<parameter=")
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _extract_tool_calls_with_parser(
+        request: ResponsesRequest | ChatCompletionRequest,
+        tokenizer: TokenizerLike | None,
+        tool_parser_cls: Callable[[TokenizerLike], ToolParser] | None,
+        content: str,
+        log_context: str,
+    ) -> list[FunctionCall] | None:
+        """Try extracting tool calls via configured parser as a fallback path."""
+        if tool_parser_cls is None:
+            return None
+        if tokenizer is None:
+            return None
+        if not isinstance(request, ChatCompletionRequest):
+            return None
+
+        try:
+            tool_parser = tool_parser_cls(tokenizer)
+        except Exception:
+            return None
+
+        try:
+            tool_call_info = tool_parser.extract_tool_calls(content, request=request)
+        except Exception:
+            return None
+
+        if not tool_call_info or not tool_call_info.tools_called:
+            return None
+
+        parsed_calls: list[FunctionCall] = []
+        for tool_call in tool_call_info.tool_calls:
+            if tool_call.function and tool_call.function.name:
+                parsed_calls.append(
+                    FunctionCall(
+                        id=tool_call.id,
+                        name=tool_call.function.name,
+                        arguments=tool_call.function.arguments,
+                    )
+                )
+
+        return parsed_calls if parsed_calls else None
+
+    @staticmethod
     def _parse_tool_calls_from_content(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
@@ -1110,32 +1301,118 @@ class OpenAIServing:
         function_calls = list[FunctionCall]()
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
-            # Forced Function Call
+            target_name = request.tool_choice.name
+            # Forced Function Call - handle Kimi K2 marker format
+            if OpenAIServing._has_kimi_k2_markers(content):
+                arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
+                if arguments is None:
+                    arguments = ""
+            else:
+                stripped_content = content.strip()
+                arguments = content
+                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                        log_context=f"forced_function:{target_name}",
+                    )
+                    if parsed_calls:
+                        matched = next(
+                            (fc for fc in parsed_calls if fc.name == target_name),
+                            parsed_calls[0],
+                        )
+                        arguments = matched.arguments
+                else:
+                    # Normalize direct JSON object arguments when present.
+                    try:
+                        parsed_obj = json.loads(stripped_content)
+                        if isinstance(parsed_obj, dict):
+                            arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        pass
             function_calls.append(
-                FunctionCall(name=request.tool_choice.name, arguments=content)
+                FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice and isinstance(
             request.tool_choice, ChatCompletionNamedToolChoiceParam
         ):
             assert content is not None
-            # Forced Function Call
+            target_name = request.tool_choice.function.name
+            # Forced Function Call - handle Kimi K2 marker format
+            if OpenAIServing._has_kimi_k2_markers(content):
+                arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
+                if arguments is None:
+                    arguments = ""
+            else:
+                stripped_content = content.strip()
+                arguments = content
+                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                        log_context=f"named_function:{target_name}",
+                    )
+                    if parsed_calls:
+                        matched = next(
+                            (fc for fc in parsed_calls if fc.name == target_name),
+                            parsed_calls[0],
+                        )
+                        arguments = matched.arguments
+                else:
+                    # Normalize direct JSON object arguments when present.
+                    try:
+                        parsed_obj = json.loads(stripped_content)
+                        if isinstance(parsed_obj, dict):
+                            arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        pass
             function_calls.append(
-                FunctionCall(name=request.tool_choice.function.name, arguments=content)
+                FunctionCall(name=request.tool_choice.function.name, arguments=arguments)
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice == "required":
             assert content is not None
-            tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(content)
-            function_calls.extend(
-                [
-                    FunctionCall(
-                        name=tool_call.name,
-                        arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
+            # Handle Kimi K2 marker format for tool_choice=required
+            if OpenAIServing._has_kimi_k2_markers(content):
+                extracted_calls = OpenAIServing._extract_kimi_k2_tool_calls(content)
+                for func_name, args in extracted_calls:
+                    function_calls.append(
+                        FunctionCall(name=func_name, arguments=args)
                     )
-                    for tool_call in tool_calls
-                ]
-            )
+            else:
+                # Standard JSON format, with parser fallback for XML-like model outputs.
+                try:
+                    tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
+                        content
+                    )
+                    function_calls.extend(
+                        [
+                            FunctionCall(
+                                name=tool_call.name,
+                                arguments=json.dumps(
+                                    tool_call.parameters, ensure_ascii=False
+                                ),
+                            )
+                            for tool_call in tool_calls
+                        ]
+                    )
+                except Exception:
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                        log_context="required",
+                    )
+                    if parsed_calls:
+                        function_calls.extend(parsed_calls)
+                    else:
+                        raise
             content = None  # Clear content since tool is called.
         elif (
             tool_parser_cls
@@ -1194,7 +1471,8 @@ class OpenAIServing:
                 "Unable to get tokenizer because `skip_tokenizer_init=True`"
             )
 
-        return tokenizer.decode([token_id])
+        with tokenizer_lock(tokenizer):
+            return tokenizer.decode([token_id])
 
     def _is_model_supported(self, model_name: str | None) -> bool:
         if not model_name:
