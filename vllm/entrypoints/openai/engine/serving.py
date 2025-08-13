@@ -127,6 +127,7 @@ from vllm.utils import random_uuid
 from vllm.utils.async_utils import (
     collect_from_async_generator,
     merge_async_iterators,
+    tokenizer_lock,
 )
 from vllm.utils.mistral import is_mistral_tokenizer
 
@@ -426,7 +427,8 @@ class OpenAIServing:
                 tokens = beam.tokens[tokenized_length:-1]
             else:
                 tokens = beam.tokens[tokenized_length:]
-            beam.text = tokenizer.decode(tokens)
+            with tokenizer_lock(tokenizer):
+                beam.text = tokenizer.decode(tokens)
 
         yield RequestOutput(
             request_id=request_id,
@@ -1240,6 +1242,54 @@ class OpenAIServing:
         return None
 
     @staticmethod
+    def _looks_like_xml_tool_call(text: str) -> bool:
+        """Best-effort detection for XML-style tool-call envelopes."""
+        markers = ("<tool_call>", "</tool_call>", "<function=", "<parameter=")
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _extract_tool_calls_with_parser(
+        request: ResponsesRequest | ChatCompletionRequest,
+        tokenizer: TokenizerLike | None,
+        tool_parser_cls: Callable[[TokenizerLike], ToolParser] | None,
+        content: str,
+        log_context: str,
+    ) -> list[FunctionCall] | None:
+        """Try extracting tool calls via configured parser as a fallback path."""
+        if tool_parser_cls is None:
+            return None
+        if tokenizer is None:
+            return None
+        if not isinstance(request, ChatCompletionRequest):
+            return None
+
+        try:
+            tool_parser = tool_parser_cls(tokenizer)
+        except Exception:
+            return None
+
+        try:
+            tool_call_info = tool_parser.extract_tool_calls(content, request=request)
+        except Exception:
+            return None
+
+        if not tool_call_info or not tool_call_info.tools_called:
+            return None
+
+        parsed_calls: list[FunctionCall] = []
+        for tool_call in tool_call_info.tool_calls:
+            if tool_call.function and tool_call.function.name:
+                parsed_calls.append(
+                    FunctionCall(
+                        id=tool_call.id,
+                        name=tool_call.function.name,
+                        arguments=tool_call.function.arguments,
+                    )
+                )
+
+        return parsed_calls if parsed_calls else None
+
+    @staticmethod
     def _parse_tool_calls_from_content(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
@@ -1250,13 +1300,37 @@ class OpenAIServing:
         function_calls = list[FunctionCall]()
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
+            target_name = request.tool_choice.name
             # Forced Function Call - handle Kimi K2 marker format
             if OpenAIServing._has_kimi_k2_markers(content):
                 arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
                 if arguments is None:
                     arguments = ""
             else:
+                stripped_content = content.strip()
                 arguments = content
+                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                        log_context=f"forced_function:{target_name}",
+                    )
+                    if parsed_calls:
+                        matched = next(
+                            (fc for fc in parsed_calls if fc.name == target_name),
+                            parsed_calls[0],
+                        )
+                        arguments = matched.arguments
+                else:
+                    # Normalize direct JSON object arguments when present.
+                    try:
+                        parsed_obj = json.loads(stripped_content)
+                        if isinstance(parsed_obj, dict):
+                            arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        pass
             function_calls.append(
                 FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
@@ -1265,13 +1339,37 @@ class OpenAIServing:
             request.tool_choice, ChatCompletionNamedToolChoiceParam
         ):
             assert content is not None
+            target_name = request.tool_choice.function.name
             # Forced Function Call - handle Kimi K2 marker format
             if OpenAIServing._has_kimi_k2_markers(content):
                 arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
                 if arguments is None:
                     arguments = ""
             else:
+                stripped_content = content.strip()
                 arguments = content
+                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                        log_context=f"named_function:{target_name}",
+                    )
+                    if parsed_calls:
+                        matched = next(
+                            (fc for fc in parsed_calls if fc.name == target_name),
+                            parsed_calls[0],
+                        )
+                        arguments = matched.arguments
+                else:
+                    # Normalize direct JSON object arguments when present.
+                    try:
+                        parsed_obj = json.loads(stripped_content)
+                        if isinstance(parsed_obj, dict):
+                            arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        pass
             function_calls.append(
                 FunctionCall(name=request.tool_choice.function.name, arguments=arguments)
             )
@@ -1286,17 +1384,34 @@ class OpenAIServing:
                         FunctionCall(name=func_name, arguments=args)
                     )
             else:
-                # Standard JSON format
-                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(content)
-                function_calls.extend(
-                    [
-                        FunctionCall(
-                            name=tool_call.name,
-                            arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
-                        )
-                        for tool_call in tool_calls
-                    ]
-                )
+                # Standard JSON format, with parser fallback for XML-like model outputs.
+                try:
+                    tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
+                        content
+                    )
+                    function_calls.extend(
+                        [
+                            FunctionCall(
+                                name=tool_call.name,
+                                arguments=json.dumps(
+                                    tool_call.parameters, ensure_ascii=False
+                                ),
+                            )
+                            for tool_call in tool_calls
+                        ]
+                    )
+                except Exception:
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                        log_context="required",
+                    )
+                    if parsed_calls:
+                        function_calls.extend(parsed_calls)
+                    else:
+                        raise
             content = None  # Clear content since tool is called.
         elif (
             tool_parser_cls
@@ -1355,7 +1470,8 @@ class OpenAIServing:
                 "Unable to get tokenizer because `skip_tokenizer_init=True`"
             )
 
-        return tokenizer.decode([token_id])
+        with tokenizer_lock(tokenizer):
+            return tokenizer.decode([token_id])
 
     def _is_model_supported(self, model_name: str | None) -> bool:
         if not model_name:

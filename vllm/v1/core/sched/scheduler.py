@@ -568,12 +568,41 @@ class Scheduler(SchedulerInterface):
                 # for FSM compilation.
                 if request.status == RequestStatus.WAITING_FOR_FSM:
                     structured_output_req = request.structured_output_request
-                    if structured_output_req and structured_output_req.grammar:
+                    if structured_output_req is None:
                         request.status = RequestStatus.WAITING
                     else:
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
-                        continue
+                        try:
+                            grammar_error = structured_output_req.grammar_error
+                            grammar = structured_output_req.grammar
+                        except Exception:
+                            logger.exception(
+                                "Structured output grammar compilation failed; "
+                                "finishing request (request_id=%s)",
+                                request_id,
+                            )
+                            self.finish_requests(
+                                request_id, RequestStatus.FINISHED_ERROR
+                            )
+                            continue
+
+                        if grammar_error is not None:
+                            logger.error(
+                                "Structured output grammar compilation failed for "
+                                "request_id=%s: %s",
+                                request_id,
+                                grammar_error,
+                            )
+                            self.finish_requests(
+                                request_id, RequestStatus.FINISHED_ERROR
+                            )
+                            continue
+
+                        if grammar is not None:
+                            request.status = RequestStatus.WAITING
+                        else:
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.prepend_request(request)
+                            continue
 
                 # Streaming: skip request if still waiting for next streaming req.
                 if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
@@ -1361,6 +1390,46 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            if new_token_ids:
+                constrained_token_ids = new_token_ids
+                should_advance = self.structured_output_manager.should_advance(request)
+                struct_output_request = request.structured_output_request
+
+                if struct_output_request is not None:
+                    advance_from = getattr(struct_output_request, "_so_advance_from", 0)
+                    if advance_from is None:
+                        constrained_token_ids = []
+                    elif isinstance(advance_from, int) and advance_from > 0:
+                        constrained_token_ids = new_token_ids[advance_from:]
+                    # reset one-step trim marker
+                    setattr(struct_output_request, "_so_advance_from", 0)
+
+                if should_advance and constrained_token_ids:
+                    assert struct_output_request is not None
+                    # Check if grammar is ready (handles async compilation race condition)
+                    if not struct_output_request.is_grammar_ready:
+                        pass
+                    elif struct_output_request.grammar is None:
+                        logger.warning(
+                            "Grammar is None for request %s despite "
+                            "is_grammar_ready=True (status=%s, output_tokens=%d, "
+                            "backend=%s)",
+                            req_id,
+                            request.status,
+                            request.num_output_tokens,
+                            struct_output_request.params._backend,
+                        )
+                    else:
+                        ok = struct_output_request.grammar.accept_tokens(
+                            req_id, constrained_token_ids
+                        )
+                        if not ok:
+                            logger.warning(
+                                "Unexpected: grammar rejected tokens %s for request %s.",
+                                constrained_token_ids,
+                                req_id,
+                            )
+
             routed_experts = None
             finish_reason = None
             if stopped:
@@ -1385,29 +1454,6 @@ class Scheduler(SchedulerInterface):
                 and logprobs
             ):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
-
-            if new_token_ids and self.structured_output_manager.should_advance(request):
-                struct_output_request = request.structured_output_request
-                assert struct_output_request is not None
-                # Check if grammar is ready (handles async compilation race condition)
-                if not struct_output_request.is_grammar_ready:
-                    logger.debug(
-                        "Grammar not ready yet for request %s, skipping accept_tokens",
-                        req_id,
-                    )
-                elif struct_output_request.grammar is None:
-                    logger.warning(
-                        "Grammar is None for request %s despite is_grammar_ready=True",
-                        req_id,
-                    )
-                else:
-                    ok = struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
-                    if not ok:
-                        logger.warning(
-                            "Unexpected: grammar rejected tokens %s for request %s.",
-                            new_token_ids,
-                            req_id,
-                        )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]

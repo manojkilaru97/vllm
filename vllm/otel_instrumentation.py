@@ -24,6 +24,7 @@ import json
 from typing import Optional, Tuple, Dict, Tuple as Tup, Any
 import threading
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 from prometheus_client.parser import text_string_to_metric_families
 import base64
 import re
@@ -54,6 +55,12 @@ _QUEUE_LISTENER: Optional[QueueListener] = None
 # Cached bucket per namespace (best-effort)
 _KRATOS_BUCKET_CACHE: Dict[str, str] = {}
 _OFFLOAD_CACHE: Dict[str, str] = {}  # sha256(data) -> uri (best-effort dedup)
+
+# Media mirroring (HTTP URLs / NVCF assets -> S3 via kratos) is intentionally
+# separate from "log offload" so it can emit a correlation event without
+# changing the original request log line.
+_MEDIA_MIRROR_QUEUE: Optional["queue.Queue[dict[str, Any]]"] = None
+_MEDIA_MIRROR_THREAD: Optional[threading.Thread] = None
 
 
 
@@ -378,6 +385,11 @@ def _extract_data_uris(text: str) -> Any:
 
 
 def _kratos_get_bucket(namespace: str, profile: str) -> Optional[str]:
+    # Allow explicit override for environments where storage metadata lookup
+    # is blocked/unavailable. This ensures log replacement can emit s3:// URIs.
+    override = os.getenv("KRATOS_BULKUPLOAD_S3_BUCKET") or os.getenv("KRATOS_OFFLOAD_S3_BUCKET")
+    if override:
+        return override
     # Best-effort: cache, then attempt API
     if namespace in _KRATOS_BUCKET_CACHE:
         return _KRATOS_BUCKET_CACHE[namespace]
@@ -442,117 +454,288 @@ def _kratos_bulk_upload_bytes(data: bytes, fname: str, cfg: Dict[str, str]) -> T
         return None, None
 
 
-class _KratosOffloadFilter(logging.Filter):
-    def __init__(self, threshold_bytes: int, enabled: bool, cfg: Dict[str, str]):
-        super().__init__()
-        self.threshold_bytes = threshold_bytes
-        self.enabled = enabled
-        self.cfg = cfg
+def _sanitize_url_no_query(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        # Drop query + fragment to avoid leaking presigned tokens.
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    except Exception:
+        return url
 
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
-        if not self.enabled:
-            return True
-        try:
-            # Collect mutable text targets from record: message, str fields, and list-of-str elements
-            targets: Dict[str, Any] = {}
-            setters: Dict[str, Any] = {}
 
-            if isinstance(record.msg, str):
-                targets["__message__"] = record.getMessage()
-                def _set_msg(val, rec=record):
-                    rec.msg = val
-                setters["__message__"] = _set_msg
+def _media_mirror_enabled() -> bool:
+    # Default to enabled when kratos is enabled, since mirroring relies on it.
+    return _is_truthy(os.getenv("VLLM_MEDIA_MIRROR_ENABLE", os.getenv("KRATOS_BULKUPLOAD_ENABLE", "0")))
 
-            for k, v in list(record.__dict__.items()):
-                if isinstance(v, str):
-                    targets[k] = v
-                    setters[k] = (lambda key: (lambda val, rec=record: rec.__dict__.__setitem__(key, val)))(k)
-                elif isinstance(v, list):
-                    for idx, elem in enumerate(v):
-                        if isinstance(elem, str):
-                            key = f"{k}[{idx}]"
-                            targets[key] = elem
-                            def _make_setter(field, i):
-                                def _setter(val, rec=record):
-                                    rec.__dict__[field][i] = val
-                                return _setter
-                            setters[key] = _make_setter(k, idx)
 
-            # For each candidate string, offload any data URIs such that
-            # the total size over threshold is offloaded.
-            total_est_bytes = 0
-            items = []
-            for key, text in targets.items():
-                matches = _extract_data_uris(text)
-                for m in matches:
-                    est_bytes = int(len(m["b64"]) * 3 / 4)
-                    total_est_bytes += est_bytes
-                    items.append((key, text, m, est_bytes))
+def _start_media_mirror_worker() -> None:
+    global _MEDIA_MIRROR_QUEUE, _MEDIA_MIRROR_THREAD
+    if _MEDIA_MIRROR_THREAD is not None and _MEDIA_MIRROR_QUEUE is not None:
+        return
 
-            if total_est_bytes < self.threshold_bytes or not items:
-                return True
+    # Bounded by default to prevent runaway memory usage; set to 0 for unbounded.
+    qsize = _env_int("VLLM_MEDIA_MIRROR_MAX_QUEUE", 256)
+    _MEDIA_MIRROR_QUEUE = queue.Queue(maxsize=qsize)
 
-            # Offload items until total_est_bytes drops below threshold
-            # Offload larger ones first
-            items.sort(key=lambda x: x[3], reverse=True)
-            remaining = total_est_bytes
-            updated_texts: Dict[str, str] = {}
-            for key, text, m, est_bytes in items:
-                if remaining < self.threshold_bytes:
-                    break
-                try:
-                    b = base64.b64decode(m["b64"], validate=False)
-                except Exception:
+    def _worker() -> None:
+        media_logger = logging.getLogger("vllm.payload")
+        cfg = _kratos_defaults()
+        while True:
+            try:
+                assert _MEDIA_MIRROR_QUEUE is not None
+                item = _MEDIA_MIRROR_QUEUE.get()
+                if item is None:  # type: ignore[comparison-overlap]
                     continue
-                ext = _guess_ext_from_mime(m["mime"]) or "bin"
-                fname = f"payload_{uuid.uuid4().hex}.{ext}"
-                # Deduplicate by content digest across records
+                rid = str(item.get("rid") or "")
+                kind = str(item.get("kind") or "")
+                original = str(item.get("original") or "")
+                source = str(item.get("source") or "")
+                mime = item.get("mime")
+                mime_s = str(mime) if isinstance(mime, str) else ""
+                data = item.get("data")
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                b = bytes(data)
+                size = len(b)
+
                 digest = hashlib.sha256(b).hexdigest()
                 uri = _OFFLOAD_CACHE.get(digest)
                 bulk_id = None
                 if uri is None:
-                    bulk_id, uri = _kratos_bulk_upload_bytes(b, fname, self.cfg)
+                    ext = _guess_ext_from_mime(mime_s) or "bin"
+                    fname = f"media_{uuid.uuid4().hex}.{ext}"
+                    bulk_id, uri = _kratos_bulk_upload_bytes(b, fname, cfg)
                     if uri:
-                        # Trim cache if too large
-                        if len(_OFFLOAD_CACHE) > 1024:
+                        if len(_OFFLOAD_CACHE) > 2048:
                             try:
                                 _OFFLOAD_CACHE.pop(next(iter(_OFFLOAD_CACHE)))
                             except Exception:
                                 _OFFLOAD_CACHE.clear()
                         _OFFLOAD_CACHE[digest] = uri
-                if uri:
-                    replacement = f"[offloaded:{uri}]"
-                    base = updated_texts.get(key, text)
-                    updated_texts[key] = base.replace(m["full_match"], replacement)
-                    remaining -= est_bytes
-                    # Attach last metadata for convenience; avoid None to satisfy OTEL attr type
-                    if bulk_id is not None:
-                        record.__dict__["kratos_bulk_upload_id"] = str(bulk_id)
-                    record.__dict__["kratos_uri"] = str(uri)
-                else:
-                    # On failure, leave as-is; we'll rely on exporter limits
-                    continue
 
-            # Apply replacements
-            for key, new_text in updated_texts.items():
-                setter = setters.get(key)
-                if setter is not None:
-                    setter(new_text)
+                extra = {
+                    "rid": rid,
+                    "kind": kind,
+                    "source": source,
+                    "original": original,
+                    "original_no_query": _sanitize_url_no_query(original),
+                    "original_had_query": ("?" in original),
+                    "mime": mime_s,
+                    "size_bytes": size,
+                    "sha256": digest,
+                    "s3_uri": str(uri or ""),
+                    "status": "success" if uri else "failed",
+                }
+                if bulk_id is not None:
+                    extra["kratos_bulk_upload_id"] = str(bulk_id)
+
+                # Separate line so automation can correlate durable media pointers.
+                media_logger.info("openai.media_mirror", extra=extra)
+            except Exception:
+                # Never crash the worker; best-effort only.
+                try:
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+
+    _MEDIA_MIRROR_THREAD = threading.Thread(
+        target=_worker, name="vllm-media-mirror", daemon=True
+    )
+    try:
+        _MEDIA_MIRROR_THREAD.start()
+    except Exception:
+        _MEDIA_MIRROR_THREAD = None
+        _MEDIA_MIRROR_QUEUE = None
+
+
+def enqueue_media_mirror(
+    *,
+    rid: str,
+    kind: str,
+    original: str,
+    data: bytes,
+    mime: str | None = None,
+    source: str = "",
+) -> None:
+    """Enqueue a best-effort media upload to S3 and emit a correlation log line.
+
+    This must never block request handling. It drops work when the queue is full.
+    """
+    if not rid or not original or not isinstance(data, (bytes, bytearray)):
+        return
+    if not _media_mirror_enabled():
+        return
+
+    k = (kind or "").lower()
+    if k not in ("image", "video"):
+        return
+
+    # Always mirror videos. Images are configurable (default: mirror all).
+    img_thresh = _env_int("VLLM_MEDIA_MIRROR_IMAGE_THRESHOLD_BYTES", 0)
+    if k == "image" and len(data) < img_thresh:
+        return
+
+    _start_media_mirror_worker()
+    if _MEDIA_MIRROR_QUEUE is None:
+        return
+
+    item = {
+        "rid": rid,
+        "kind": k,
+        "original": original,
+        "mime": mime,
+        "source": source,
+        "data": bytes(data),
+    }
+    try:
+        _MEDIA_MIRROR_QUEUE.put_nowait(item)
+    except Exception:
+        # Drop when the queue is full or on any unexpected queue issues.
+        return
+
+
+class _KratosOffloadFilter(logging.Filter):
+    def __init__(self, image_threshold_bytes: int, enabled: bool, cfg: Dict[str, str]):
+        super().__init__()
+        # Offload rules:
+        # - Images are offloaded only if decoded size >= image_threshold_bytes
+        # - Videos are always offloaded
+        self.image_threshold_bytes = image_threshold_bytes
+        self.enabled = enabled
+        self.cfg = cfg
+
+    def _offload_data_uris_in_string(self, text: str, record: logging.LogRecord) -> str:
+        if not text or "base64," not in text:
+            return text
+
+        def _maybe_upload(m: re.Match) -> str:
+            full = m.group(0)
+            mime = (m.group("mime") or "").lower()
+            b64 = m.group("b64") or ""
+            est_bytes = int(len(b64) * 3 / 4)
+
+            is_video = mime.startswith("video/")
+            is_image = mime.startswith("image/")
+
+            if is_video:
+                should_offload = True
+            elif is_image:
+                should_offload = est_bytes >= self.image_threshold_bytes
+            else:
+                return full
+
+            try:
+                b = base64.b64decode(b64, validate=False)
+            except Exception:
+                return full
+
+            digest = hashlib.sha256(b).hexdigest()
+            uri = _OFFLOAD_CACHE.get(digest)
+            bulk_id = None
+            if uri is None:
+                ext = _guess_ext_from_mime(mime) or "bin"
+                fname = f"payload_{uuid.uuid4().hex}.{ext}"
+                bulk_id, uri = _kratos_bulk_upload_bytes(b, fname, self.cfg)
+                if uri:
+                    # Trim cache if too large
+                    if len(_OFFLOAD_CACHE) > 1024:
+                        try:
+                            _OFFLOAD_CACHE.pop(next(iter(_OFFLOAD_CACHE)))
+                        except Exception:
+                            _OFFLOAD_CACHE.clear()
+                    _OFFLOAD_CACHE[digest] = uri
+
+            if not uri:
+                return full
+
+            # Attach last metadata for convenience; avoid None to satisfy OTEL attr type
+            if bulk_id is not None:
+                record.__dict__["kratos_bulk_upload_id"] = str(bulk_id)
+            record.__dict__["kratos_uri"] = str(uri)
+            return str(uri)
+
+        try:
+            return _DATA_URI_RE.sub(_maybe_upload, text)
+        except Exception:
+            return text
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
+        if not self.enabled:
+            return True
+        try:
+            seen: set[int] = set()
+
+            def _walk(obj: Any) -> Any:
+                if isinstance(obj, str):
+                    return self._offload_data_uris_in_string(obj, record)
+                if isinstance(obj, list):
+                    oid = id(obj)
+                    if oid in seen:
+                        return obj
+                    seen.add(oid)
+                    for i in range(len(obj)):
+                        try:
+                            obj[i] = _walk(obj[i])
+                        except Exception:
+                            continue
+                    return obj
+                if isinstance(obj, dict):
+                    oid = id(obj)
+                    if oid in seen:
+                        return obj
+                    seen.add(oid)
+                    for k, v in list(obj.items()):
+                        try:
+                            obj[k] = _walk(v)
+                        except Exception:
+                            continue
+                    return obj
+                return obj
+
+            # Also consider the log message itself.
+            if isinstance(record.msg, str):
+                record.msg = self._offload_data_uris_in_string(record.msg, record)
+
+            # Walk all extra attributes (payload, headers, etc.) and mutate in-place.
+            skip_keys = {
+                "args",
+                "exc_info",
+                "exc_text",
+                "stack_info",
+                "message",
+                "msg",
+            }
+            for k, v in list(record.__dict__.items()):
+                if k in skip_keys:
+                    continue
+                if isinstance(v, (str, list, dict)):
+                    record.__dict__[k] = _walk(v)
         except Exception:
             # Never block logging on errors in filter
             return True
         return True
 
 
+class _NonBlockingQueueHandler(QueueHandler):
+    """QueueHandler that never blocks the caller (drops on full)."""
+
+    def enqueue(self, record: logging.LogRecord) -> None:  # type: ignore[override]
+        try:
+            self.queue.put_nowait(record)
+        except Exception:
+            # Drop when the queue is full or on any unexpected queue issues.
+            return
+
+
 def _wrap_with_queue(logging_handler: logging.Handler) -> logging.Handler:
     global _LOG_QUEUE, _QUEUE_LISTENER
     if _LOG_QUEUE is not None and _QUEUE_LISTENER is not None:
-        return QueueHandler(_LOG_QUEUE)
+        return _NonBlockingQueueHandler(_LOG_QUEUE)
 
     _LOG_QUEUE = queue.Queue(maxsize=_env_int("KRATOS_OFFLOAD_MAX_QUEUE", 0))
 
     # Configure offload filter on the downstream handler
-    threshold = _env_int("KRATOS_OFFLOAD_THRESHOLD_BYTES", 262144)
+    threshold = _env_int("KRATOS_OFFLOAD_THRESHOLD_BYTES", 131072)
     enabled = _truthy_env("KRATOS_BULKUPLOAD_ENABLE", "0")
     cfg = _kratos_defaults()
     offload_filter = _KratosOffloadFilter(threshold, enabled, cfg)
@@ -561,7 +744,7 @@ def _wrap_with_queue(logging_handler: logging.Handler) -> logging.Handler:
     _QUEUE_LISTENER = QueueListener(_LOG_QUEUE, logging_handler, respect_handler_level=True)
     _QUEUE_LISTENER.daemon = True
     _QUEUE_LISTENER.start()
-    return QueueHandler(_LOG_QUEUE)
+    return _NonBlockingQueueHandler(_LOG_QUEUE)
 
 
 def init_otel(resource_attributes: Optional[dict] = None
@@ -820,6 +1003,3 @@ def start_prom_to_otel_bridge(scrape_url: str, interval_seconds: float = 10.0) -
 
     _PROM_BRIDGE_THREAD = threading.Thread(target=_run, name="vllm-prom-bridge", daemon=True)
     _PROM_BRIDGE_THREAD.start()
-
-
-

@@ -40,7 +40,7 @@ from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
-from vllm.utils.async_utils import merge_async_iterators
+from vllm.utils.async_utils import merge_async_iterators, tokenizer_lock
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
@@ -626,7 +626,8 @@ class OpenAIServingCompletion(OpenAIServing):
                             value=True,
                         )
 
-                    token = tokenizer.decode(token_id)
+                    with tokenizer_lock(tokenizer):
+                        token = tokenizer.decode(token_id)
 
                 out_tokens.append(token)
                 out_token_logprobs.append(None)

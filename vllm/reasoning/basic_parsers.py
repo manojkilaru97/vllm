@@ -66,22 +66,99 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 "think start/end tokens in the tokenizer!"
             )
 
-    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        start_token_id = self.start_token_id
-        end_token_id = self.end_token_id
+        # Some tokenizers split markers like </think> into multiple ids.
+        # Keep robust sequence forms for stream-interval chunks where marker ids
+        # may straddle chunk boundaries.
+        self.start_token_ids = self._encode_marker(self.start_token)
+        self.end_token_ids = self._encode_marker(self.end_token)
+        if not self.start_token_ids:
+            self.start_token_ids = [self.start_token_id]
+        if not self.end_token_ids:
+            self.end_token_ids = [self.end_token_id]
 
-        for i in range(len(input_ids) - 1, -1, -1):
-            if input_ids[i] == start_token_id:
-                return False
-            if input_ids[i] == end_token_id:
+    def _encode_marker(self, marker: str) -> list[int]:
+        try:
+            token_ids = self.model_tokenizer.encode(marker, add_special_tokens=False)
+        except TypeError:
+            token_ids = self.model_tokenizer.encode(marker)
+        except Exception:
+            return []
+
+        if not isinstance(token_ids, list):
+            return []
+
+        try:
+            return [int(t) for t in token_ids]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _contains_subsequence(haystack: Sequence[int], needle: Sequence[int]) -> bool:
+        if not needle:
+            return False
+        n = len(needle)
+        h = len(haystack)
+        if h < n:
+            return False
+        for i in range(h - n + 1):
+            if list(haystack[i : i + n]) == list(needle):
                 return True
         return False
+
+    @staticmethod
+    def _last_subsequence_index(haystack: Sequence[int], needle: Sequence[int]) -> int:
+        if not needle:
+            return -1
+        n = len(needle)
+        h = len(haystack)
+        if h < n:
+            return -1
+        for i in range(h - n, -1, -1):
+            if list(haystack[i : i + n]) == list(needle):
+                return i
+        return -1
+
+    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        last_start = self._last_subsequence_index(input_ids, self.start_token_ids)
+        last_end = self._last_subsequence_index(input_ids, self.end_token_ids)
+
+        if last_end < 0:
+            return False
+        if last_start < 0:
+            return True
+        return last_end > last_start
 
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
-        end_token_id = self.end_token_id
-        return end_token_id in delta_ids
+        if not delta_ids:
+            return False
+
+        # Only check the tail region where new marker suffixes can emerge to
+        # handle chunk boundaries robustly with larger stream intervals.
+        marker_len = max(1, len(self.end_token_ids))
+        boundary = max(0, len(input_ids) - len(delta_ids) - marker_len + 1)
+        tail_ids = input_ids[boundary:]
+        if self._contains_subsequence(tail_ids, self.end_token_ids):
+            return True
+
+        # Fallback for tokenizers whose marker segmentation differs from encode().
+        # Decode only a short tail for minimal overhead.
+        try:
+            window = max(32, marker_len * 8)
+            decoded_tail = self.model_tokenizer.decode(
+                list(input_ids)[-window:], skip_special_tokens=False
+            )
+            if self.end_token in decoded_tail:
+                return True
+        except TypeError:
+            decoded_tail = self.model_tokenizer.decode(list(input_ids)[-32:])
+            if self.end_token in decoded_tail:
+                return True
+        except Exception:
+            pass
+
+        return False
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         """

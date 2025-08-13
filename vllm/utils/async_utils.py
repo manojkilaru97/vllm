@@ -8,10 +8,10 @@ This is similar in concept to the `asyncio` module.
 
 import asyncio
 import contextlib
+import threading
 from asyncio import FIRST_COMPLETED, AbstractEventLoop, Future, Task
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
-from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 
 from transformers.tokenization_utils_base import BatchEncoding
@@ -19,6 +19,35 @@ from typing_extensions import ParamSpec
 
 P = ParamSpec("P")
 T = TypeVar("T")
+RLockType = type(threading.RLock())
+_TOKENIZER_LOCK_ATTR = "_vllm_tokenizer_lock"
+
+
+def get_tokenizer_lock(tokenizer) -> RLockType | None:
+    """Get or create a process-local lock for a tokenizer instance."""
+    lock = getattr(tokenizer, _TOKENIZER_LOCK_ATTR, None)
+    if isinstance(lock, RLockType):
+        return lock
+
+    try:
+        lock = threading.RLock()
+        setattr(tokenizer, _TOKENIZER_LOCK_ATTR, lock)
+        return lock
+    except Exception:
+        # Some tokenizer wrappers may not allow dynamic attributes.
+        return None
+
+
+@contextlib.contextmanager
+def tokenizer_lock(tokenizer):
+    """Serialize access to thread-unsafe tokenizer internals when possible."""
+    lock = get_tokenizer_lock(tokenizer)
+    if lock is None:
+        yield
+        return
+
+    with lock:
+        yield
 
 
 class AsyncMicrobatchTokenizer:
@@ -113,7 +142,10 @@ class AsyncMicrobatchTokenizer:
                 # If every request uses identical kwargs we can run a single
                 # batched tokenizer call for a big speed-up.
                 if can_batch and len(prompts) > 1:
-                    batch_encode_fn = partial(self.tokenizer, prompts, **kwargs)
+                    def batch_encode_fn():
+                        with tokenizer_lock(self.tokenizer):
+                            return self.tokenizer(prompts, **kwargs)
+
                     results = await self._loop.run_in_executor(
                         self._executor, batch_encode_fn
                     )
@@ -123,9 +155,13 @@ class AsyncMicrobatchTokenizer:
                             data = {k: v[i] for k, v in results.items()}
                             fut.set_result(BatchEncoding(data))
                 else:
-                    encode_fn = lambda prompts=prompts, kwargs=kwargs_list: [
-                        self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs)
-                    ]
+                    def encode_fn(prompts=prompts, kwargs=kwargs_list):
+                        with tokenizer_lock(self.tokenizer):
+                            return [
+                                self.tokenizer(p, **kw)
+                                for p, kw in zip(prompts, kwargs)
+                            ]
+
                     results = await self._loop.run_in_executor(
                         self._executor, encode_fn
                     )
@@ -161,8 +197,12 @@ class AsyncMicrobatchTokenizer:
 
             try:
                 # Perform a single batched decode call for all requests
+                def batch_decode_fn():
+                    with tokenizer_lock(self.tokenizer):
+                        return self.tokenizer.batch_decode(token_ids_list)
+
                 results = await self._loop.run_in_executor(
-                    self._executor, self.tokenizer.batch_decode, token_ids_list
+                    self._executor, batch_decode_fn
                 )
                 for fut, res in zip(result_futures, results):
                     if not fut.done():
