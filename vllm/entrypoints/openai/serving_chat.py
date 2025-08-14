@@ -185,6 +185,13 @@ class OpenAIServingChat(OpenAIServing):
                 except Exception as e:
                     logger.exception("Error while resolving NVCF assets")
                     return self.create_error_response(str(e))
+            # Strip raw multimodal special tokens from plain text to avoid
+            # backend crashes when no corresponding media is provided.
+            try:
+                request.messages = self._strip_mm_special_tokens_in_messages(
+                    request.messages)
+            except Exception:
+                logger.exception("Error while stripping MM special tokens")
             lora_request = self._maybe_get_adapters(
                 request, supports_default_mm_loras=True)
 
@@ -1348,6 +1355,51 @@ class OpenAIServingChat(OpenAIServing):
                     )
 
         return response
+
+    def _strip_mm_special_tokens_in_messages(self, messages: list[dict]) -> list[dict]:
+        """
+        Remove raw multimodal special tokens typed inside text content.
+
+        This prevents crashes when users include tokens like '<|image|>' or
+        '<image>' without supplying corresponding multimodal data. Structured
+        content parts (e.g., {'type': 'image_url', ...}) are preserved.
+        """
+        token_pattern = (
+            r"(?i)"  # case-insensitive
+            r"(<\|begin_of_image\|>|<\|image_start\|>|<\|image_end\|>|"
+            r"<\|image\|>|<\|audio\|>|<\|video\|>|<image>|</image>|"
+            r"<audio>|</audio>|<video>|</video>|<\|patch\|>)"
+        )
+        mm_token_re = re.compile(token_pattern)
+
+        def clean_text(text: str) -> str:
+            cleaned = mm_token_re.sub(" ", text)
+            return re.sub(r"\s+", " ", cleaned).strip()
+
+        def clean_message(msg: dict) -> dict:
+            if not isinstance(msg, dict):
+                return msg
+            new_msg = dict(msg)
+            content = new_msg.get("content")
+            if isinstance(content, str):
+                new_msg["content"] = clean_text(content)
+            elif isinstance(content, list):
+                new_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text" and isinstance(
+                                part.get("text"), str):
+                            new_part = dict(part)
+                            new_part["text"] = clean_text(part["text"])
+                            new_parts.append(new_part)
+                        else:
+                            new_parts.append(part)
+                    else:
+                        new_parts.append(part)
+                new_msg["content"] = new_parts
+            return new_msg
+
+        return [clean_message(m) for m in messages]
 
     def _get_top_logprobs(
             self, logprobs: dict[int, Logprob], top_logprobs: Optional[int],
