@@ -172,6 +172,12 @@ class OpenAIServingChat(OpenAIServing):
                     "--enable-auto-tool-choice and --tool-call-parser to be set"
                 )
 
+            # Check for unsupported tool_choice "required"
+            if request.tool_choice == "required":
+                return self.create_error_response(
+                    "tool_choice \"required\" is not supported in this implementation"
+                )
+
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
@@ -276,6 +282,23 @@ class OpenAIServingChat(OpenAIServing):
         if request.add_generation_prompt:
             return self.response_role
         return request.messages[-1]["role"]
+    
+    def _is_no_think_mode(self, request: ChatCompletionRequest) -> bool:
+        """Detect if request is in /no_think mode by checking message content."""
+        if not hasattr(request, 'messages') or not request.messages:
+            return False
+        
+        for message in request.messages:
+            content = None
+            if isinstance(message, dict):
+                content = message.get('content')
+            elif hasattr(message, 'content'):
+                content = message.content
+            
+            if content and '/no_think' in str(content):
+                return True
+        
+        return False
 
     @staticmethod
     def _bracket_level(s: str, opening='{', closing='}') -> int:
@@ -432,7 +455,8 @@ class OpenAIServingChat(OpenAIServing):
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
-        if tool_choice_auto or self.reasoning_parser:
+        # In /no_think mode, still need arrays if tools are enabled
+        if tool_choice_auto or (self.reasoning_parser and not self._is_no_think_mode(request)):
             # These are only required in "auto" tool choice case
             previous_texts = [""] * num_choices
             all_previous_token_ids = [[]] * num_choices
@@ -586,7 +610,8 @@ class OpenAIServingChat(OpenAIServing):
                     delta_message: Optional[DeltaMessage]
 
                     # just update previous_texts and previous_token_ids
-                    if tool_choice_auto or self.reasoning_parser:
+                    # In /no_think mode, still need text accumulation if tools are enabled
+                    if tool_choice_auto or (self.reasoning_parser and not self._is_no_think_mode(request)):
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
                         previous_text = previous_texts[i]
@@ -597,7 +622,7 @@ class OpenAIServingChat(OpenAIServing):
 
                     # handle streaming deltas for tools with named tool_choice
                     if tool_choice_function_name:
-                        if (self.reasoning_parser
+                        if (self.reasoning_parser and not self._is_no_think_mode(request)
                                 and not reasoning_parser.is_reasoning_end(
                                     previous_token_ids)):
                             assert reasoning_parser is not None
@@ -610,6 +635,7 @@ class OpenAIServingChat(OpenAIServing):
                                     previous_token_ids,
                                     current_token_ids,
                                     output.token_ids,
+                                    request=request,
                                 ))
                             # When encountering think end id in delta_token_ids,
                             # process the `content`. Only keep 'content',
@@ -624,7 +650,7 @@ class OpenAIServingChat(OpenAIServing):
                                     current_text = ""
                         else:
                             # Just to add remaining `content`
-                            if self.reasoning_parser:
+                            if self.reasoning_parser and not self._is_no_think_mode(request):
                                 delta_text = previous_text + delta_text
                                 current_text = ""
 
@@ -653,7 +679,7 @@ class OpenAIServingChat(OpenAIServing):
                         current_text = previous_text + delta_text
                         fn_name_returned = function_name_returned[i]
 
-                        if self.reasoning_parser:
+                        if self.reasoning_parser and not self._is_no_think_mode(request):
                             _, content = \
                                 reasoning_parser.extract_reasoning_content(
                                     current_text,
@@ -672,8 +698,8 @@ class OpenAIServingChat(OpenAIServing):
                         previous_texts[i] = current_text
 
                     # handle streaming deltas for tools with "auto" tool choice
-                    # and reasoning parser
-                    elif tool_choice_auto and self.reasoning_parser:
+                    # and reasoning parser - but skip reasoning parser in /no_think mode
+                    elif tool_choice_auto and self.reasoning_parser and not self._is_no_think_mode(request):
                         assert tool_parser is not None
                         assert reasoning_parser is not None
                         assert added_content_delta_arr is not None
@@ -688,6 +714,7 @@ class OpenAIServingChat(OpenAIServing):
                                     previous_token_ids,
                                     current_token_ids,
                                     output.token_ids,
+                                    request=request,
                                 ))
                             # When encountering think end id in prompt_token_ids
                             # i.e {"enable_thinking": False},
@@ -722,26 +749,49 @@ class OpenAIServingChat(OpenAIServing):
 
                         # handle tool calls only after reasoning is done,
                         else:
-                            delta_token_ids = list(output.token_ids)
-                            # First time to tool call,
-                            # add the remaining text and token ids
-                            # to delta from previous
-                            if not added_content_delta_arr[i]:
-                                added_content_delta_arr[i] = True
-                                previous_text = ""
-                                previous_token_ids = []
-                                delta_text = current_text
-                                delta_token_ids = current_token_ids
+                            # Even after reasoning ends, we need to pass tokens through
+                            # the reasoning parser first for proper buffering/coordination
+                            reasoning_delta_message = (
+                                reasoning_parser.
+                                extract_reasoning_content_streaming(
+                                    previous_text,
+                                    current_text,
+                                    delta_text,
+                                    previous_token_ids,
+                                    current_token_ids,
+                                    output.token_ids,
+                                    request=request,
+                                ))
+                            
+                            # If reasoning parser returned None (buffering), don't call tool parser
+                            if reasoning_delta_message is None:
+                                delta_message = None
+                            else:
+                                # If reasoning parser returned content, it should be final content
+                                if reasoning_delta_message.content is not None:
+                                    delta_message = reasoning_delta_message
+                                else:
+                                    # Otherwise proceed with tool parsing
+                                    delta_token_ids = list(output.token_ids)
+                                    # First time to tool call,
+                                    # add the remaining text and token ids
+                                    # to delta from previous
+                                    if not added_content_delta_arr[i]:
+                                        added_content_delta_arr[i] = True
+                                        previous_text = ""
+                                        previous_token_ids = []
+                                        delta_text = current_text
+                                        delta_token_ids = current_token_ids
 
-                            delta_message = (
-                                tool_parser.extract_tool_calls_streaming(
-                                    previous_text=previous_text,
-                                    current_text=current_text,
-                                    delta_text=delta_text,
-                                    previous_token_ids=previous_token_ids,
-                                    current_token_ids=current_token_ids,
-                                    delta_token_ids=delta_token_ids,
-                                    request=request))
+                                    delta_message = (
+                                        tool_parser.extract_tool_calls_streaming(
+                                            previous_text=previous_text,
+                                            current_text=current_text,
+                                            delta_text=delta_text,
+                                            previous_token_ids=previous_token_ids,
+                                            current_token_ids=current_token_ids,
+                                            delta_token_ids=delta_token_ids,
+                                            request=request))
                     # when only tool calls
                     elif tool_choice_auto:
                         assert tool_parser is not None
@@ -754,8 +804,8 @@ class OpenAIServingChat(OpenAIServing):
                                 current_token_ids=current_token_ids,
                                 delta_token_ids=output.token_ids,
                                 request=request))
-                    # when only reasoning
-                    elif self.reasoning_parser:
+                    # when only reasoning (skip reasoning parser in /no_think mode)
+                    elif self.reasoning_parser and not self._is_no_think_mode(request):
                         delta_message = (reasoning_parser.
                                          extract_reasoning_content_streaming(
                                              previous_text,
@@ -764,13 +814,15 @@ class OpenAIServingChat(OpenAIServing):
                                              previous_token_ids,
                                              current_token_ids,
                                              output.token_ids,
+                                             request=request,
                                          ))
                     # handle streaming just a content delta
                     else:
                         delta_message = DeltaMessage(content=delta_text)
 
                     # update the previous values for the next iteration
-                    if tool_choice_auto or self.reasoning_parser:
+                    # In /no_think mode, still need state updates if tools are enabled
+                    if tool_choice_auto or (self.reasoning_parser and not self._is_no_think_mode(request)):
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
                         previous_texts[i] = current_text
@@ -783,7 +835,8 @@ class OpenAIServingChat(OpenAIServing):
                     # "control token" for tool calls or the parser otherwise
                     # wasn't ready to send a token, then
                     #   get the next token without streaming a chunk
-                    if delta_message is None:
+                    # BUT still send final chunk if model is finished generating
+                    if delta_message is None and output.finish_reason is None:
                         continue
 
                     if output.finish_reason is None:
@@ -809,8 +862,21 @@ class OpenAIServingChat(OpenAIServing):
                         else:
                             index = 0
 
-                        if self._should_check_for_unstreamed_tool_arg_tokens(
-                                delta_message, output) and tool_parser:
+                        # Skip the unstreamed token check if the tool parser has already handled end-of-call flush
+                        # This prevents duplicate argument streaming when both tool parser and serving layer try to flush
+                        should_check_unstreamed = self._should_check_for_unstreamed_tool_arg_tokens(delta_message, output)
+                        
+                        # Some tool parsers implement their own comprehensive end-of-call flush logic.
+                        # Skip the serving layer's unstreamed token check entirely for those parsers
+                        if (should_check_unstreamed and tool_parser and 
+                            hasattr(tool_parser, '__class__') and (
+                                'MistralToolParser' in tool_parser.__class__.__name__ or
+                                'NemotronToolParser' in tool_parser.__class__.__name__
+                            )):
+                            # Parser handles all end-of-call flushing internally, don't duplicate
+                            should_check_unstreamed = False
+
+                        if should_check_unstreamed and tool_parser:
                             latest_delta_len = 0
                             if ((isinstance(
                                     delta_message.tool_calls[0].function,
@@ -836,20 +902,33 @@ class OpenAIServingChat(OpenAIServing):
                                 actual_call = actual_call[:-latest_delta_len]
 
                             # check to see if there's anything left to stream
-                            remaining_call = expected_call.replace(
-                                actual_call, "", 1)
-                            # set that as a delta message
-                            delta_message = DeltaMessage(tool_calls=[
-                                DeltaToolCall(index=index,
-                                              function=DeltaFunctionCall(
-                                                  arguments=remaining_call).
-                                              model_dump(exclude_none=True))
-                            ])
+                            # Use startswith check for more robust remaining content computation
+                            if expected_call.startswith(actual_call):
+                                remaining_call = expected_call[len(actual_call):]
+                            else:
+                                # Fallback: use extract_intermediate_diff for better handling
+                                from vllm.entrypoints.openai.tool_parsers.utils import extract_intermediate_diff
+                                remaining_call = extract_intermediate_diff(expected_call, actual_call)
+                            
+                            # Only send remaining call if it's non-empty and meaningful
+                            if remaining_call and remaining_call.strip():
+                                # set that as a delta message
+                                delta_message = DeltaMessage(tool_calls=[
+                                    DeltaToolCall(index=index,
+                                                  function=DeltaFunctionCall(
+                                                      arguments=remaining_call).
+                                                  model_dump(exclude_none=True))
+                                ])
+                            else:
+                                # No meaningful remaining content, don't send anything
+                                delta_message = None
 
                         # Send the finish response for each request.n only once
+                        # If delta_message is None (e.g. from reasoning parser), create empty delta
+                        final_delta = delta_message if delta_message is not None else DeltaMessage(content="")
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
-                            delta=delta_message,
+                            delta=final_delta,
                             logprobs=logprobs,
                             finish_reason=output.finish_reason
                             if not auto_tools_called else "tool_calls",
@@ -873,7 +952,7 @@ class OpenAIServingChat(OpenAIServing):
                             total_tokens=num_prompt_tokens + completion_tokens,
                         )
 
-                    data = chunk.model_dump_json(exclude_none=True)
+                    data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
             # once the final token is handled, if stream_options.include_usage
@@ -959,7 +1038,7 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = None
             auto_tools_called = False
 
-            if self.reasoning_parser:
+            if self.reasoning_parser and not self._is_no_think_mode(request):
                 try:
                     reasoning_parser = self.reasoning_parser(tokenizer)
                 except RuntimeError as e:
