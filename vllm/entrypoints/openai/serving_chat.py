@@ -351,8 +351,10 @@ class OpenAIServingChat(OpenAIServing):
             elif hasattr(message, 'content'):
                 content = message.content
             
-            if content and '/no_think' in str(content):
-                return True
+            if content:
+                text = str(content)
+                if '/no_think' in text or 'detailed thinking off' in text.lower():
+                    return True
         
         return False
 
@@ -767,8 +769,6 @@ class OpenAIServingChat(OpenAIServing):
                         if (self.reasoning_parser
                                 and not self._is_no_think_mode(request)
                                 and not reasoning_end_arr[i]
-                                and not reasoning_parser.is_reasoning_end(
-                                    previous_token_ids))
                                 and not reasoning_parser.is_reasoning_end(
                                     previous_token_ids)):
                             assert reasoning_parser is not None

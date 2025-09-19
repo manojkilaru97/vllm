@@ -20,7 +20,7 @@ import partial_json_parser
 import regex as re
 from partial_json_parser.core.options import Allow
 
-from vllm.entrypoints.chat_utils import random_tool_call_id
+from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     DeltaFunctionCall,
@@ -58,6 +58,7 @@ class NemotronToolParser(ToolParser):
         self.current_tool_id: int = -1
         self.current_tool_name_sent: bool = False
         self.streamed_args_for_tool: list[str] = []
+        self.last_complete_args: list[str] = []  # Track last complete arguments for each tool
 
         # Tokens and patterns
         self.bot_token = "<TOOLCALL>"
@@ -66,6 +67,167 @@ class NemotronToolParser(ToolParser):
 
         # Buffer for partial tag sequences in streaming
         self._pending_tag_buffer: str = ""
+
+    @staticmethod
+    def _sanitize_toolcall_wrappers(text: str) -> str:
+        # Remove any stray TOOLCALL tags that might be leaked into arguments
+        if not text:
+            return text
+        return text.replace("<TOOLCALL>", "").replace("</TOOLCALL>", "")
+
+    @staticmethod
+    def _suffix_after_longest_common_prefix(current_text: str,
+                                            streamed_prefix: str) -> str:
+        """Return the incremental suffix of current_text after removing the
+        longest common prefix with streamed_prefix.
+
+        This is more robust than generic diff for streaming assembly and helps
+        avoid duplicated substrings like repeated field prefixes.
+        """
+        if not streamed_prefix:
+            return current_text
+        i = 0
+        max_i = min(len(current_text), len(streamed_prefix))
+        while i < max_i and current_text[i] == streamed_prefix[i]:
+            i += 1
+        return current_text[i:]
+
+    @staticmethod
+    def _extract_raw_array_content(text: str, start_token: str, end_tag: str) -> str:
+        """Return the substring inside <TOOLCALL> ... </TOOLCALL>.
+
+        If the end tag is not present yet (streaming), return the tail after
+        the start token.
+        """
+        after = text.split(start_token)[-1]
+        end_idx = after.find(end_tag)
+        return after[:end_idx] if end_idx != -1 else after
+
+    @staticmethod
+    def _extract_nth_object_in_array(arr_text: str, index: int) -> str | None:
+        """Extract the raw substring of the index-th JSON object within a top-level array.
+
+        Works on partial arrays during streaming. If the object hasn't closed
+        yet, returns the substring from the opening brace to the current end.
+        """
+        if not arr_text:
+            return None
+        # Find the first '['
+        start = arr_text.find('[')
+        if start == -1:
+            return None
+        i = start + 1
+        obj_idx = -1
+        obj_start = None
+        brace_count = 0
+        in_string = False
+        escape = False
+        n = len(arr_text)
+        while i < n:
+            ch = arr_text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                else:
+                    if ch == '\\':
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '{':
+                    if brace_count == 0:
+                        obj_idx += 1
+                        if obj_idx == index:
+                            obj_start = i
+                    brace_count += 1
+                elif ch == '}':
+                    if brace_count > 0:
+                        brace_count -= 1
+                        if brace_count == 0 and obj_start is not None and obj_idx == index:
+                            return arr_text[obj_start:i + 1]
+                elif ch == ']' and brace_count == 0:
+                    break
+            i += 1
+        if obj_start is not None and obj_idx == index:
+            return arr_text[obj_start:i]
+        return None
+
+    @staticmethod
+    def _extract_arguments_raw(obj_text: str) -> str | None:
+        """Extract the raw substring of the value of the "arguments" field.
+
+        Returns the substring including surrounding braces if it's an object.
+        Works on partial objects during streaming.
+        """
+        if not obj_text:
+            return None
+        key = '"arguments"'
+        pos = obj_text.find(key)
+        if pos == -1:
+            return None
+        i = pos + len(key)
+        n = len(obj_text)
+        # Skip whitespace
+        while i < n and obj_text[i].isspace():
+            i += 1
+        if i >= n or obj_text[i] != ':':
+            return None
+        i += 1
+        while i < n and obj_text[i].isspace():
+            i += 1
+        if i >= n:
+            return None
+        # Object value
+        if obj_text[i] == '{':
+            start = i
+            brace = 0
+            in_string = False
+            escape = False
+            while i < n:
+                ch = obj_text[i]
+                if in_string:
+                    if escape:
+                        escape = False
+                    else:
+                        if ch == '\\':
+                            escape = True
+                        elif ch == '"':
+                            in_string = False
+                else:
+                    if ch == '"':
+                        in_string = True
+                    elif ch == '{':
+                        brace += 1
+                    elif ch == '}':
+                        brace -= 1
+                        if brace == 0:
+                            return obj_text[start:i + 1]
+                i += 1
+            return obj_text[start:i]
+        # String value
+        if obj_text[i] == '"':
+            start = i
+            in_string = True
+            escape = False
+            i += 1
+            while i < n:
+                ch = obj_text[i]
+                if escape:
+                    escape = False
+                else:
+                    if ch == '\\':
+                        escape = True
+                    elif ch == '"':
+                        return obj_text[start:i + 1]
+                i += 1
+            return obj_text[start:i]
+        # Primitive value (number, true/false/null)
+        start = i
+        while i < n and obj_text[i] not in ',}':
+            i += 1
+        return obj_text[start:i].strip()
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         # Ensure special tokens are not skipped so <TOOLCALL> tags are visible
@@ -129,6 +291,14 @@ class NemotronToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
+        if not previous_text:
+            # First chunk of a new generation, reset state
+            self.prev_tool_call_arr = []
+            self.current_tool_id = -1
+            self.current_tool_name_sent = False
+            self.streamed_args_for_tool = []
+            self.last_complete_args = []
+
         # Handle potential partial tag buffering (e.g., "<", "<T", ...)
         try:
             start_token = self.bot_token
@@ -187,7 +357,10 @@ class NemotronToolParser(ToolParser):
         end_of_call = False
 
         try:
-            parsable_arr = current_text.split(self.bot_token)[-1]
+            # Work on raw substring inside <TOOLCALL> ... </TOOLCALL>
+            parsable_arr = self._extract_raw_array_content(
+                current_text, self.bot_token, "</TOOLCALL>")
+            parsable_arr = self._sanitize_toolcall_wrappers(parsable_arr)
 
             if "</TOOLCALL>" in parsable_arr:
                 end_of_call = True
@@ -208,6 +381,7 @@ class NemotronToolParser(ToolParser):
                 if lt_index != -1:
                     raw = raw[:lt_index]
                 raw = raw.strip()
+                raw = self._sanitize_toolcall_wrappers(raw)
                 try:
                     tool_call_arr = json.loads(raw)
                 except json.JSONDecodeError:
@@ -220,8 +394,9 @@ class NemotronToolParser(ToolParser):
                     else:
                         return None
 
-            # Current tool
-            current_tool_call: dict = tool_call_arr[self.current_tool_id] if len(tool_call_arr) > 0 else {}
+            # Current tool index & raw object substring for robust streaming diffs
+            current_index = len(tool_call_arr) - 1
+            current_tool_call: dict = tool_call_arr[current_index] if len(tool_call_arr) > 0 else {}
 
             if len(tool_call_arr) == 0:
                 return None
@@ -244,9 +419,10 @@ class NemotronToolParser(ToolParser):
                         delta = None
                 else:
                     delta = None
-                self.current_tool_id = len(tool_call_arr) - 1
+                self.current_tool_id = current_index
                 self.current_tool_name_sent = False
                 self.streamed_args_for_tool.append("")
+                self.last_complete_args.append("")
                 logger.debug("starting on new tool %d", self.current_tool_id)
                 return delta
 
@@ -258,7 +434,7 @@ class NemotronToolParser(ToolParser):
                         DeltaToolCall(
                             index=self.current_tool_id,
                             type="function",
-                            id=random_tool_call_id(),
+                            id=make_tool_call_id(),
                             function=DeltaFunctionCall(name=function_name).model_dump(exclude_none=True),
                         )
                     ])
@@ -267,53 +443,25 @@ class NemotronToolParser(ToolParser):
                     delta = None
 
             else:
-                prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
-                cur_arguments = current_tool_call.get("arguments")
-
-                new_text = delta_text.replace("\'", '"')
-                if '"}' in new_text:
-                    new_text = new_text[:new_text.rindex('"}')]
-
-                if not cur_arguments and not prev_arguments:
-                    delta = None
-                elif not cur_arguments and prev_arguments:
-                    logger.error("INVARIANT - impossible to have arguments reset mid-arguments")
-                    delta = None
-                elif cur_arguments and not prev_arguments:
-                    cur_arguments_json = json.dumps(cur_arguments, ensure_ascii=False)
-                    streamed_prefix = self.streamed_args_for_tool[self.current_tool_id]
-                    if cur_arguments_json.startswith(streamed_prefix):
-                        arguments_delta = cur_arguments_json[len(streamed_prefix):]
-                    else:
-                        arguments_delta = extract_intermediate_diff(cur_arguments_json, streamed_prefix)
-
-                    if (not self.streamed_args_for_tool[self.current_tool_id]
-                            and not end_of_call and arguments_delta and arguments_delta.endswith('}')):
-                        arguments_delta = arguments_delta[:-1]
-
-                    if arguments_delta:
-                        delta = DeltaMessage(tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=arguments_delta).model_dump(exclude_none=True),
-                            )
-                        ])
-                        self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
-                    else:
-                        delta = None
-
-                elif cur_arguments and prev_arguments:
-                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
-                    prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
-                    argument_diff = extract_intermediate_diff(cur_args_json, prev_args_json)
-                    if argument_diff:
-                        delta = DeltaMessage(tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=argument_diff).model_dump(exclude_none=True),
-                            )
-                        ])
-                        self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+                # Robust raw-substring assembly of the current tool's arguments
+                raw_arr = parsable_arr
+                raw_obj = self._extract_nth_object_in_array(raw_arr, current_index)
+                if raw_obj is not None:
+                    raw_args = self._extract_arguments_raw(raw_obj)
+                    if raw_args is not None:
+                        streamed_prefix = self.streamed_args_for_tool[self.current_tool_id]
+                        # Compute suffix to avoid duplication, based on already streamed raw content
+                        arguments_delta = self._suffix_after_longest_common_prefix(raw_args, streamed_prefix)
+                        if arguments_delta:
+                            delta = DeltaMessage(tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_id,
+                                    function=DeltaFunctionCall(arguments=arguments_delta).model_dump(exclude_none=True),
+                                )
+                            ])
+                            self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
+                        else:
+                            delta = None
                     else:
                         delta = None
                 else:
@@ -321,31 +469,30 @@ class NemotronToolParser(ToolParser):
 
             self.prev_tool_call_arr = tool_call_arr
 
-            # End-of-call flush of remaining suffix
+            # End-of-call flush - ensure we've sent all arguments
             if end_of_call and self.current_tool_id >= 0:
                 try:
-                    cur_arguments = current_tool_call.get("arguments")
-                    if cur_arguments is not None:
-                        cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
-                        streamed_prefix = self.streamed_args_for_tool[self.current_tool_id]
-                        if cur_args_json.startswith(streamed_prefix):
-                            remaining_suffix = cur_args_json[len(streamed_prefix):]
-                        else:
-                            remaining_suffix = extract_intermediate_diff(cur_args_json, streamed_prefix)
-
-                        if remaining_suffix and remaining_suffix.strip():
-                            extra = DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=remaining_suffix).model_dump(exclude_none=True),
-                            )
-                            if delta is None:
-                                delta = DeltaMessage(tool_calls=[extra])
-                            else:
-                                if getattr(delta, "tool_calls", None):
-                                    delta.tool_calls.append(extra)
+                    # Recompute raw args and flush any remaining suffix
+                    raw_arr = parsable_arr
+                    raw_obj = self._extract_nth_object_in_array(raw_arr, current_index)
+                    if raw_obj is not None:
+                        raw_args = self._extract_arguments_raw(raw_obj)
+                        if raw_args is not None:
+                            streamed_prefix = self.streamed_args_for_tool[self.current_tool_id]
+                            remaining_suffix = self._suffix_after_longest_common_prefix(raw_args, streamed_prefix)
+                            if remaining_suffix and remaining_suffix.strip():
+                                extra = DeltaToolCall(
+                                    index=self.current_tool_id,
+                                    function=DeltaFunctionCall(arguments=remaining_suffix).model_dump(exclude_none=True),
+                                )
+                                if delta is None:
+                                    delta = DeltaMessage(tool_calls=[extra])
                                 else:
-                                    delta.tool_calls = [extra]
-                            self.streamed_args_for_tool[self.current_tool_id] += remaining_suffix
+                                    if getattr(delta, "tool_calls", None):
+                                        delta.tool_calls.append(extra)
+                                    else:
+                                        delta.tool_calls = [extra]
+                                self.streamed_args_for_tool[self.current_tool_id] += remaining_suffix
                 except Exception:
                     logger.debug("NemotronToolParser: end-of-call flush failed", exc_info=True)
 
