@@ -1,4 +1,4 @@
-    #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Nemotron variant of the tool-calling test runner that exercises both
 "thinking" modes by injecting a system prompt:
@@ -16,7 +16,7 @@ import argparse
 import os
 import time
 import requests
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 BASE_URL = os.environ.get("SGLANG_BASE_URL", "http://localhost:8003")
 CHAT_URL = f"{BASE_URL}/v1/chat/completions"
@@ -154,11 +154,12 @@ def detect_default_model() -> str:
 
 
 def make_request(messages: List[Dict], tools: List[Dict] = None,
-                stream: bool = False, model: str = None, tool_choice: Any = None) -> Dict[str, Any]:
+                stream: bool = False, model: str = None, tool_choice: Any = None,
+                system_override: Optional[str] = None) -> Dict[str, Any]:
     """Make a request to the chat completions endpoint with Nemotron system prompt injected."""
 
     # Prepend system prompt to toggle thinking behavior
-    system_message = {"role": "system", "content": get_system_prompt()}
+    system_message = {"role": "system", "content": system_override if system_override is not None else get_system_prompt()}
     request_messages = [system_message] + messages.copy()
 
     use_model = model or DEFAULT_MODEL or detect_default_model()
@@ -418,6 +419,14 @@ def test_tool_choice_variants():
     print("\n-- tool_choice=auto --")
     for stream in [False, True]:
         make_request(messages_auto, tools=TOOLS, stream=stream, tool_choice="auto")
+        time.sleep(0.5)
+
+    # New Delhi weather test with 'detailed thinking off' enforced via system override
+    messages_delhi = [{"role": "user", "content": "Temperature in new delhi?"}]
+    print("\n-- tool_choice=auto (New Delhi, thinking off) --")
+    for stream in [False, True]:
+        make_request(messages_delhi, tools=TOOLS, stream=stream, tool_choice="auto",
+                     system_override="detailed thinking off")
         time.sleep(0.5)
 
     messages_required = [{"role": "user", "content": "Briefly tell me the weather in San Francisco."}]
