@@ -76,6 +76,44 @@ class NemotronToolParser(ToolParser):
         return text.replace("<TOOLCALL>", "").replace("</TOOLCALL>", "")
 
     @staticmethod
+    def _extract_top_level_json_array_text(text: str) -> str | None:
+        """Extract the first top-level JSON array substring from text.
+        Returns None if '[' not found.
+        """
+        if not text:
+            return None
+        start = text.find('[')
+        if start == -1:
+            return None
+        i = start
+        depth = 0
+        in_string = False
+        escape = False
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                else:
+                    if ch == '\\':
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '[':
+                    depth += 1
+                elif ch == ']':
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i + 1]
+            i += 1
+        # Fallback: return partial tail
+        return text[start:]
+
+    @staticmethod
     def _suffix_after_longest_common_prefix(current_text: str,
                                             streamed_prefix: str) -> str:
         """Return the incremental suffix of current_text after removing the
@@ -230,8 +268,11 @@ class NemotronToolParser(ToolParser):
         return obj_text[start:i].strip()
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
-        # Ensure special tokens are not skipped so <TOOLCALL> tags are visible
-        if request.tools and request.tool_choice != "none":
+        # Only for auto tool parsing should we expose <TOOLCALL> tokens.
+        # For named/required tool_choice, keep default behavior so guided
+        # decoding and postprocessors see clean JSON without wrappers.
+        if request.tools and (request.tool_choice is None
+                              or request.tool_choice == "auto"):
             request.skip_special_tokens = False
         return request
 
@@ -246,30 +287,39 @@ class NemotronToolParser(ToolParser):
                 tools_called=False, tool_calls=[], content=model_output)
 
         # Remove the leading tag sequence
-        tool_content = model_output.replace(self.bot_token, "").strip()
+        sanitized = self._sanitize_toolcall_wrappers(model_output).strip()
+        # Extract the JSON array payload best-effort
+        tool_content = self._extract_top_level_json_array_text(sanitized) or sanitized
 
         try:
             # Prefer direct JSON load; fall back to regex extraction of the array
             try:
                 function_call_arr = json.loads(tool_content)
             except json.JSONDecodeError:
-                raw_tool_call = self.tool_call_regex.findall(tool_content)[0]
-                function_call_arr = json.loads(raw_tool_call)
+                # Try partial parser first
+                try:
+                    function_call_arr = partial_json_parser.loads(tool_content, Allow.ALL)
+                except Exception:
+                    # Regex fallback: find the first [ ... ] segment if present
+                    matches = self.tool_call_regex.findall(tool_content)
+                    if not matches:
+                        raise
+                    function_call_arr = json.loads(matches[0])
 
             tool_calls: list[ToolCall] = [
                 ToolCall(
                     type="function",
                     function=FunctionCall(
                         name=raw_function_call["name"],
-                        arguments=json.dumps(
-                            raw_function_call["arguments"], ensure_ascii=False,
-                        ),
+                        arguments=(json.dumps(raw_function_call["arguments"], ensure_ascii=False)
+                                   if not isinstance(raw_function_call.get("arguments"), str)
+                                   else raw_function_call["arguments"]),
                     ),
                 )
                 for raw_function_call in function_call_arr
             ]
 
-            content = model_output.split(self.bot_token)[0]
+            content = model_output.split(self.bot_token, 1)[0]
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 """
 Nemotron variant of the tool-calling test runner that exercises both
 "thinking" modes by injecting a system prompt:
