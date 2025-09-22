@@ -41,6 +41,10 @@ class NemotronReasoningParser(ReasoningParser):
         self._handed_off_to_tool_parser = False  # Track if we've handed off to tool parser
         # Buffer to accumulate potential </think> tag
         self._end_tag_buffer: str = ""
+        # Track if we're in direct content mode (no <think> tags detected)
+        self._direct_content_mode = False
+        # Skip a single stray '>' token immediately after </think>
+        self._skip_trailing_gt = False
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -53,6 +57,8 @@ class NemotronReasoningParser(ReasoningParser):
         self._pending_post_think_prefix = ""
         self._handed_off_to_tool_parser = False
         self._end_tag_buffer = ""
+        self._direct_content_mode = False
+        self._skip_trailing_gt = False
 
     def is_reasoning_end(self, input_ids: list[int]) -> bool:
         """Check if the reasoning content ends in the input_ids by looking for </think>."""
@@ -179,11 +185,29 @@ class NemotronReasoningParser(ReasoningParser):
         prev_has_end = self.end_token in previous_text
         curr_end_index = current_text.find(self.end_token)
 
+        # Update reasoning_ended state if we detect the end token in current_text
+        if curr_end_index != -1 and not self._reasoning_ended:
+            logger.debug(f"NEMOTRON_DEBUG: Setting _reasoning_ended=True due to </think> in current_text")
+            self._reasoning_ended = True
+            # Prepare to skip a stray '>' token right after </think>
+            self._skip_trailing_gt = True
+
         # Case 1: Already past </think> → everything is final content
         # Use _reasoning_ended state since previous_text might be reset
         if prev_has_end or self._reasoning_ended:
             logger.debug(f"NEMOTRON_DEBUG: Case 1 - Already past </think>")
             self._reasoning_ended = True  # Mark that reasoning has ended
+
+            # Skip a single stray '>' (and its newline variants) immediately after </think>
+            if self._skip_trailing_gt:
+                stripped = delta_text.strip()
+                if stripped in ('>', '*>', '*>\n', '*>\n\n', '>','>\n','>\n\n'):
+                    logger.debug(f"NEMOTRON_DEBUG: Case 1 - Skipping trailing '>' token after </think>: '{repr(delta_text)}'")
+                    self._skip_trailing_gt = False
+                    return None
+                # If we saw any non-whitespace/non-'>' token, disable the skip flag
+                if stripped:
+                    self._skip_trailing_gt = False
 
             # Handle potential tool-call prefix buffering, specifically for
             # a '<' immediately after </think> that may introduce a tool token
@@ -235,12 +259,78 @@ class NemotronReasoningParser(ReasoningParser):
 
         # Case 2: Still within reasoning → stream reasoning deltas
         if curr_end_index == -1:
+            # Double-check: if reasoning has already ended, this should be content
+            if self._reasoning_ended:
+                logger.debug(f"NEMOTRON_DEBUG: Case 2 -> Case 1 redirect - Reasoning already ended, treating as content")
+                return DeltaMessage(content=delta_text)
+            
+            # Check if we're in direct content mode or should enter it
+            if self._direct_content_mode:
+                logger.debug(f"NEMOTRON_DEBUG: Case 2 -> Direct content mode - treating as content")
+                return DeltaMessage(content=delta_text)
+            
+            # Special case: If we're at the beginning and current_text doesn't start with <think>,
+            # the model is outputting content directly (streaming vs non-streaming difference)
+            # Only enter direct content mode if we're sure it's not a partial <think> tag
+            if (not previous_text and current_text and 
+                not any(current_text.strip().startswith(prefix) for prefix in ['<think>', '<think', '<thin', '<thi', '<th', '<t', '<'])):
+                logger.debug(f"NEMOTRON_DEBUG: Case 2 -> Entering direct content mode - No <think> detected, current_text='{current_text}'")
+                self._direct_content_mode = True
+                return DeltaMessage(content=delta_text)
+                
             logger.debug(f"NEMOTRON_DEBUG: Case 2 - Still in reasoning, streaming reasoning delta")
-            return DeltaMessage(reasoning_content=delta_text)
+            
+            # Clean up reasoning content tokens - don't emit <think> tag parts
+            cleaned_delta = delta_text
+            
+            # Check if we're building up the <think> tag
+            accumulated_text = previous_text + cleaned_delta
+            
+            # Skip any fragments of the closing </think> tag as they are being built
+            closing_prefixes = ['</', '</t', '</th', '</thi', '</thin', '</think', '</think>']
+            tail_stripped = (previous_text + cleaned_delta).strip()
+            for prefix in closing_prefixes:
+                if tail_stripped.endswith(prefix) or cleaned_delta.strip() == prefix:
+                    logger.debug(f"NEMOTRON_DEBUG: Case 2 - Skipping closing tag fragment '{cleaned_delta}' (tail endswith '{prefix}')")
+                    return None
+
+            # Skip tokens that are part of building the <think> tag
+            if accumulated_text.strip().startswith('<') and not accumulated_text.strip().startswith('<think>'):
+                # We're still building the <think> tag, skip this token
+                if '<think>' not in accumulated_text:
+                    logger.debug(f"NEMOTRON_DEBUG: Case 2 - Skipping <think> building token: '{cleaned_delta}'")
+                    return None
+            
+            # Skip the opening <think> tag and immediate whitespace after it
+            if accumulated_text.strip() == '<think>' or (accumulated_text.startswith('<think>') and cleaned_delta.strip() == ''):
+                logger.debug(f"NEMOTRON_DEBUG: Case 2 - Skipping <think> tag or whitespace: '{cleaned_delta}'")
+                return None
+            
+            # Skip tokens that are building up the </think> tag or are part of it
+            if self.end_token in accumulated_text:
+                # Check if this token is part of the </think> tag or the > after it
+                end_tag_start = accumulated_text.rfind('</')
+                if end_tag_start != -1:
+                    potential_end_tag = accumulated_text[end_tag_start:]
+                    # Skip all parts of </think> and the > that follows
+                    if (potential_end_tag in ['</', '</t', '</th', '</thi', '</thin', '</think', '</think>'] or
+                        cleaned_delta.strip() in ['>', '>\n', '>\n\n'] or
+                        potential_end_tag.endswith('</think>') and cleaned_delta.strip().startswith('>')):
+                        logger.debug(f"NEMOTRON_DEBUG: Case 2 - Skipping </think> building/trailing token: '{cleaned_delta}'")
+                        return None
+            
+            # Also check if we're emitting incomplete </think> tokens
+            if cleaned_delta.strip().startswith('</think') and not cleaned_delta.strip() == '</think>':
+                logger.debug(f"NEMOTRON_DEBUG: Case 2 - Skipping incomplete </think> token: '{cleaned_delta}'")
+                return None
+            
+            return DeltaMessage(reasoning_content=cleaned_delta)
         
         # Case 3: Boundary appears within this delta → split and emit
         logger.debug(f"NEMOTRON_DEBUG: Case 3 - Found </think> boundary within delta")
         self._reasoning_ended = True
+        # Prepare to skip a stray '>' token right after </think>
+        self._skip_trailing_gt = True
         end_index = curr_end_index + len(self.end_token)
         before = current_text[:end_index]
         after = current_text[end_index:]
@@ -257,8 +347,30 @@ class NemotronReasoningParser(ReasoningParser):
         else:
             post = ''
 
-        return DeltaMessage(reasoning_content=None if not before else None,
-                            content=post if post else None)
+        # Clean up the reasoning content (remove <think> tags)
+        cleaned_reasoning = None
+        if before:
+            cleaned_reasoning = before
+            # Remove leading <think> tag if present
+            if cleaned_reasoning.startswith(self.start_token):
+                cleaned_reasoning = cleaned_reasoning[len(self.start_token):]
+            # Remove trailing </think> tag if present
+            if cleaned_reasoning.endswith(self.end_token):
+                cleaned_reasoning = cleaned_reasoning[:-len(self.end_token)]
+            # Clean up whitespace
+            cleaned_reasoning = cleaned_reasoning.strip()
+            if not cleaned_reasoning:
+                cleaned_reasoning = None
+
+        # Clean up the content (remove leading whitespace/newlines)
+        cleaned_content = None
+        if post:
+            cleaned_content = post.lstrip()
+            if not cleaned_content:
+                cleaned_content = None
+
+        return DeltaMessage(reasoning_content=cleaned_reasoning,
+                            content=cleaned_content)
 
     def extract_reasoning_content(
         self,
@@ -283,9 +395,11 @@ class NemotronReasoningParser(ReasoningParser):
                 elif hasattr(message, 'content'):
                     content = message.content
                 
-                if content and '/no_think' in str(content):
-                    is_no_think = True
-                    break
+                if content:
+                    text = str(content)
+                    if '/no_think' in text or 'detailed thinking off' in text.lower():
+                        is_no_think = True
+                        break
         
         # Remove leading <think> if present (from prompt)
         if model_output.startswith(self.start_token):
@@ -295,13 +409,16 @@ class NemotronReasoningParser(ReasoningParser):
         if self.end_token in model_output:
             reasoning_content, _, content = model_output.partition(self.end_token)
             
+            # Clean up reasoning content (remove <think> tag and whitespace)
+            if reasoning_content:
+                # Remove leading <think> tag if present
+                if reasoning_content.startswith(self.start_token):
+                    reasoning_content = reasoning_content[len(self.start_token):]
+                reasoning_content = reasoning_content.strip()
+            
             # Clean up the final content (remove leading whitespace/newlines)
             if content:
                 content = content.strip()
-            
-            # Clean up reasoning content (remove any trailing/leading whitespace)
-            if reasoning_content:
-                reasoning_content = reasoning_content.strip()
                 
             return (reasoning_content or None), (content or None)
 
@@ -322,9 +439,11 @@ class NemotronReasoningParser(ReasoningParser):
                 elif hasattr(message, 'content'):
                     content = message.content
                 
-                if content and '/no_think' in str(content):
-                    is_no_think = True
-                    break
+                if content:
+                    text = str(content)
+                    if '/no_think' in text or 'detailed thinking off' in text.lower():
+                        is_no_think = True
+                        break
         
         if is_no_think:
             # In no-think mode, treat everything as direct content

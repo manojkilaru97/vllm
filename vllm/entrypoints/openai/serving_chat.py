@@ -14,6 +14,7 @@ import regex as re
 from fastapi import Request
 from openai_harmony import Message as OpenAIMessage
 from pydantic import TypeAdapter
+from partial_json_parser.core.options import Allow
 
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
@@ -341,6 +342,14 @@ class OpenAIServingChat(OpenAIServing):
     
     def _is_no_think_mode(self, request: ChatCompletionRequest) -> bool:
         """Detect if request is in /no_think mode by checking message content."""
+        # If tools are present, Nemotron chat template forces detailed thinking off.
+        # Treat any request with tools as no-think to avoid engaging the reasoning parser.
+        try:
+            if getattr(request, 'tools', None):
+                return True
+        except Exception:
+            pass
+
         if not hasattr(request, 'messages') or not request.messages:
             return False
         
@@ -496,8 +505,12 @@ class OpenAIServingChat(OpenAIServing):
             # Sanitize Nemotron wrappers and focus on array content
             sanitized_current = self._sanitize_nemotron_wrappers(current_text)
             array_slice = self._extract_top_level_json_array(sanitized_current)
-            if array_slice and (']' in array_slice or '}' in array_slice):
-                obj = partial_json_parser.loads(array_slice)
+            if array_slice:
+                # Use partial JSON parser in permissive mode to support streaming
+                try:
+                    obj = partial_json_parser.loads(array_slice, Allow.ALL)
+                except Exception:
+                    obj = None
             else:
                 obj = None
         except Exception:

@@ -34,12 +34,12 @@ THINKING_MODE = "on"
 def get_system_prompt() -> str:
     base = "detailed thinking on" if THINKING_MODE == "on" else "detailed thinking off"
     # For Nemotron tool-calling, in OFF mode encourage strict <TOOLCALL> emission.
-    if THINKING_MODE == "off":
-        base += (
-            "\nWhen you decide to use tools, output exactly one tool call in this exact format and nothing else:\n"
-            "<TOOLCALL>[{\"name\":\"FUNCTION_NAME\",\"arguments\":{...}}]</TOOLCALL>\n"
-            "No prose, no code fences, no extra text."
-        )
+    # if THINKING_MODE == "off":
+        # base += (
+        #     "\nWhen you decide to use tools, output exactly one tool call in this exact format and nothing else:\n"
+        #     "<TOOLCALL>[{\"name\":\"FUNCTION_NAME\",\"arguments\":{...}}]</TOOLCALL>\n"
+        #     "No prose, no code fences, no extra text."
+        # )
     return base
 
 
