@@ -16,7 +16,31 @@ import argparse
 import os
 import time
 import requests
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+
+# Test result tracking
+class TestResult:
+    def __init__(self, name: str):
+        self.name = name
+        self.passed = False
+        self.errors = []
+        self.warnings = []
+        self.details = {}
+    
+    def add_error(self, msg: str):
+        self.errors.append(msg)
+    
+    def add_warning(self, msg: str):
+        self.warnings.append(msg)
+    
+    def set_passed(self, passed: bool):
+        self.passed = passed
+    
+    def summary(self) -> str:
+        status = "✅ PASS" if self.passed else "❌ FAIL"
+        return f"{status} {self.name}"
+
+test_results = []
 
 BASE_URL = os.environ.get("SGLANG_BASE_URL", "http://localhost:8003")
 CHAT_URL = f"{BASE_URL}/v1/chat/completions"
@@ -153,14 +177,66 @@ def detect_default_model() -> str:
     return ""
 
 
+def validate_tool_response(expected_tools: List[str], actual_tool_calls: List[Dict], 
+                          content: str, thinking_mode: str, result: TestResult) -> None:
+    """Validate tool calling response based on expected behavior."""
+    
+    # Safety check - ensure result is actually a TestResult
+    if not isinstance(result, TestResult):
+        print(f"ERROR: validate_tool_response received {type(result)} instead of TestResult")
+        return
+    
+    # Basic validation
+    if expected_tools and not actual_tool_calls:
+        result.add_error(f"Expected tool calls for {expected_tools} but got none")
+        return
+    
+    if not expected_tools and actual_tool_calls:
+        result.add_warning(f"Got unexpected tool calls: {[tc.get('function', {}).get('name') for tc in actual_tool_calls]}")
+    
+    # Validate specific tool calls
+    if expected_tools and actual_tool_calls:
+        actual_names = [tc.get('function', {}).get('name') for tc in actual_tool_calls]
+        
+        for expected in expected_tools:
+            if expected not in actual_names:
+                result.add_error(f"Expected tool '{expected}' not found in actual calls: {actual_names}")
+        
+        # Validate tool call structure
+        for tc in actual_tool_calls:
+            func = tc.get('function', {})
+            if not func.get('name'):
+                result.add_error("Tool call missing function name")
+            if not func.get('arguments'):
+                result.add_warning("Tool call has empty arguments")
+            else:
+                try:
+                    json.loads(func['arguments'])
+                except json.JSONDecodeError:
+                    result.add_error(f"Tool call arguments are not valid JSON: {func['arguments']}")
+    
+    # Content validation based on thinking mode
+    if thinking_mode == "off" and content and actual_tool_calls:
+        # In thinking off mode, we might expect minimal content when tools are called
+        pass  # This is acceptable
+    
+    # Set overall pass/fail
+    result.set_passed(len(result.errors) == 0)
+
 def make_request(messages: List[Dict], tools: List[Dict] = None,
                 stream: bool = False, model: str = None, tool_choice: Any = None,
-                system_override: Optional[str] = None) -> Dict[str, Any]:
+                system_override: Optional[str] = None, test_name: str = None,
+                expected_tools: List[str] = None) -> Tuple[Dict[str, Any], Optional[TestResult]]:
     """Make a request to the chat completions endpoint with Nemotron system prompt injected."""
 
+    # Create test result if test_name provided
+    result = TestResult(test_name) if test_name else None
+    
     # Prepend system prompt to toggle thinking behavior
     system_message = {"role": "system", "content": system_override if system_override is not None else get_system_prompt()}
     request_messages = [system_message] + messages.copy()
+    
+    current_thinking_mode = "on" if "thinking on" in system_message["content"] else "off"
 
     use_model = model or DEFAULT_MODEL or detect_default_model()
 
@@ -179,6 +255,8 @@ def make_request(messages: List[Dict], tools: List[Dict] = None,
         else:
             payload["tool_choice"] = "auto"
 
+    if test_name:
+        print(f"\n🔄 {test_name}")
     print(f"\n{'='*80}")
     print(f"REQUEST: stream={stream}, tools={'Yes' if tools else 'No'}")
     auth_present = bool(HEADERS and HEADERS.get('Authorization'))
@@ -254,18 +332,24 @@ def make_request(messages: List[Dict], tools: List[Dict] = None,
 
             print(f"\nSSE EVENT COUNT: {len(sse_events)}")
 
-            return {"content": full_content, "tool_calls": assembled_tool_calls, "sse_events": sse_events}
+            response_data = {"content": full_content, "tool_calls": assembled_tool_calls, "sse_events": sse_events}
+            
+            # Validate if this is a test
+            if result:
+                validate_tool_response(expected_tools or [], assembled_tool_calls, full_content, current_thinking_mode, result)
+            
+            return response_data, result
 
         else:
             response = requests.post(CHAT_URL, json=payload, headers=HEADERS, timeout=60)
             response.raise_for_status()
-            result = response.json()
+            response_json = response.json()
 
             print("NON-STREAMING RESPONSE:")
-            print(json.dumps(result, indent=2))
+            print(json.dumps(response_json, indent=2))
 
-            if 'choices' in result and len(result['choices']) > 0:
-                message = result['choices'][0]['message']
+            if 'choices' in response_json and len(response_json['choices']) > 0:
+                message = response_json['choices'][0]['message']
                 content = message.get('content', '')
                 tool_calls = message.get('tool_calls', [])
                 if tool_calls:
@@ -275,13 +359,22 @@ def make_request(messages: List[Dict], tools: List[Dict] = None,
                         args = (tc.get('function') or {}).get('arguments')
                         print(f"- {fn}({args})")
 
-                return {"content": content, "tool_calls": tool_calls}
-
-            return {"content": "", "tool_calls": []}
+                response_data = {"content": content, "tool_calls": tool_calls}
+            else:
+                response_data = {"content": "", "tool_calls": []}
+            
+            # Validate if this is a test
+            if result:
+                validate_tool_response(expected_tools or [], response_data.get("tool_calls", []), 
+                                     response_data.get("content", ""), current_thinking_mode, result)
+            
+            return response_data, result
 
     except Exception as e:
         print(f"ERROR: {e}")
-        return {"error": str(e)}
+        if result:
+            result.add_error(f"Request failed: {e}")
+        return {"error": str(e)}, result
 
 
 def test_normal_queries():
@@ -293,7 +386,14 @@ def test_normal_queries():
     messages = [{"role": "user", "content": "What is the capital of France? Explain briefly."}]
 
     for stream in [False, True]:
-        make_request(messages, tools=None, stream=stream)
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages, tools=None, stream=stream, 
+            test_name=f"Normal Query ({stream_type})",
+            expected_tools=[]
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(1)
 
 
@@ -306,7 +406,14 @@ def test_single_tool_calling():
     messages = [{"role": "user", "content": "What's the weather like in San Francisco?"}]
 
     for stream in [False, True]:
-        make_request(messages, tools=TOOLS, stream=stream, tool_choice="auto")
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages, tools=TOOLS, stream=stream, tool_choice="auto",
+            test_name=f"Single Tool Call ({stream_type})",
+            expected_tools=["get_weather"]
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(1)
 
 
@@ -319,7 +426,14 @@ def test_parallel_tool_calling():
     messages = [{"role": "user", "content": "I need the weather in both New York and Los Angeles, and also calculate 15 * 23."}]
 
     for stream in [False, True]:
-        make_request(messages, tools=TOOLS, stream=stream, tool_choice="auto")
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages, tools=TOOLS, stream=stream, tool_choice="auto",
+            test_name=f"Parallel Tool Calls ({stream_type})",
+            expected_tools=["get_weather", "calculate"]  # May get multiple weather calls
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(1)
 
 
@@ -331,16 +445,22 @@ def test_complex_tool_scenario():
 
     messages = [{"role": "user", "content": "What's the weather in Tokyo? Use Celsius."}]
 
-    result = make_request(messages, tools=TOOLS, stream=False, tool_choice="auto")
+    response_data, test_result = make_request(
+        messages, tools=TOOLS, stream=False, tool_choice="auto",
+        test_name="Complex Multi-turn (initial)",
+        expected_tools=["get_weather"]
+    )
+    if test_result:
+        test_results.append(test_result)
 
-    if result.get('tool_calls'):
+    if response_data.get('tool_calls'):
         messages.append({
             "role": "assistant",
-            "content": result.get('content', ''),
-            "tool_calls": result['tool_calls']
+            "content": response_data.get('content', ''),
+            "tool_calls": response_data['tool_calls']
         })
 
-        for tool_call in result['tool_calls']:
+        for tool_call in response_data['tool_calls']:
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.get('id', 'call_123'),
@@ -357,7 +477,13 @@ def test_complex_tool_scenario():
             "content": "Great! Now can you also search for recent news about Tokyo weather patterns?"
         })
 
-        make_request(messages, tools=TOOLS, stream=True, tool_choice="auto")
+        response_data, test_result2 = make_request(
+            messages, tools=TOOLS, stream=True, tool_choice="auto",
+            test_name="Complex Multi-turn (follow-up)",
+            expected_tools=["search_web"]
+        )
+        if test_result2:
+            test_results.append(test_result2)
 
 
 def test_edge_cases():
@@ -366,12 +492,26 @@ def test_edge_cases():
     print("TESTING EDGE CASES")
     print(f"{'#'*80}")
 
+    # Test with no tools available
     messages = [{"role": "user", "content": "What's the weather?"}]
-    make_request(messages, tools=[], stream=False)
+    response_data, test_result = make_request(
+        messages, tools=[], stream=False,
+        test_name="Edge Case: No tools available",
+        expected_tools=[]
+    )
+    if test_result:
+        test_results.append(test_result)
 
+    # Test with very long message
     long_message = "Please " + "really " * 100 + "help me with the weather."
     messages = [{"role": "user", "content": long_message}]
-    make_request(messages, tools=TOOLS, stream=False, tool_choice="auto")
+    response_data, test_result2 = make_request(
+        messages, tools=TOOLS, stream=False, tool_choice="auto",
+        test_name="Edge Case: Long message",
+        expected_tools=["get_weather"]
+    )
+    if test_result2:
+        test_results.append(test_result2)
 
 
 def test_sql_tool_choice_variants():
@@ -386,7 +526,14 @@ def test_sql_tool_choice_variants():
     }]
     print("\n-- SQL tool_choice=auto --")
     for stream in [False, True]:
-        make_request(messages_auto, tools=TOOLS, stream=stream, tool_choice="auto")
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages_auto, tools=TOOLS, stream=stream, tool_choice="auto",
+            test_name=f"SQL auto ({stream_type})",
+            expected_tools=["execute_sql"]
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(0.5)
 
     messages_required = [{
@@ -395,7 +542,14 @@ def test_sql_tool_choice_variants():
     }]
     print("\n-- SQL tool_choice=required --")
     for stream in [False, True]:
-        make_request(messages_required, tools=TOOLS, stream=stream, tool_choice="required")
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages_required, tools=TOOLS, stream=stream, tool_choice="required",
+            test_name=f"SQL required ({stream_type})",
+            expected_tools=["execute_sql"]
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(0.5)
 
     messages_targeted = [{
@@ -405,7 +559,14 @@ def test_sql_tool_choice_variants():
     targeted_choice = {"type": "function", "function": {"name": "execute_sql"}}
     print("\n-- SQL tool_choice={type:function, name:execute_sql} --")
     for stream in [False, True]:
-        make_request(messages_targeted, tools=TOOLS, stream=stream, tool_choice=targeted_choice)
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages_targeted, tools=TOOLS, stream=stream, tool_choice=targeted_choice,
+            test_name=f"SQL targeted ({stream_type})",
+            expected_tools=["execute_sql"]
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(0.5)
 
 
@@ -418,28 +579,56 @@ def test_tool_choice_variants():
     messages_auto = [{"role": "user", "content": "What's the weather like in San Francisco?"}]
     print("\n-- tool_choice=auto --")
     for stream in [False, True]:
-        make_request(messages_auto, tools=TOOLS, stream=stream, tool_choice="auto")
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages_auto, tools=TOOLS, stream=stream, tool_choice="auto",
+            test_name=f"Tool choice auto ({stream_type})",
+            expected_tools=["get_weather"]
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(0.5)
 
     # New Delhi weather test with 'detailed thinking off' enforced via system override
     messages_delhi = [{"role": "user", "content": "Temperature in new delhi?"}]
     print("\n-- tool_choice=auto (New Delhi, thinking off) --")
     for stream in [False, True]:
-        make_request(messages_delhi, tools=TOOLS, stream=stream, tool_choice="auto",
-                     system_override="detailed thinking off")
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages_delhi, tools=TOOLS, stream=stream, tool_choice="auto",
+            system_override="detailed thinking off",
+            test_name=f"Tool choice auto - thinking off ({stream_type})",
+            expected_tools=["get_weather"]
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(0.5)
 
     messages_required = [{"role": "user", "content": "Briefly tell me the weather in San Francisco."}]
     print("\n-- tool_choice=required --")
     for stream in [False, True]:
-        make_request(messages_required, tools=TOOLS, stream=stream, tool_choice="required")
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages_required, tools=TOOLS, stream=stream, tool_choice="required",
+            test_name=f"Tool choice required ({stream_type})",
+            expected_tools=["get_weather"]  # Should be forced to use a tool
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(0.5)
 
     messages_targeted = [{"role": "user", "content": "Calculate 15 * 23."}]
     targeted_choice = {"type": "function", "function": {"name": "calculate"}}
     print("\n-- tool_choice={type:function, name:calculate} --")
     for stream in [False, True]:
-        make_request(messages_targeted, tools=TOOLS, stream=stream, tool_choice=targeted_choice)
+        stream_type = "streaming" if stream else "non-streaming"
+        response_data, test_result = make_request(
+            messages_targeted, tools=TOOLS, stream=stream, tool_choice=targeted_choice,
+            test_name=f"Tool choice targeted ({stream_type})",
+            expected_tools=["calculate"]
+        )
+        if test_result:
+            test_results.append(test_result)
         time.sleep(0.5)
 
 
@@ -519,10 +708,46 @@ def main():
         print(f"{'#'*80}")
         run_selected_tests(args.only)
 
+    # Print test summary
+    print_test_summary()
+    
     print(f"\n{'#'*80}")
     print("ALL TESTS COMPLETED")
     print(f"{'#'*80}")
 
+
+def print_test_summary():
+    """Print a summary of all test results."""
+    if not test_results:
+        return
+    
+    print(f"\n{'='*80}")
+    print("🧪 TEST SUMMARY")
+    print(f"{'='*80}")
+    
+    passed = 0
+    failed = 0
+    
+    for result in test_results:
+        print(result.summary())
+        if result.passed:
+            passed += 1
+        else:
+            failed += 1
+        
+        # Show errors and warnings
+        for error in result.errors:
+            print(f"   ❌ {error}")
+        for warning in result.warnings:
+            print(f"   ⚠️  {warning}")
+    
+    print(f"\n{'-'*80}")
+    print(f"Total: {len(test_results)} tests, {passed} passed, {failed} failed")
+    
+    if failed == 0:
+        print("🎉 All tests passed!")
+    else:
+        print(f"💥 {failed} test(s) failed")
 
 if __name__ == "__main__":
     main()
