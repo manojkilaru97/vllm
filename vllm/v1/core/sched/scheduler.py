@@ -1295,6 +1295,11 @@ class Scheduler(SchedulerInterface):
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
+        
+        # Cleanup structured output resources to avoid memory leaks
+        if request.structured_output_request is not None:
+            request.structured_output_request.cleanup()
+        
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
