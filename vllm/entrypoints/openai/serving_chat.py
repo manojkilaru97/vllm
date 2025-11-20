@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import base64
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
+from pathlib import Path
 from typing import Final
+import os
+import logging
 
 import jinja2
 import partial_json_parser
@@ -71,6 +75,7 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -180,11 +185,52 @@ class OpenAIServingChat(OpenAIServing):
             raise self.engine_client.dead_error
 
         try:
+            # Resolve NVCF image assets in-place before preprocessing
+            if raw_request is not None:
+                try:
+                    request.messages = self._resolve_nvcf_image_assets(
+                        request.messages, raw_request)
+                except Exception as e:
+                    logger.exception("Error while resolving NVCF assets")
+                    return self.create_error_response(str(e))
+            
             lora_request = self._maybe_get_adapters(
                 request, supports_default_mm_loras=True
             )
 
             model_name = self.models.model_name(lora_request)
+
+            # Log request payload BEFORE any chat template is applied
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                # Collect all incoming headers unfiltered
+                headers_json = ""
+                try:
+                    if raw_request is not None:
+                        headers_to_log = {k: v for k, v in raw_request.headers.items()}
+                        headers_json = json.dumps(headers_to_log, ensure_ascii=False)
+                except Exception:
+                    headers_json = ""
+                try:
+                    req_dump = request.model_dump()
+                except Exception:
+                    req_dump = None
+                try:
+                    req_str = json.dumps(req_dump, ensure_ascii=False) if req_dump is not None else ""
+                except Exception:
+                    req_str = ""
+                rid_hint = self._base_request_id(raw_request, getattr(request, "request_id", None))
+                try:
+                    payload_logger.info(
+                        "openai.request",
+                        extra={
+                            "rid": rid_hint or "",
+                            "endpoint": self.__class__.__name__,
+                            "payload": req_str,
+                            "headers": headers_json,
+                        },
+                    )
+                except Exception:
+                    pass
 
             tokenizer = await self.engine_client.get_tokenizer()
 
@@ -529,6 +575,7 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
+        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("chatcmpl-") else request_id
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
@@ -563,6 +610,11 @@ class OpenAIServingChat(OpenAIServing):
 
         # Always track previous_texts for comprehensive output logging
         previous_texts = [""] * num_choices
+        
+        # Track reasoning, content and tool calls separately for proper logging
+        previous_reasoning_texts = [""] * num_choices
+        previous_content_texts = [""] * num_choices
+        previous_tool_calls: list[list[DeltaToolCall]] = [[] for _ in range(num_choices)]
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -1051,10 +1103,68 @@ class OpenAIServingChat(OpenAIServing):
                         assert all_previous_token_ids is not None
                         previous_texts[i] = current_text
                         all_previous_token_ids[i] = current_token_ids
+                        
+                        # Track reasoning, content, and tool calls separately for logging
+                        if delta_message:
+                            if delta_message.reasoning:
+                                previous_reasoning_texts[i] += delta_message.reasoning
+                            if delta_message.content:
+                                previous_content_texts[i] += delta_message.content
+                            if delta_message.tool_calls:
+                                # Track tool calls - merge or add new ones
+                                for delta_tc in delta_message.tool_calls:
+                                    if delta_tc.index is not None:
+                                        # Ensure we have enough slots
+                                        while len(previous_tool_calls[i]) <= delta_tc.index:
+                                            previous_tool_calls[i].append(DeltaToolCall(index=len(previous_tool_calls[i])))
+                                        # Merge with existing tool call at this index
+                                        existing_tc = previous_tool_calls[i][delta_tc.index]
+                                        if delta_tc.id is not None:
+                                            existing_tc.id = delta_tc.id
+                                        if delta_tc.type is not None:
+                                            existing_tc.type = delta_tc.type
+                                        if delta_tc.function is not None:
+                                            if existing_tc.function is None:
+                                                existing_tc.function = DeltaFunctionCall()
+                                            if delta_tc.function.name is not None:
+                                                existing_tc.function.name = delta_tc.function.name
+                                            if delta_tc.function.arguments is not None:
+                                                if existing_tc.function.arguments is None:
+                                                    existing_tc.function.arguments = ""
+                                                existing_tc.function.arguments += delta_tc.function.arguments
                     else:
                         # Update for comprehensive logging even in simple case
                         assert previous_texts is not None
                         previous_texts[i] += delta_text
+                        
+                        # Track reasoning and content separately for logging
+                        if delta_message:
+                            if delta_message.reasoning:
+                                previous_reasoning_texts[i] += delta_message.reasoning
+                            if delta_message.content:
+                                previous_content_texts[i] += delta_message.content
+                            if delta_message.tool_calls:
+                                # Track tool calls - merge or add new ones
+                                for delta_tc in delta_message.tool_calls:
+                                    if delta_tc.index is not None:
+                                        # Ensure we have enough slots
+                                        while len(previous_tool_calls[i]) <= delta_tc.index:
+                                            previous_tool_calls[i].append(DeltaToolCall(index=len(previous_tool_calls[i])))
+                                        # Merge with existing tool call at this index
+                                        existing_tc = previous_tool_calls[i][delta_tc.index]
+                                        if delta_tc.id is not None:
+                                            existing_tc.id = delta_tc.id
+                                        if delta_tc.type is not None:
+                                            existing_tc.type = delta_tc.type
+                                        if delta_tc.function is not None:
+                                            if existing_tc.function is None:
+                                                existing_tc.function = DeltaFunctionCall()
+                                            if delta_tc.function.name is not None:
+                                                existing_tc.function.name = delta_tc.function.name
+                                            if delta_tc.function.arguments is not None:
+                                                if existing_tc.function.arguments is None:
+                                                    existing_tc.function.arguments = ""
+                                                existing_tc.function.arguments += delta_tc.function.arguments
 
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
@@ -1072,24 +1182,9 @@ class OpenAIServingChat(OpenAIServing):
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
                         delta_content = ""
-                        if delta_message.content:
-                            delta_content = delta_message.content
-                        elif delta_message.tool_calls:
-                            delta_content = "".join(
-                                tc.function.arguments
-                                for tc in delta_message.tool_calls
-                                if tc.function and tc.function.arguments
-                            )
-
-                        if delta_content:
-                            self.request_logger.log_outputs(
-                                request_id=request_id,
-                                outputs=delta_content,
-                                output_token_ids=as_list(output.token_ids),
-                                finish_reason=output.finish_reason,
-                                is_streaming=True,
-                                delta=True,
-                            )
+                        # Skip logging individual streaming deltas to reduce log volume
+                        # We'll log the complete response at the end instead
+                        pass
 
                     if output.finish_reason is None:
                         # Send token-by-token response for each request.n
@@ -1255,23 +1350,125 @@ class OpenAIServingChat(OpenAIServing):
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
 
+            # Emit a single streaming summary payload log
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                try:
+                    usage_dict = (
+                        request_metadata.final_usage_info.model_dump()
+                        if request_metadata.final_usage_info
+                        else None
+                    )
+                except Exception:
+                    usage_dict = None
+                resp_summary = {
+                    "id": rid_hint,
+                    "object": "chat.completion",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [],
+                    "usage": usage_dict,
+                    "stream": True,
+                }
+                try:
+                    payload_str = json.dumps(resp_summary, ensure_ascii=False)
+                except Exception:
+                    payload_str = ""
+                try:
+                    payload_logger.info(
+                        "openai.response",
+                        extra={
+                            "rid": rid_hint,
+                            "endpoint": self.__class__.__name__,
+                            "payload": payload_str,
+                        },
+                    )
+                except Exception:
+                    pass
+
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
                 # Log the complete response for each choice
                 for i in range(num_choices):
-                    full_text = (
-                        previous_texts[i]
-                        if previous_texts and i < len(previous_texts)
-                        else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
+                    reasoning_text = previous_reasoning_texts[i]
+                    content_text = previous_content_texts[i]
+                    tool_calls_list = previous_tool_calls[i]
+                    
+                    logger.debug(
+                        "Streaming complete for request %s, choice %d: reasoning_length=%d, content_length=%d, tool_calls=%d",
+                        request_id, i, len(reasoning_text), len(content_text), len(tool_calls_list)
                     )
-                    self.request_logger.log_outputs(
-                        request_id=request_id,
-                        outputs=full_text,
-                        output_token_ids=None,  # Consider also logging all token IDs
-                        finish_reason="streaming_complete",
-                        is_streaming=True,
-                        delta=False,
-                    )
+                    
+                    if reasoning_text:
+                        logger.debug(
+                            "Logging reasoning part for request %s: [reasoning] %s...",
+                            request_id, reasoning_text[:100]
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=f"[reasoning] {reasoning_text}",
+                            output_token_ids=None,
+                            finish_reason=None,
+                            is_streaming=True,
+                            delta=False,
+                        )
+                    
+                    if content_text:
+                        logger.debug(
+                            "Logging content part for request %s: %s...",
+                            request_id, content_text[:100]
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=content_text,
+                            output_token_ids=None,
+                            finish_reason="streaming_complete",
+                            is_streaming=True,
+                            delta=False,
+                        )
+                    
+                    # Log tool calls if present (similar to non-streaming mode)
+                    if tool_calls_list:
+                        tool_call_descriptions = []
+                        for tc in tool_calls_list:
+                            if tc.function and tc.function.name and tc.function.arguments:
+                                tool_call_descriptions.append(
+                                    f"{tc.function.name}({tc.function.arguments})"
+                                )
+                        if tool_call_descriptions:
+                            tool_calls_str = ", ".join(tool_call_descriptions)
+                            tool_calls_output = f"[tool_calls: {tool_calls_str}]"
+                            logger.debug(
+                                "Logging tool calls for request %s: %s",
+                                request_id, tool_calls_output[:200]
+                            )
+                            self.request_logger.log_outputs(
+                                request_id=request_id,
+                                outputs=tool_calls_output,
+                                output_token_ids=None,
+                                finish_reason="streaming_complete",
+                                is_streaming=True,
+                                delta=False,
+                            )
+                    
+                    # If neither reasoning nor content nor tool calls, log a fallback message
+                    if not reasoning_text and not content_text and not tool_calls_list:
+                        full_text = (
+                            previous_texts[i]
+                            if previous_texts and i < len(previous_texts)
+                            else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
+                        )
+                        logger.debug(
+                            "No separate reasoning/content/tool_calls tracked, logging full text for request %s",
+                            request_id
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=full_text,
+                            output_token_ids=None,
+                            finish_reason="streaming_complete",
+                            is_streaming=True,
+                            delta=False,
+                        )
 
         except Exception as e:
             # TODO: Use a vllm-specific Validation Error
@@ -1292,6 +1489,7 @@ class OpenAIServingChat(OpenAIServing):
         request_metadata: RequestResponseMetadata,
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
+        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("chatcmpl-") else request_id
         final_res: RequestOutput | None = None
 
         try:
@@ -1575,9 +1773,51 @@ class OpenAIServingChat(OpenAIServing):
             kv_transfer_params=final_res.kv_transfer_params,
         )
 
+        # Emit a single non-streaming summary payload log
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            try:
+                usage_dict = usage.model_dump() if usage else None
+            except Exception:
+                usage_dict = None
+            resp_summary = {
+                "id": rid_hint,
+                "object": "chat.completion",
+                "created": created_time,
+                "model": model_name,
+                "choices": [],
+                "usage": usage_dict,
+                "stream": False,
+            }
+            try:
+                payload_str = json.dumps(resp_summary, ensure_ascii=False)
+            except Exception:
+                payload_str = ""
+            try:
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": rid_hint,
+                        "endpoint": self.__class__.__name__,
+                        "payload": payload_str,
+                    },
+                )
+            except Exception:
+                pass
+
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
             for choice in choices:
+                # Log reasoning 
+                if hasattr(choice.message, 'reasoning') and choice.message.reasoning:
+                    self.request_logger.log_outputs(
+                        request_id=request_id,
+                        outputs=f"[reasoning] {choice.message.reasoning}",
+                        output_token_ids=None,
+                        finish_reason=None,  
+                        is_streaming=False,
+                        delta=False,
+                    )
+
                 output_text = ""
                 if choice.message.content:
                     output_text = choice.message.content
@@ -1595,15 +1835,11 @@ class OpenAIServingChat(OpenAIServing):
                     output_text = f"[tool_calls: {tool_calls_str}]"
 
                 if output_text:
-                    # Get the corresponding output token IDs
-                    output_token_ids = None
-                    if choice.index < len(final_res.outputs):
-                        output_token_ids = final_res.outputs[choice.index].token_ids
-
+                    # Don't log output_token_ids to reduce log volume
                     self.request_logger.log_outputs(
                         request_id=request_id,
                         outputs=output_text,
-                        output_token_ids=output_token_ids,
+                        output_token_ids=None,
                         finish_reason=choice.finish_reason,
                         is_streaming=False,
                         delta=False,
@@ -1770,3 +2006,105 @@ class OpenAIServingChat(OpenAIServing):
             engine_prompt["cache_salt"] = request.cache_salt
 
         return messages, [prompt_token_ids], [engine_prompt]
+
+    def _resolve_nvcf_image_assets(self, messages: list[dict], raw_request: Request
+                                   ) -> list[dict]:
+        """
+        Convert any NVCF image asset references to base64 data URLs and, when
+        present inside plain text content with <img src="...">, transform the
+        message into structured parts to ensure image loading by the multimodal
+        parser.
+
+        Supported inputs:
+        - Structured: {"type":"image_url", "image_url":{"url":"data:image/...;asset_id,<id>"}}
+        - Text with HTML: "... <img src=\"data:image/...;asset_id,<id>\"/> ..."
+        
+        Headers used:
+        - NVCF-ASSET-DIR: absolute directory containing assets
+        - NVCF-FUNCTION-ASSET-IDS: comma-separated allowed asset ids
+        
+        Note: The Kratos offload filter in OTEL will automatically handle
+        large base64 images (>256KB) by uploading to S3 and replacing with URIs.
+        """
+        headers = raw_request.headers
+        asset_dir = headers.get("NVCF-ASSET-DIR")
+        allowed_ids_hdr = headers.get("NVCF-FUNCTION-ASSET-IDS")
+
+        if not asset_dir or not allowed_ids_hdr:
+            # Nothing to resolve
+            return messages
+
+        asset_root = Path(asset_dir)
+        if not asset_root.exists() or not asset_root.is_dir():
+            raise ValueError(f"Invalid NVCF-ASSET-DIR: {asset_dir}")
+
+        allowed_ids = {s.strip() for s in allowed_ids_hdr.split(',') if s.strip()}
+
+        def to_base64_data_url(data_url: str) -> str:
+            # data:image/<type>;asset_id,<id>
+            m = re.match(r"^data:(image/[^;]+);asset_id,([^,]+)$", data_url)
+            if not m:
+                return data_url
+            mime = m.group(1)
+            asset_id = m.group(2)
+            if asset_id not in allowed_ids:
+                raise ValueError(f"Asset id '{asset_id}' not permitted by NVCF-FUNCTION-ASSET-IDS")
+            file_path = (asset_root / asset_id).resolve()
+            # prevent traversal
+            if asset_root not in file_path.parents and file_path != asset_root:
+                raise ValueError("Asset path escapes NVCF-ASSET-DIR")
+            with open(file_path, 'rb') as f:
+                data_b64 = base64.b64encode(f.read()).decode('ascii')
+            return f"data:{mime};base64,{data_b64}"
+
+        def transform_message(msg: dict) -> dict:
+            content = msg.get("content")
+            # Case 1: structured content list
+            if isinstance(content, list):
+                new_parts = []
+                for part in content:
+                    if isinstance(part, dict) and "image_url" in part:
+                        url_obj = part["image_url"]
+                        if isinstance(url_obj, dict):
+                            url = url_obj.get("url")
+                            if isinstance(url, str) and ";asset_id," in url:
+                                url_obj["url"] = to_base64_data_url(url)
+                        elif isinstance(url_obj, str) and ";asset_id," in url_obj:
+                            part["image_url"] = {"url": to_base64_data_url(url_obj)}
+                        new_parts.append(part)
+                    else:
+                        new_parts.append(part)
+                msg["content"] = new_parts
+                return msg
+
+            # Case 2: plain text possibly containing <img src="...">
+            if isinstance(content, str):
+                pattern = re.compile(r"<img\s+[^>]*src=\"([^\"]+)\"[^>]*/?>")
+                idx = 0
+                parts = []
+                for m in pattern.finditer(content):
+                    start, end = m.span()
+                    url = m.group(1)
+                    if start > idx:
+                        text_chunk = content[idx:start]
+                        if text_chunk:
+                            parts.append({"type": "text", "text": text_chunk})
+                    if url.startswith("data:image/") and ";asset_id," in url:
+                        b64_url = to_base64_data_url(url)
+                        parts.append({"type": "image_url", "image_url": {"url": b64_url}})
+                    else:
+                        # keep as text if not asset_id pattern
+                        parts.append({"type": "text", "text": m.group(0)})
+                    idx = end
+                if parts:
+                    # trailing text
+                    if idx < len(content):
+                        tail = content[idx:]
+                        if tail:
+                            parts.append({"type": "text", "text": tail})
+                    msg["content"] = parts
+                return msg
+
+            return msg
+
+        return [transform_message(dict(m)) for m in messages]
