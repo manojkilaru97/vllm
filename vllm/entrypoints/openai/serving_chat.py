@@ -1217,20 +1217,37 @@ class OpenAIServingChat(OpenAIServing):
                         else:
                             index = 0
 
-                        if (
+                        # Check if we need to send remaining tool arguments
+                        # This handles cases where:
+                        # 1. delta_message has tool_calls with arguments
+                        # 2. OR delta_message is None/empty but tool_parser has
+                        #    parsed tool calls (e.g., Mistral format)
+                        should_check_remaining = (
                             self._should_check_for_unstreamed_tool_arg_tokens(
                                 delta_message, output
                             )
-                            and tool_parser
-                        ):
+                            or (
+                                output.finish_reason is not None
+                                and self.enable_auto_tools
+                                and tool_parser
+                                and auto_tools_called
+                                and len(tool_parser.streamed_args_for_tool) > index
+                            )
+                        )
+                        
+                        if should_check_remaining and tool_parser:
                             latest_delta_len = 0
                             if (
-                                isinstance(
+                                delta_message
+                                and delta_message.tool_calls
+                                and delta_message.tool_calls[0].function
+                                and isinstance(
                                     delta_message.tool_calls[0].function,
                                     DeltaFunctionCall,
                                 )
-                            ) and isinstance(
-                                delta_message.tool_calls[0].function.arguments, str
+                                and isinstance(
+                                    delta_message.tool_calls[0].function.arguments, str
+                                )
                             ):
                                 latest_delta_len = len(
                                     delta_message.tool_calls[0].function.arguments
@@ -1253,17 +1270,18 @@ class OpenAIServingChat(OpenAIServing):
 
                             # check to see if there's anything left to stream
                             remaining_call = expected_call.replace(actual_call, "", 1)
-                            # set that as a delta message
-                            delta_message = DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        index=index,
-                                        function=DeltaFunctionCall(
-                                            arguments=remaining_call
-                                        ).model_dump(exclude_none=True),
-                                    )
-                                ]
-                            )
+                            # set that as a delta message if there's remaining content
+                            if remaining_call:
+                                delta_message = DeltaMessage(
+                                    tool_calls=[
+                                        DeltaToolCall(
+                                            index=index,
+                                            function=DeltaFunctionCall(
+                                                arguments=remaining_call
+                                            ).model_dump(exclude_none=True),
+                                        )
+                                    ]
+                                )
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the

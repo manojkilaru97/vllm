@@ -2174,6 +2174,9 @@ class FunctionCall(OpenAIBaseModel):
 class ToolCall(OpenAIBaseModel):
     id: str = Field(default_factory=make_tool_call_id)
     type: Literal["function"] = "function"
+    # index is included in streaming responses and may be sent back by clients
+    # in subsequent requests, so we accept it but don't require it
+    index: int | None = None
     function: FunctionCall
 
 

@@ -92,7 +92,22 @@ class MistralToolParser(ToolParser):
             )
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
-        request = super().adjust_request(request)
+        # NOTE: We intentionally do NOT call super().adjust_request(request) here.
+        # The base class sets up structured output (JSON schema grammar) for tool
+        # calling when tool_choice is "required" or a named function. However,
+        # Mistral models use their own [TOOL_CALLS] token format for tool calling
+        # and do NOT use structured output/grammar-guided generation.
+        #
+        # Calling super() would set request.structured_outputs.json which triggers
+        # xgrammar/structured output initialization. This causes an engine crash
+        # (AssertionError: struct_output_request.grammar is not None) because:
+        # 1. The grammar is created for JSON schema output format
+        # 2. But Mistral outputs in [TOOL_CALLS]fn_name{args} format
+        # 3. The grammar never properly initializes/matches, leading to None grammar
+        #
+        # By skipping the base class, we let Mistral handle tool calls natively
+        # through its tokenizer and the extract_tool_calls/streaming methods.
+        
         if (
             not isinstance(self.model_tokenizer, MistralTokenizer)
             and request.tools
@@ -183,6 +198,68 @@ class MistralToolParser(ToolParser):
                 tools_called=False, tool_calls=[], content=tool_content
             )
 
+    def _parse_fn_name_format_streaming(
+        self, parsable_arr: str
+    ) -> list[dict] | None:
+        """
+        Parse tool calls in the fn_name{args} format used by newer Mistral
+        models (version >= 11). Returns a list of dicts with 'name' and
+        'arguments' keys, or None if no valid tool calls found yet.
+
+        Example input: 'get_weather{"location": "Paris", "unit": "c"}'
+        Example output: [{"name": "get_weather", "arguments": {"location": "Paris", "unit": "c"}}]
+        """
+        if not self.fn_name_regex:
+            return None
+
+        # For streaming, we need a more lenient regex that can match
+        # partial JSON. First try the strict regex for complete matches.
+        matches = self.fn_name_regex.findall(parsable_arr)
+        if matches:
+            result = []
+            for match in matches:
+                fn_name = match[0]
+                args_str = match[1]
+                try:
+                    args = json.loads(args_str)
+                    result.append({"name": fn_name, "arguments": args})
+                except json.JSONDecodeError:
+                    # Args not complete yet, try partial parsing
+                    try:
+                        args = partial_json_parser.loads(args_str, Allow.ALL)
+                        result.append({"name": fn_name, "arguments": args})
+                    except Exception:
+                        # If we have a name but can't parse args yet,
+                        # return with empty arguments
+                        result.append({"name": fn_name, "arguments": {}})
+            return result if result else None
+
+        # Try to match just the function name with partial/incomplete JSON
+        # Pattern: function_name followed by { and possibly incomplete JSON
+        partial_fn_regex = re.compile(r"([a-zA-Z0-9_-]+)(\{.*)", re.DOTALL)
+        partial_match = partial_fn_regex.match(parsable_arr.strip())
+        if partial_match:
+            fn_name = partial_match.group(1)
+            args_str = partial_match.group(2)
+            try:
+                # Try to parse with partial JSON parser
+                args = partial_json_parser.loads(args_str, Allow.ALL)
+                return [{"name": fn_name, "arguments": args}]
+            except Exception:
+                # We have the function name but args aren't parseable yet
+                # Return with just the name so we can stream it
+                return [{"name": fn_name, "arguments": {}}]
+
+        # Check if we just have a function name starting (no { yet)
+        name_only_regex = re.compile(r"^([a-zA-Z0-9_-]+)$")
+        name_match = name_only_regex.match(parsable_arr.strip())
+        if name_match:
+            # We might be in the middle of receiving the function name
+            # Don't return anything yet until we see the {
+            return None
+
+        return None
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -219,14 +296,37 @@ class MistralToolParser(ToolParser):
             # quotes instead of double for tool calls
             parsable_arr = current_text.split(self.bot_token)[-1]
 
-            # tool calls are generated in an array, so do partial JSON
-            # parsing on the entire array
-            try:
-                tool_call_arr: list[dict] = partial_json_parser.loads(
-                    parsable_arr, flags
-                )
-            except partial_json_parser.core.exceptions.MalformedJSON:
-                logger.debug("not enough tokens to parse into JSON yet")
+            # If there is nothing after the BOT token yet, we don't have
+            # any JSON to parse. Calling the partial JSON parser on an empty
+            # string can raise a JSONDecodeError, so just wait for more
+            # tokens instead.
+            if not parsable_arr.strip():
+                logger.debug("no tool-call payload after BOT token yet")
+                return None
+
+            # First, try to parse using fn_name{args} format for newer models
+            tool_call_arr: list[dict] | None = None
+            if self.fn_name_regex:
+                tool_call_arr = self._parse_fn_name_format_streaming(parsable_arr)
+
+            # If fn_name format didn't work, try the legacy JSON array format
+            if tool_call_arr is None:
+                # tool calls are generated in an array, so do partial JSON
+                # parsing on the entire array
+                try:
+                    tool_call_arr = partial_json_parser.loads(parsable_arr, flags)
+                except partial_json_parser.core.exceptions.MalformedJSON:
+                    logger.debug("not enough tokens to parse into JSON yet")
+                    return None
+                except json.JSONDecodeError:
+                    # partial_json_parser may delegate to the stdlib JSON parser;
+                    # if it fails here we also just wait for more tokens.
+                    logger.debug("JSON decode error while parsing partial tool call")
+                    return None
+
+            # Ensure tool_call_arr is a list
+            if not isinstance(tool_call_arr, list):
+                logger.debug("tool_call_arr is not a list, waiting for more tokens")
                 return None
 
             # select as the current tool call the one we're on the state at
@@ -321,30 +421,38 @@ class MistralToolParser(ToolParser):
                     )
                     delta = None
                 elif cur_arguments and not prev_arguments:
-                    cur_arguments_json = json.dumps(cur_arguments, ensure_ascii=False)[
-                        :-2
-                    ]
-                    logger.debug("finding %s in %s", new_text, cur_arguments_json)
+                    cur_arguments_json = json.dumps(cur_arguments, ensure_ascii=False)
+                    # Handle case where arguments is empty dict {}
+                    if cur_arguments_json == "{}":
+                        delta = None
+                    else:
+                        logger.debug("finding %s in %s", new_text, cur_arguments_json)
 
-                    if new_text not in cur_arguments_json:
-                        return None
-                    arguments_delta = cur_arguments_json[
-                        : cur_arguments_json.rindex(new_text) + len(new_text)
-                    ]
-                    logger.debug(
-                        "First tokens in arguments received: %s", arguments_delta
-                    )
-                    delta = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(
-                                    arguments=arguments_delta
-                                ).model_dump(exclude_none=True),
+                        if new_text and new_text not in cur_arguments_json:
+                            # Just send what we have so far
+                            arguments_delta = cur_arguments_json
+                        else:
+                            arguments_delta = cur_arguments_json[
+                                : cur_arguments_json.rindex(new_text) + len(new_text)
+                            ] if new_text else cur_arguments_json
+                        logger.debug(
+                            "First tokens in arguments received: %s", arguments_delta
+                        )
+                        # Only send a delta if there's actually new content
+                        if arguments_delta:
+                            delta = DeltaMessage(
+                                tool_calls=[
+                                    DeltaToolCall(
+                                        index=self.current_tool_id,
+                                        function=DeltaFunctionCall(
+                                            arguments=arguments_delta
+                                        ).model_dump(exclude_none=True),
+                                    )
+                                ]
                             )
-                        ]
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
+                            self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
+                        else:
+                            delta = None
 
                 elif cur_arguments and prev_arguments:
                     cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
@@ -359,17 +467,21 @@ class MistralToolParser(ToolParser):
                         cur_args_json, prev_args_json
                     )
                     logger.debug("got arguments diff: %s", argument_diff)
-                    delta = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(
-                                    arguments=argument_diff
-                                ).model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+                    # Only send a delta if there's actually new content
+                    if argument_diff:
+                        delta = DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_id,
+                                    function=DeltaFunctionCall(
+                                        arguments=argument_diff
+                                    ).model_dump(exclude_none=True),
+                                )
+                            ]
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+                    else:
+                        delta = None
                 else:
                     # try parsing it with regular JSON - if it works we're
                     # at the end, and we need to send the difference between
