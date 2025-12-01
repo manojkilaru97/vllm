@@ -1633,6 +1633,36 @@ def apply_hf_chat_template(
         raise ValueError(str(e)) from e
 
 
+def _strip_tool_call_index_from_messages(
+    messages: list[ChatCompletionMessageParam],
+) -> list[ChatCompletionMessageParam]:
+    """Remove the `index` field from tool calls before passing to mistral_common.
+
+    Newer OpenAI-compatible clients include an `index` integer on each
+    tool call in the assistant message history. The upstream
+    `mistral_common.protocol.instruct.tool_calls.ToolCall` schema does
+    not yet accept this field, which causes a ValidationError when
+    `tokenizer.apply_chat_template` calls `ToolCall.from_openai`.
+
+    To keep compatibility while we wait for upstream support, we drop
+    the `index` field from any assistant message tool_calls before
+    invoking the mistral chat template.
+    """
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+
+        for tool_call in tool_calls:
+            if isinstance(tool_call, dict):
+                tool_call.pop("index", None)
+
+    return messages
+
+
 def apply_mistral_chat_template(
     tokenizer: MistralTokenizer,
     messages: list[ChatCompletionMessageParam],
@@ -1649,9 +1679,11 @@ def apply_mistral_chat_template(
         **kwargs,
     )
 
+    sanitized_messages = _strip_tool_call_index_from_messages(messages)
+
     try:
         return tokenizer.apply_chat_template(
-            messages=messages,
+            messages=sanitized_messages,
             tools=tools,
             **kwargs,
         )
