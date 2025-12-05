@@ -93,6 +93,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
         Handles streaming output where previous + delta = current.
         Uses token IDs for faster processing.
         """
+        # If the template explicitly disabled thinking, bypass reasoning
+        # extraction entirely and treat the whole output as content.
+        ct_kwargs = getattr(self, "chat_template_kwargs", None)
+        if isinstance(ct_kwargs, dict) and ct_kwargs.get("enable_thinking") is False:
+            return DeltaMessage(content=delta_text) if delta_text else None
+
         # Skip single special tokens
         if len(delta_token_ids) == 1 and (
             delta_token_ids[0] in [self.start_token_id, self.end_token_id]
