@@ -57,6 +57,14 @@ class ToolParser:
         """
         if not request.tools:
             return request
+
+        # Optional escape hatch: allow disabling structured-outputs-based tool
+        # constraints via environment variable. This is useful for models or
+        # deployments where the structured outputs pipeline is not configured
+        # correctly, but tool calling via plain text/XML still works.
+        if os.getenv("VLLM_DISABLE_TOOL_STRUCTURED_OUTPUTS", "0") == "1":
+            return request
+
         json_schema_from_tool = get_json_schema_from_tools(
             tool_choice=request.tool_choice, tools=request.tools
         )

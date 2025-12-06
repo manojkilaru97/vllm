@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 T = TypeVar("T")
+logger = None
 
 
 class MinPLogitsProcessor(LogitsProcessor):
@@ -111,6 +112,113 @@ class MinPLogitsProcessor(LogitsProcessor):
         invalid_token_mask = probability_values < adjusted_min_p
         # Apply mask using boolean indexing
         logits.masked_fill_(invalid_token_mask, -float("inf"))
+        return logits
+
+
+class ReasoningBudgetLogitsProcessor(LogitsProcessor):
+    """Force </think> token when generated tokens exceed reasoning_budget.
+    
+    When reasoning_budget is provided (and != -1) in chat_template_kwargs,
+    this processor will force the model to output the </think> token once
+    the number of generated tokens reaches the budget, ending the thinking phase.
+    
+    The </think> token ID should be passed as think_end_token_id in 
+    chat_template_kwargs. If not provided, budget enforcement is skipped.
+    """
+
+    def __init__(
+        self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
+    ):
+        from vllm.logger import init_logger
+        self.logger = init_logger(__name__)
+        
+        # Track state per batch slot
+        self.budgets: dict[int, int] = {}  # index -> budget
+        self.think_end_ids: dict[int, int] = {}  # index -> </think> token id
+        self.output_token_refs: dict[int, list[int]] = {}  # index -> output tokens ref
+        self.forced_done: set[int] = set()  # indices where we already forced </think>
+
+    def is_argmax_invariant(self) -> bool:
+        # Forcing a specific token changes argmax
+        return False
+
+    def _clear(self, index: int):
+        self.budgets.pop(index, None)
+        self.think_end_ids.pop(index, None)
+        self.output_token_refs.pop(index, None)
+        self.forced_done.discard(index)
+
+    def _move(self, src: int, dst: int):
+        for store in (self.budgets, self.think_end_ids, self.output_token_refs):
+            if src in store:
+                store[dst] = store.pop(src)
+        if src in self.forced_done:
+            self.forced_done.discard(src)
+            self.forced_done.add(dst)
+
+    def update_state(self, batch_update: BatchUpdate | None):
+        if not batch_update:
+            return
+
+        for index in batch_update.removed:
+            self._clear(index)
+
+        for index, params, _, output_tok_ids in batch_update.added:
+            extra = params.extra_args if isinstance(params.extra_args, dict) else {}
+            budget = extra.get("reasoning_budget")
+            think_end_id = extra.get("think_end_token_id")
+            
+            # Skip if no budget, budget is -1 (unlimited), or no think_end_token_id
+            if budget is None or budget == -1 or think_end_id is None:
+                self._clear(index)
+                continue
+
+            self.budgets[index] = int(budget)
+            self.think_end_ids[index] = int(think_end_id)
+            self.output_token_refs[index] = output_tok_ids
+            self.logger.debug(
+                "ReasoningBudget: req %d budget=%d think_end_id=%d",
+                index, budget, think_end_id
+            )
+
+        for a_index, b_index, direct in batch_update.moved:
+            self._move(a_index, b_index)
+            if direct == MoveDirectionality.SWAP:
+                self._move(b_index, a_index)
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self.budgets:
+            return logits
+
+        for req_idx, budget in list(self.budgets.items()):
+            if req_idx >= logits.shape[0]:
+                continue
+            # Skip if we already forced </think> for this request
+            if req_idx in self.forced_done:
+                continue
+                
+            output_tokens = self.output_token_refs.get(req_idx)
+            think_end_id = self.think_end_ids.get(req_idx)
+            if output_tokens is None or think_end_id is None:
+                continue
+
+            num_tokens = len(output_tokens)
+            
+            # Check if </think> was already generated (either naturally or by us)
+            if output_tokens and output_tokens[-1] == think_end_id:
+                self.forced_done.add(req_idx)
+                continue
+            
+            if num_tokens >= budget:
+                # Force </think> token by setting all logits to -inf except </think>
+                self.logger.debug(
+                    "ReasoningBudget: forcing </think> (id=%d) at token %d (budget=%d)",
+                    think_end_id, num_tokens, budget
+                )
+                logits[req_idx].fill_(float("-inf"))
+                logits[req_idx][think_end_id] = 0.0
+                # Mark as done so we don't keep forcing
+                self.forced_done.add(req_idx)
         return logits
 
 

@@ -234,6 +234,18 @@ class StructuredOutputManager:
                     assert structured_output_request.grammar is not None
                 grammar = structured_output_request.grammar
 
+                # Skip if grammar is not ready yet (defensive guard)
+                if (
+                    structured_output_request is None
+                    or structured_output_request.grammar is None
+                ):
+                    logger.warning(
+                        "Skipping request %s: grammar not ready for bitmask fill",
+                        req_id,
+                    )
+                    cumulative_index += 1
+                    continue
+
                 apply_bitmask = self.should_fill_bitmask(request)
                 batch.append((grammar, cumulative_index, apply_bitmask))
                 if len(batch) == self.fill_bitmask_parallel_batch_size:
@@ -256,6 +268,20 @@ class StructuredOutputManager:
                 if TYPE_CHECKING:
                     assert structured_output_request is not None
                     assert structured_output_request.grammar is not None
+                # Skip if grammar is not ready yet (defensive guard)
+                if (
+                    structured_output_request is None
+                    or structured_output_request.grammar is None
+                ):
+                    logger.warning(
+                        "Skipping request %s: grammar not ready for bitmask fill",
+                        req_id,
+                    )
+                    cumulative_index += 1 + len(
+                        scheduled_spec_decode_tokens.get(req_id, [])
+                    )
+                    continue
+
                 grammar = structured_output_request.grammar
                 apply_bitmask = self.should_fill_bitmask(request)
 
@@ -308,6 +334,12 @@ class StructuredOutputManager:
         if TYPE_CHECKING:
             assert request.structured_output_request is not None
             assert request.structured_output_request.grammar is not None
+
+        # Guard against missing structured output request or grammar
+        structured_req = request.structured_output_request
+        if structured_req is None or structured_req.grammar is None:
+            return False
+
         # by default, we should always advance
         # for cases that don't use thinking mode.
         if self.reasoner is None:
@@ -317,7 +349,6 @@ class StructuredOutputManager:
         if self.enable_in_reasoning:
             return True
 
-        structured_req = request.structured_output_request
         if structured_req.reasoning_ended:
             return True
 
