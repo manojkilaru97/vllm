@@ -34,6 +34,19 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
     ) -> DeltaMessage | None:
+        # If thinking is explicitly disabled, let the base class handle it
+        # (returns all output as content) without further processing.
+        ct_kwargs = getattr(self, "chat_template_kwargs", None)
+        if isinstance(ct_kwargs, dict) and ct_kwargs.get("enable_thinking") is False:
+            return super().extract_reasoning_streaming(
+                previous_text,
+                current_text,
+                delta_text,
+                previous_token_ids,
+                current_token_ids,
+                delta_token_ids,
+            )
+
         ret = super().extract_reasoning_streaming(
             previous_text,
             current_text,
