@@ -44,6 +44,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
         raise NotImplementedError
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
+        # Capture chat template kwargs (if any) so parsers can inspect switches
+        # like `enable_thinking` that are passed via `chat_template_kwargs`.
+        self.chat_template_kwargs = kwargs.get("chat_template_kwargs")
         super().__init__(tokenizer, *args, **kwargs)
 
         if not self.model_tokenizer:
@@ -90,6 +93,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
         Handles streaming output where previous + delta = current.
         Uses token IDs for faster processing.
         """
+        # If the template explicitly disabled thinking, bypass reasoning
+        # extraction entirely and treat the whole output as content.
+        ct_kwargs = getattr(self, "chat_template_kwargs", None)
+        if isinstance(ct_kwargs, dict) and ct_kwargs.get("enable_thinking") is False:
+            return DeltaMessage(content=delta_text) if delta_text else None
+
         # Skip single special tokens
         if len(delta_token_ids) == 1 and (
             delta_token_ids[0] in [self.start_token_id, self.end_token_id]
@@ -140,17 +149,23 @@ class BaseThinkingReasoningParser(ReasoningParser):
     ) -> tuple[str | None, str | None]:
         """
         Extract reasoning content from the model output.
-
+    
         This is the base implementation that works for most models.
         Subclasses can override this method for specific behavior.
         """
+        # If the template explicitly disabled thinking, bypass reasoning
+        # extraction entirely and treat the whole output as content.
+        ct_kwargs = getattr(self, "chat_template_kwargs", None)
+        if isinstance(ct_kwargs, dict) and ct_kwargs.get("enable_thinking") is False:
+            return None, model_output
+    
         # Check if the start token is present in the model output, remove it
         # if it is present.
         model_output_parts = model_output.partition(self.start_token)
         model_output = (
             model_output_parts[2] if model_output_parts[1] else model_output_parts[0]
         )
-
+    
         # For models that may not generate start token,
         # assume the reasoning content is always at the start.
         if self.end_token not in model_output:

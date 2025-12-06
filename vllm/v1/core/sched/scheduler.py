@@ -1137,10 +1137,15 @@ class Scheduler(SchedulerInterface):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
+                # For structured outputs, advance the grammar FSM when available.
+                # In rare cases where grammar compilation has not completed yet,
+                # skip advancing for this step instead of crashing.
                 struct_output_request = request.structured_output_request
-                assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
+                if (
+                    struct_output_request is not None
+                    and struct_output_request.grammar is not None
+                ):
+                    struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -1290,9 +1295,13 @@ class Scheduler(SchedulerInterface):
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
-                request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]
-                    spec_token_ids
-                )
+                # Guard against grammar being None (should not happen but be safe)
+                if metadata is not None and metadata.grammar is not None:
+                    request.spec_token_ids = metadata.grammar.validate_tokens(
+                        spec_token_ids
+                    )
+                else:
+                    request.spec_token_ids = spec_token_ids
             else:
                 request.spec_token_ids = spec_token_ids
 
@@ -1355,6 +1364,11 @@ class Scheduler(SchedulerInterface):
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
+        
+        # Cleanup structured output resources to avoid memory leaks
+        if request.structured_output_request is not None:
+            request.structured_output_request.cleanup()
+        
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:

@@ -799,6 +799,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        # Pass reasoning_budget and think_end_token_id from chat_template_kwargs
+        if self.chat_template_kwargs:
+            rb = self.chat_template_kwargs.get("reasoning_budget")
+            if rb is not None and rb != -1:
+                extra_args["reasoning_budget"] = rb
+            tei = self.chat_template_kwargs.get("think_end_token_id")
+            if tei is not None:
+                extra_args["think_end_token_id"] = tei
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
