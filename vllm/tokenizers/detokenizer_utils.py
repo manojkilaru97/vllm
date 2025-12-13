@@ -187,12 +187,19 @@ def detokenize_incrementally(
             spaces_between_special_tokens=spaces_between_special_tokens,
         )
 
-    if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
-        # utf-8 char at the end means it's a potential unfinished byte sequence
-        # from byte fallback tokenization.
-        # If it's in the middle, it's probably a real invalid id generated
-        # by the model
+    if len(new_text) <= len(prefix_text):
         return new_tokens, "", prefix_offset, read_offset
 
-    new_text = new_text[len(prefix_text) :]
-    return new_tokens, new_text, read_offset, len(output_tokens)
+    delta_text = new_text[len(prefix_text) :]
+
+    # NOTE: In streaming, byte-fallback tokenization can split a multi-byte
+    # UTF-8 codepoint across tokens. When this happens, some tokenizers may
+    # temporarily emit the Unicode replacement character (U+FFFD, "�") in the
+    # decoded *delta* even though the overall byte sequence becomes valid once
+    # more tokens arrive. To avoid streaming corrupted text like "�️�️", we
+    # hold back any delta that contains a replacement character and retry on
+    # the next token.
+    if "�" in delta_text:
+        return new_tokens, "", prefix_offset, read_offset
+
+    return new_tokens, delta_text, read_offset, len(output_tokens)

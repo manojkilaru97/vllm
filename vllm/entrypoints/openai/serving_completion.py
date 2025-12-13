@@ -381,7 +381,6 @@ class OpenAIServingCompletion(OpenAIServing):
                     # with the echo implementation.
                     prompt_token_ids_to_return: list[int] | None = None
 
-                    assert request.max_tokens is not None
                     if request.echo and not has_echoed[i]:
                         assert prompt_token_ids is not None
                         if request.return_token_ids:
@@ -442,8 +441,6 @@ class OpenAIServingCompletion(OpenAIServing):
                     previous_num_tokens[i] += len(output.token_ids)
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason
-
-                    self._raise_if_error(finish_reason, request_id)
 
                     chunk = CompletionStreamResponse(
                         id=request_id,
@@ -540,9 +537,6 @@ class OpenAIServingCompletion(OpenAIServing):
             out_logprobs: GenericSequence[dict[int, Logprob] | None] | None
 
             for output in final_res.outputs:
-                self._raise_if_error(output.finish_reason, request_id)
-
-                assert request.max_tokens is not None
                 if request.echo:
                     if request.return_token_ids:
                         prompt_text = ""
