@@ -51,7 +51,10 @@ BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
     MinTokensLogitsProcessor,
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
-    # ReasoningBudgetLogitsProcessor,  # Disabled: forcing </think> doesn't change model's internal state
+    # Enforce a reasoning budget for thinking-style models (e.g. DeepSeek/Qwen3).
+    # Configuration is driven via `chat_template_kwargs` and wired through
+    # `SamplingParams.extra_args` (see `ReasoningBudgetLogitsProcessor` docs).
+    ReasoningBudgetLogitsProcessor,
 ]
 
 

@@ -799,14 +799,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        # Pass reasoning_budget and think_end_token_id from chat_template_kwargs
+        # Wire reasoning-related knobs from chat_template_kwargs into extra_args
+        # so the ReasoningBudgetLogitsProcessor can consume them.
         if self.chat_template_kwargs:
             rb = self.chat_template_kwargs.get("reasoning_budget")
             if rb is not None and rb != -1:
                 extra_args["reasoning_budget"] = rb
-            tei = self.chat_template_kwargs.get("think_end_token_id")
-            if tei is not None:
-                extra_args["think_end_token_id"] = tei
+
+            # Optional grace period: how many extra tokens beyond the budget
+            # we allow before forcing the end-of-think sequence.
+            rb_grace = self.chat_template_kwargs.get("reasoning_budget_grace_period")
+            if rb_grace is not None:
+                extra_args["reasoning_budget_grace_period"] = rb_grace
+
+            # Pass along explicit enable_thinking if provided so that both the
+            # reasoning parser and logits processor can honor enable_thinking=False.
+            enable_thinking = self.chat_template_kwargs.get("enable_thinking")
+            if enable_thinking is not None:
+                extra_args["enable_thinking"] = enable_thinking
+
+            # think_end_token_id / end_token_ids are injected later in
+            # OpenAIServingChat._inject_think_end_token_id once we have a tokenizer.
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

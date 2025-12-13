@@ -995,14 +995,25 @@ class OpenAIServing:
                 "the input messages."
             )
 
+        # If the requested max_tokens would overflow the model context,
+        # clamp it to the maximum allowed instead of returning a 400 error.
         if max_tokens is not None and token_num + max_tokens > self.max_model_len:
-            raise ValueError(
-                "'max_tokens' or 'max_completion_tokens' is too large: "
-                f"{max_tokens}. This model's maximum context length is "
-                f"{self.max_model_len} tokens and your request has "
-                f"{token_num} input tokens ({max_tokens} > {self.max_model_len}"
-                f" - {token_num})."
-            )
+            allowed_max_tokens = self.max_model_len - token_num
+            # Sanity floor: if something is off, still allow at least 1 token.
+            if allowed_max_tokens <= 0:
+                allowed_max_tokens = 1
+
+            if isinstance(request, ChatCompletionRequest):
+                # Prefer to clamp the field the caller actually set.
+                if request.max_completion_tokens is not None:
+                    request.max_completion_tokens = allowed_max_tokens
+                elif request.max_tokens is not None:
+                    request.max_tokens = allowed_max_tokens
+            else:
+                if hasattr(request, "max_tokens"):
+                    request.max_tokens = allowed_max_tokens
+
+            max_tokens = allowed_max_tokens
 
         return TextTokensPrompt(prompt=input_text, prompt_token_ids=input_ids)
 
@@ -1377,18 +1388,32 @@ class OpenAIServing:
         function_calls = list[FunctionCall]()
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
-            # Forced Function Call
+            # Forced Function Call - normalize arguments JSON
+            try:
+                normalized_args = json.dumps(
+                    json.loads(content), ensure_ascii=False
+                )
+            except (json.JSONDecodeError, TypeError):
+                normalized_args = content  # Fall back to raw if parsing fails
             function_calls.append(
-                FunctionCall(name=request.tool_choice.name, arguments=content)
+                FunctionCall(name=request.tool_choice.name, arguments=normalized_args)
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice and isinstance(
             request.tool_choice, ChatCompletionNamedToolChoiceParam
         ):
             assert content is not None
-            # Forced Function Call
+            # Forced Function Call - normalize arguments JSON
+            try:
+                normalized_args = json.dumps(
+                    json.loads(content), ensure_ascii=False
+                )
+            except (json.JSONDecodeError, TypeError):
+                normalized_args = content  # Fall back to raw if parsing fails
             function_calls.append(
-                FunctionCall(name=request.tool_choice.function.name, arguments=content)
+                FunctionCall(
+                    name=request.tool_choice.function.name, arguments=normalized_args
+                )
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice == "required":
