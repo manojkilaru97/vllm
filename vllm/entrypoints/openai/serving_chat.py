@@ -327,21 +327,16 @@ class OpenAIServingChat(OpenAIServing):
             # Log request payload BEFORE any chat template is applied
             if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
                 # Collect all incoming headers unfiltered
-                headers_json = ""
+                headers_obj = None
                 try:
                     if raw_request is not None:
-                        headers_to_log = {k: v for k, v in raw_request.headers.items()}
-                        headers_json = json.dumps(headers_to_log, ensure_ascii=False)
+                        headers_obj = {k: v for k, v in raw_request.headers.items()}
                 except Exception:
-                    headers_json = ""
+                    headers_obj = None
                 try:
                     req_dump = request.model_dump()
                 except Exception:
                     req_dump = None
-                try:
-                    req_str = json.dumps(req_dump, ensure_ascii=False) if req_dump is not None else ""
-                except Exception:
-                    req_str = ""
                 rid_hint = self._base_request_id(raw_request, getattr(request, "request_id", None))
                 try:
                     payload_logger.info(
@@ -349,8 +344,9 @@ class OpenAIServingChat(OpenAIServing):
                         extra={
                             "rid": rid_hint or "",
                             "endpoint": self.__class__.__name__,
-                            "payload": req_str,
-                            "headers": headers_json,
+                            # Pass dict directly for proper OTEL structured logging
+                            "payload": req_dump,
+                            "headers": headers_obj,
                         },
                     )
                 except Exception:
@@ -1494,26 +1490,58 @@ class OpenAIServingChat(OpenAIServing):
                     )
                 except Exception:
                     usage_dict = None
+                # Build choices with actual content, reasoning, and tool_calls
+                choices_list = []
+                for i in range(num_choices):
+                    choice_data = {
+                        "index": i,
+                        "message": {
+                            "role": "assistant",
+                        },
+                        "finish_reason": "stop",
+                    }
+                    # Add reasoning if present
+                    if previous_reasoning_texts[i]:
+                        choice_data["message"]["reasoning_content"] = previous_reasoning_texts[i]
+                    # Add content if present
+                    if previous_content_texts[i]:
+                        choice_data["message"]["content"] = previous_content_texts[i]
+                    else:
+                        choice_data["message"]["content"] = None
+                    # Add tool_calls if present
+                    if previous_tool_calls[i]:
+                        tool_calls_list = []
+                        for tc in previous_tool_calls[i]:
+                            if tc.function and tc.function.name:
+                                tool_calls_list.append({
+                                    "id": tc.id,
+                                    "type": tc.type or "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments or "",
+                                    },
+                                })
+                        if tool_calls_list:
+                            choice_data["message"]["tool_calls"] = tool_calls_list
+                            choice_data["finish_reason"] = "tool_calls"
+                    choices_list.append(choice_data)
                 resp_summary = {
-                    "id": rid_hint,
+                    "id": request_id,
                     "object": "chat.completion",
                     "created": created_time,
                     "model": model_name,
-                    "choices": [],
+                    "choices": choices_list,
                     "usage": usage_dict,
                     "stream": True,
                 }
-                try:
-                    payload_str = json.dumps(resp_summary, ensure_ascii=False)
-                except Exception:
-                    payload_str = ""
                 try:
                     payload_logger.info(
                         "openai.response",
                         extra={
                             "rid": rid_hint,
                             "endpoint": self.__class__.__name__,
-                            "payload": payload_str,
+                            # Pass dict directly for proper OTEL structured logging
+                            "payload": resp_summary,
                         },
                     )
                 except Exception:
@@ -1918,26 +1946,54 @@ class OpenAIServingChat(OpenAIServing):
                 usage_dict = usage.model_dump() if usage else None
             except Exception:
                 usage_dict = None
+            # Build choices with actual content, reasoning, and tool_calls
+            choices_list = []
+            for choice in choices:
+                choice_data = {
+                    "index": choice.index,
+                    "message": {
+                        "role": choice.message.role if hasattr(choice.message, 'role') else "assistant",
+                    },
+                    "finish_reason": choice.finish_reason,
+                }
+                # Add reasoning if present
+                if hasattr(choice.message, 'reasoning') and choice.message.reasoning:
+                    choice_data["message"]["reasoning_content"] = choice.message.reasoning
+                # Add content
+                choice_data["message"]["content"] = choice.message.content
+                # Add tool_calls if present
+                if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
+                    tool_calls_list = []
+                    for tc in choice.message.tool_calls:
+                        tc_dict = {
+                            "id": tc.id if hasattr(tc, 'id') else None,
+                            "type": tc.type if hasattr(tc, 'type') else "function",
+                            "function": {
+                                "name": tc.function.name if hasattr(tc.function, 'name') else None,
+                                "arguments": tc.function.arguments if hasattr(tc.function, 'arguments') else "",
+                            },
+                        }
+                        tool_calls_list.append(tc_dict)
+                    if tool_calls_list:
+                        choice_data["message"]["tool_calls"] = tool_calls_list
+                choices_list.append(choice_data)
             resp_summary = {
-                "id": rid_hint,
+                "id": request_id,
                 "object": "chat.completion",
                 "created": created_time,
                 "model": model_name,
-                "choices": [],
+                "choices": choices_list,
                 "usage": usage_dict,
                 "stream": False,
             }
-            try:
-                payload_str = json.dumps(resp_summary, ensure_ascii=False)
-            except Exception:
-                payload_str = ""
             try:
                 payload_logger.info(
                     "openai.response",
                     extra={
                         "rid": rid_hint,
                         "endpoint": self.__class__.__name__,
-                        "payload": payload_str,
+                        # Pass dict directly for proper OTEL structured logging
+                        "payload": resp_summary,
                     },
                 )
             except Exception:
