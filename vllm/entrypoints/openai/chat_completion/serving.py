@@ -237,6 +237,14 @@ class OpenAIServingChat(OpenAIServing):
                     )
                 except Exception:
                     pass
+            # For gpt-oss (harmony) models, special tokens are part of the
+            # protocol framing. If the caller did not explicitly set
+            # `skip_special_tokens`, preserve them by default.
+            if (
+                self.use_harmony
+                and "skip_special_tokens" not in request.model_fields_set
+            ):
+                request.skip_special_tokens = False
             return await self.openai_serving_render.render_chat(request)
         except RuntimeError as e:
             logger.exception("Error in preprocessing prompt inputs")
