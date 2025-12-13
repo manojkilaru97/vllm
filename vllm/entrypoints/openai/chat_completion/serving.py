@@ -226,6 +226,49 @@ class OpenAIServingChat(OpenAIServing):
         except Exception:
             # Log but don't fail server startup if warmup fails
             logger.exception("Chat template warmup failed")
+    def _compute_newline_token_ids(
+        self,
+        tokenizer: TokenizerLike,
+        strings: list[str] | None = None,
+    ) -> list[int]:
+        """Compute and cache model-specific newline token IDs for this tokenizer."""
+        cached = getattr(tokenizer, "_vllm_newline_token_ids", None)
+        if isinstance(cached, list):
+            return cached
+
+        if strings is None:
+            strings = ["\n", "\r\n", "\n\n"]
+
+        newline_ids: set[int] = set()
+
+        # Method 1: direct encoding of canonical newline strings.
+        for s in strings:
+            try:
+                enc = tokenizer.encode(s, add_special_tokens=False)
+            except TypeError:
+                enc = tokenizer.encode(s)  # type: ignore[call-arg]
+            except Exception:
+                continue
+            for tid in enc:
+                try:
+                    newline_ids.add(int(tid))
+                except Exception:
+                    continue
+
+        # Method 2: vocab scan for tokens whose decoded form ends with newline.
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if isinstance(vocab_size, int) and vocab_size > 0:
+            for tid in range(vocab_size):
+                try:
+                    tok_str = tokenizer.decode([tid])
+                except Exception:
+                    continue
+                if any(tok_str.endswith(s) for s in strings):
+                    newline_ids.add(int(tid))
+
+        ids_list = sorted(newline_ids)
+        setattr(tokenizer, "_vllm_newline_token_ids", ids_list)
+        return ids_list
 
     def _inject_think_end_token_id(
         self,
@@ -233,12 +276,7 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         tokenizer: TokenizerLike,
     ) -> None:
-        """Inject think_end_token_id into extra_args for reasoning budget enforcement.
-
-        If a reasoning_parser is configured and reasoning_budget is set (and != -1),
-        look up the </think> token ID from the tokenizer and add it to extra_args
-        so the ReasoningBudgetLogitsProcessor can force stop when budget is hit.
-        """
+        """Inject think_end_token_id / end_token_ids into extra_args for reasoning budget enforcement."""
         if not self.reasoning_parser:
             return
 
@@ -250,36 +288,50 @@ class OpenAIServingChat(OpenAIServing):
         if rb is None or rb == -1:
             return
 
-        # Get the end_token from the reasoning parser
-        # The parser defines end_token as a @property, so we need to instantiate it
+        # Get the end token id from the reasoning parser.
         try:
-            # Instantiate the parser to access the end_token property
-            temp_parser = self.reasoning_parser(tokenizer)
-            end_token = temp_parser.end_token
+            temp_parser = self.reasoning_parser(  # type: ignore[call-arg]
+                tokenizer,
+                chat_template_kwargs=ct_kwargs,
+            )
+            think_end_id = getattr(temp_parser, "end_token_id", None)
 
-            if not end_token:
-                logger.debug("Reasoning parser has no end_token defined")
-                return
-
-            # Look up the token ID in tokenizer vocabulary
-            vocab = getattr(tokenizer, "get_vocab", lambda: {})()
-            think_end_id = vocab.get(end_token)
+            # Fallback for parsers that only expose `end_token` string.
+            if think_end_id is None:
+                end_token = getattr(temp_parser, "end_token", None)
+                if isinstance(end_token, str) and end_token:
+                    vocab = getattr(tokenizer, "get_vocab", lambda: {})()
+                    think_end_id = vocab.get(end_token)
 
             if think_end_id is None:
                 logger.warning(
-                    "Could not find token ID for '%s' in tokenizer vocab", end_token
+                    "Reasoning parser did not provide a valid end_token_id; "
+                    "skipping reasoning budget enforcement."
                 )
                 return
-            
-            # Inject into extra_args (don't override if user already specified)
+
             if sampling_params.extra_args is None:
                 sampling_params.extra_args = {}
-            if "think_end_token_id" not in sampling_params.extra_args:
-                sampling_params.extra_args["think_end_token_id"] = think_end_id
-                logger.debug(
-                    "Injected think_end_token_id=%d for reasoning budget enforcement",
-                    think_end_id,
-                )
+
+            extra = sampling_params.extra_args
+            if "think_end_token_id" not in extra:
+                extra["think_end_token_id"] = int(think_end_id)
+
+            if "end_token_ids" not in extra:
+                extra["end_token_ids"] = [int(think_end_id)]
+
+            try:
+                newline_ids = self._compute_newline_token_ids(tokenizer)
+                if newline_ids and "newline_token_ids" not in extra:
+                    extra["newline_token_ids"] = newline_ids
+            except Exception as e:
+                logger.debug("Failed to compute newline_token_ids: %s", e)
+
+            logger.debug(
+                "Injected think_end_token_id=%d and newline_token_ids=%s for reasoning budget enforcement",
+                think_end_id,
+                extra.get("newline_token_ids"),
+            )
         except Exception as e:
             logger.warning("Failed to extract think_end_token_id: %s", e)
 
@@ -476,12 +528,12 @@ class OpenAIServingChat(OpenAIServing):
                         self.logits_processors,
                         sampling_params,
                     )
-                    # NOTE: Reasoning budget logits processor disabled - forcing </think>
-                    # doesn't change model's internal state, so it keeps generating
-                    # thinking-style text after the forced token.
-                    # self._inject_think_end_token_id(
-                    #     sampling_params, request, tokenizer
-                    # )
+                    # Enable reasoning-budget enforcement: once the budget is
+                    # reached, the ReasoningBudgetLogitsProcessor will guide the
+                    # model to emit the end-of-think sequence.
+                    self._inject_think_end_token_id(
+                        sampling_params, request, tokenizer
+                    )
 
                 self._log_inputs(
                     sub_request_id,
@@ -647,20 +699,37 @@ class OpenAIServingChat(OpenAIServing):
                 delta_message = None
             else:
                 if not function_name_returned:
-                    # get partly generated arguments from the latest tool call
-                    param_match = re.search(
-                        r'.*"parameters":\s*(.*)', current_text, re.DOTALL
-                    )
-                    arguments = param_match.group(1) if param_match else ""
-                    arguments, _ = OpenAIServingChat._filter_delta_text(
-                        arguments, previous_text
-                    )
-
-                    # if this iteration finishes a previous tool call but a
+                    # First time we have a complete tool call with parameters.
+                    # Use the parsed parameters object to build a normalized JSON
+                    # arguments string, instead of streaming the model's raw
+                    # pretty-printed JSON. This mirrors the behavior of the
+                    # auto tool parser (qwen3_coder).
+                    # If this iteration finishes a previous tool call but a
                     # new incomplete tool is already generated, take the
-                    # previous from the list
+                    # previous from the list.
                     if finishes_previous_tool and "parameters" not in current_tool_call:
                         current_tool_call = obj[-2]
+
+                    params = current_tool_call.get("parameters", {})
+                    # If parameters dict is still empty (partial JSON),
+                    # wait for more tokens before emitting anything.
+                    if not finishes_previous_tool and (
+                        not isinstance(params, dict) or not params
+                    ):
+                        function_name_returned = False
+                        return None, function_name_returned
+
+                    try:
+                        arguments = json.dumps(params, ensure_ascii=False)
+                    except Exception:
+                        # Fallback: best-effort slice from the current text.
+                        param_match = re.search(
+                            r'.*"parameters":\s*(.*)', current_text, re.DOTALL
+                        )
+                        arguments = param_match.group(1) if param_match else ""
+                        arguments, _ = OpenAIServingChat._filter_delta_text(
+                            arguments, previous_text
+                        )
 
                     function_name_returned = True
                     tool_call_id = make_tool_call_id(
@@ -682,26 +751,10 @@ class OpenAIServingChat(OpenAIServing):
                     )
 
                 else:
-                    delta_text, _ = OpenAIServingChat._filter_delta_text(
-                        delta_text, previous_text
-                    )
-
-                    if delta_text != "":
-                        delta_message = DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    function=DeltaFunctionCall(
-                                        # OpenAI API returns None
-                                        # instead of name every time
-                                        name=None,
-                                        arguments=delta_text,
-                                    ),
-                                    index=len(obj) - 1,
-                                )
-                            ]
-                        )
-                    else:
-                        delta_message = None
+                    # We've already emitted the full normalized arguments once.
+                    # Do not emit further deltas for arguments to avoid
+                    # duplication or malformed JSON on the client side.
+                    delta_message = None
 
         return delta_message, function_name_returned
 
@@ -1419,12 +1472,13 @@ class OpenAIServingChat(OpenAIServing):
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
-                        # finish_reason is:
-                        # "tool_calls" for "auto" or "required" tool calls,
-                        # and "stop" for named tool calls.
+                        # finish_reason is "tool_calls" regardless of whether
+                        # the tool was chosen explicitly or via "auto"/"required".
+                        # Match that behaviour by marking any streamed response
+                        # that actually included tool calls as "tool_calls".
                         if (
                             auto_tools_called
-                            or (tools_streamed[i] and not tool_choice_function_name)
+                            or tools_streamed[i]
                             or (self.use_harmony and harmony_tools_streamed[i])
                         ):
                             finish_reason_ = "tool_calls"
@@ -1871,10 +1925,14 @@ class OpenAIServingChat(OpenAIServing):
                     "completion."
                 )
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
-            # In OpenAI's API, when a tool is called, the finish_reason is:
-            # "tool_calls" for "auto" or "required" tool calls,
-            # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
+            # In OpenAI's API, when a tool is called, the finish_reason is
+            # "tool_calls" regardless of whether the tool was chosen explicitly
+            # or via "auto"/"required".  Match that behaviour by marking any
+            # response that actually includes tool calls as "tool_calls".
+            has_tool_calls = bool(
+                hasattr(message, "tool_calls") and message.tool_calls
+            )
+            is_finish_reason_tool_calls = has_tool_calls or auto_tools_called or (
                 request.tool_choice
                 and request.tool_choice == "required"
                 and output.finish_reason == "stop"
