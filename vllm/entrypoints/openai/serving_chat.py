@@ -194,6 +194,14 @@ class OpenAIServingChat(OpenAIServing):
 
             tokenizer = await self.engine_client.get_tokenizer()
 
+            # For gpt-oss (harmony) models, special tokens are part of the
+            # protocol framing. By default, OpenAI-compatible requests set
+            # `skip_special_tokens=True`, which can strip these markers from
+            # the streamed text. If the caller didn't explicitly set this
+            # field, default to keeping special tokens for harmony models.
+            if self.use_harmony and "skip_special_tokens" not in request.model_fields_set:
+                request.skip_special_tokens = False
+
             tool_parser = self.tool_parser
 
             if isinstance(tokenizer, MistralTokenizer):
