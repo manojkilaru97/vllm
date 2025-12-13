@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 
@@ -17,6 +17,14 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 logger = None
+
+
+#
+# NOTE: We intentionally no longer keep a giant static set of newline token
+# IDs here. Instead, newline IDs are discovered dynamically per tokenizer in
+# `OpenAIServingChat._inject_think_end_token_id` and passed via
+# `extra_args["newline_token_ids"]`. If none are provided, the reasoning
+# budget processor simply falls back to using the budget + grace criteria.
 
 
 class MinPLogitsProcessor(LogitsProcessor):
@@ -116,109 +124,205 @@ class MinPLogitsProcessor(LogitsProcessor):
 
 
 class ReasoningBudgetLogitsProcessor(LogitsProcessor):
-    """Force </think> token when generated tokens exceed reasoning_budget.
-    
-    When reasoning_budget is provided (and != -1) in chat_template_kwargs,
-    this processor will force the model to output the </think> token once
-    the number of generated tokens reaches the budget, ending the thinking phase.
-    
-    The </think> token ID should be passed as think_end_token_id in 
-    chat_template_kwargs. If not provided, budget enforcement is skipped.
+    """Enforce a reasoning budget by forcing the model to emit the end-of-think
+    token sequence once the budget is reached.
+
+    This reimplements the logic from the vLLM docs `ThinkingBudgetLogitsProcessor`
+    example, but it is wired to the existing configuration flow:
+
+    - Users configure reasoning via `chat_template_kwargs`, e.g.:
+        `{\"enable_thinking\": True, \"reasoning_budget\": 50}`
+    - `ChatCompletionRequest.to_sampling_params` copies these into
+      `SamplingParams.extra_args` as:
+        * `reasoning_budget` (int, required, != -1)
+        * `reasoning_budget_grace_period` (int, optional, default 0)
+        * `enable_thinking` (bool, optional)
+    - `_inject_think_end_token_id` adds:
+        * `think_end_token_id` (int, required)
+        * `end_token_ids` (list[int], optional; defaults to `[think_end_token_id]`)
+
+    For requests with a valid budget and end token ids, this processor:
+    - Waits until either:
+        * `len(output_tok_ids) >= reasoning_budget + reasoning_budget_grace_period`, or
+        * `len(output_tok_ids) >= reasoning_budget` and the last token is a newline.
+    - Then incrementally forces the `end_token_ids` sequence using a
+      suffix/prefix overlap heuristic so that naturally generated prefixes
+      of the end sequence are respected.
     """
 
     def __init__(
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
     ):
-        from vllm.logger import init_logger
-        self.logger = init_logger(__name__)
-        
-        # Track state per batch slot
-        self.budgets: dict[int, int] = {}  # index -> budget
-        self.think_end_ids: dict[int, int] = {}  # index -> </think> token id
-        self.output_token_refs: dict[int, list[int]] = {}  # index -> output tokens ref
-        self.forced_done: set[int] = set()  # indices where we already forced </think>
+        # Per-request state, keyed by batch index.
+        #
+        # Each value is a dict with keys:
+        #   - "output_tok_ids": list[int]  (reference to decoder output tokens)
+        #   - "thinking_budget": int
+        #   - "thinking_budget_grace_period": int
+        #   - "end_token_ids": list[int]
+        #   - "is_thinking": bool
+        #   - "start_of_end": bool
+        #   - "end_of_end": bool
+        self.logit_processor_state: dict[int, dict[Any, Any]] = {}
 
     def is_argmax_invariant(self) -> bool:
-        # Forcing a specific token changes argmax
+        # Forcing a specific token sequence changes argmax.
         return False
 
-    def _clear(self, index: int):
-        self.budgets.pop(index, None)
-        self.think_end_ids.pop(index, None)
-        self.output_token_refs.pop(index, None)
-        self.forced_done.discard(index)
+    @staticmethod
+    def _suffix_prefix_overlap(a: list[int], b: list[int]) -> int:
+        """Return length of the longest suffix of `a` that is a prefix of `b`."""
+        m = min(len(a), len(b))
+        for k in range(m, 0, -1):
+            if a[-k:] == b[:k]:
+                return k
+        return 0
 
-    def _move(self, src: int, dst: int):
-        for store in (self.budgets, self.think_end_ids, self.output_token_refs):
-            if src in store:
-                store[dst] = store.pop(src)
-        if src in self.forced_done:
-            self.forced_done.discard(src)
-            self.forced_done.add(dst)
+    def _maybe_end_thinking(
+        self, idx: int, logits: torch.Tensor, state: dict[Any, Any]
+    ) -> torch.Tensor:
+        # Once we've fully emitted the end sequence, we no longer intervene.
+        if state.get("end_of_end", False):
+            return logits
+
+        output_tok_ids: list[int] = state["output_tok_ids"]
+        budget: int = int(state["thinking_budget"])
+        grace: int = int(state.get("thinking_budget_grace_period", 0))
+
+        # Prefer request-specific newline tokens if provided.
+        req_newline_ids = state.get("newline_token_ids")
+        if isinstance(req_newline_ids, set):
+            newline_ids = req_newline_ids
+        elif isinstance(req_newline_ids, (list, tuple)):
+            newline_ids = set(int(t) for t in req_newline_ids)
+            state["newline_token_ids"] = newline_ids
+        else:
+            newline_ids = set()
+
+        # Decide when to start forcing the end sequence.
+        if (
+            len(output_tok_ids) >= budget + grace
+            and not state.get("start_of_end", False)
+        ):
+            state["start_of_end"] = True
+
+        if (
+            len(output_tok_ids) >= budget
+            and output_tok_ids
+            and output_tok_ids[-1] in newline_ids
+            and not state.get("start_of_end", False)
+        ):
+            state["start_of_end"] = True
+
+        if state.get("start_of_end", False) and not state.get("end_of_end", False):
+            end_token_ids: list[int] = state["end_token_ids"]
+            if not end_token_ids:
+                return logits
+
+            last_n_inputs = list(output_tok_ids[-len(end_token_ids) :])
+            overlap = self._suffix_prefix_overlap(last_n_inputs, end_token_ids)
+
+            if overlap < len(end_token_ids):
+                # We are still in the middle of emitting the end sequence.
+                # Mask out all tokens except the next required token.
+                logits[idx, :] = float("-inf")
+                insert_id = end_token_ids[overlap]
+                logits[idx, insert_id] = 0.0
+
+                # If this is the LAST token of the end sequence, mark as done
+                # immediately so we don't intervene on the next call.
+                if overlap + 1 == len(end_token_ids):
+                    state["end_of_end"] = True
+                    state["is_thinking"] = False  # Release control completely
+            else:
+                # Completed the entire end sequence (detected via overlap).
+                state["end_of_end"] = True
+                state["is_thinking"] = False  # Release control completely
+
+        return logits
 
     def update_state(self, batch_update: BatchUpdate | None):
         if not batch_update:
             return
 
+        # Remove finished requests.
         for index in batch_update.removed:
-            self._clear(index)
+            self.logit_processor_state.pop(index, None)
 
-        for index, params, _, output_tok_ids in batch_update.added:
+        # Handle moved requests (unidirectional and swap).
+        for a, b, direction in batch_update.moved:
+            a_val = self.logit_processor_state.pop(a, None)
+            b_val = self.logit_processor_state.pop(b, None)
+            if a_val is not None:
+                self.logit_processor_state[b] = a_val
+            if direction == MoveDirectionality.SWAP and b_val is not None:
+                self.logit_processor_state[a] = b_val
+
+        # Add / update requests.
+        for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
             extra = params.extra_args if isinstance(params.extra_args, dict) else {}
+
             budget = extra.get("reasoning_budget")
-            think_end_id = extra.get("think_end_token_id")
-            
-            # Skip if no budget, budget is -1 (unlimited), or no think_end_token_id
-            if budget is None or budget == -1 or think_end_id is None:
-                self._clear(index)
+            if budget is None or budget == -1:
+                # No budget configured -> nothing to enforce.
+                self.logit_processor_state.pop(index, None)
                 continue
 
-            self.budgets[index] = int(budget)
-            self.think_end_ids[index] = int(think_end_id)
-            self.output_token_refs[index] = output_tok_ids
-            self.logger.debug(
-                "ReasoningBudget: req %d budget=%d think_end_id=%d",
-                index, budget, think_end_id
-            )
+            # Optional grace period, default 0.
+            grace = extra.get("reasoning_budget_grace_period", 0) or 0
 
-        for a_index, b_index, direct in batch_update.moved:
-            self._move(a_index, b_index)
-            if direct == MoveDirectionality.SWAP:
-                self._move(b_index, a_index)
+            # End-of-think token sequence:
+            #  - Prefer a full sequence if provided (`end_token_ids`)
+            #  - Fallback to a single closing token (`think_end_token_id`)
+            end_token_ids = extra.get("end_token_ids")
+            think_end_id = extra.get("think_end_token_id")
+            if end_token_ids is None and think_end_id is not None:
+                end_token_ids = [int(think_end_id)]
+
+            if not end_token_ids:
+                # Can't enforce without a closing token id.
+                self.logit_processor_state.pop(index, None)
+                continue
+
+            # Optional, model-specific newline token IDs.
+            newline_token_ids = extra.get("newline_token_ids")
+            if newline_token_ids is not None:
+                try:
+                    newline_token_ids = {int(t) for t in newline_token_ids}
+                except Exception:
+                    newline_token_ids = None
+
+            # Respect explicit enable_thinking=False from chat_template_kwargs.
+            enable_thinking = extra.get("enable_thinking")
+            is_thinking = enable_thinking is not False
+
+            state: dict[Any, Any] = {
+                "output_tok_ids": output_tok_ids,
+                "thinking_budget": int(budget),
+                "thinking_budget_grace_period": int(grace),
+                "end_token_ids": [int(tid) for tid in end_token_ids],
+                "newline_token_ids": newline_token_ids,
+                "is_thinking": is_thinking,
+                # Internal tracking flags for the end sequence.
+                "start_of_end": False,
+                "end_of_end": False,
+            }
+
+            # If we have prompt tokens and explicit thinking is known to be off,
+            # keep the state but mark is_thinking=False so apply() skips it.
+            # (This keeps behaviour predictable even if extra_args are reused.)
+            self.logit_processor_state[index] = state
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        if not self.budgets:
+        if not self.logit_processor_state:
             return logits
 
-        for req_idx, budget in list(self.budgets.items()):
-            if req_idx >= logits.shape[0]:
+        for idx, state in self.logit_processor_state.items():
+            if idx >= logits.shape[0]:
                 continue
-            # Skip if we already forced </think> for this request
-            if req_idx in self.forced_done:
+            if not state.get("is_thinking", False):
                 continue
-                
-            output_tokens = self.output_token_refs.get(req_idx)
-            think_end_id = self.think_end_ids.get(req_idx)
-            if output_tokens is None or think_end_id is None:
-                continue
-
-            num_tokens = len(output_tokens)
-            
-            # Check if </think> was already generated (either naturally or by us)
-            if output_tokens and output_tokens[-1] == think_end_id:
-                self.forced_done.add(req_idx)
-                continue
-            
-            if num_tokens >= budget:
-                # Force </think> token by setting all logits to -inf except </think>
-                self.logger.debug(
-                    "ReasoningBudget: forcing </think> (id=%d) at token %d (budget=%d)",
-                    think_end_id, num_tokens, budget
-                )
-                logits[req_idx].fill_(float("-inf"))
-                logits[req_idx][think_end_id] = 0.0
-                # Mark as done so we don't keep forcing
-                self.forced_done.add(req_idx)
+            logits = self._maybe_end_thinking(idx, logits, state)
         return logits
 
 
