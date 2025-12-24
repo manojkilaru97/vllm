@@ -3,6 +3,8 @@
 
 import asyncio
 import json
+import logging
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -82,6 +84,7 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -183,6 +186,7 @@ class OpenAIServingChat(OpenAIServing):
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
+        raw_request: Request | None = None,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """
         Validate the model and preprocess a chat completion request.
@@ -205,7 +209,37 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        return await self.openai_serving_render.render_chat(request)
+        try:
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                headers_obj = None
+                try:
+                    if raw_request is not None:
+                        headers_obj = {k: v for k, v in raw_request.headers.items()}
+                except Exception:
+                    headers_obj = None
+                try:
+                    req_dump = request.model_dump()
+                except Exception:
+                    req_dump = None
+                rid_hint = self._base_request_id(
+                    raw_request, getattr(request, "request_id", None)
+                )
+                try:
+                    payload_logger.info(
+                        "openai.request",
+                        extra={
+                            "rid": rid_hint or "",
+                            "endpoint": self.__class__.__name__,
+                            "payload": req_dump,
+                            "headers": headers_obj,
+                        },
+                    )
+                except Exception:
+                    pass
+            return await self.openai_serving_render.render_chat(request)
+        except RuntimeError as e:
+            logger.exception("Error in preprocessing prompt inputs")
+            return self.create_error_response(e)
 
     async def create_chat_completion(
         self,
@@ -228,11 +262,15 @@ class OpenAIServingChat(OpenAIServing):
         )
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
-            reasoning_parser = self.reasoning_parser_cls(
-                tokenizer,
-                chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
-            )
-        result = await self.render_chat_request(request)
+            try:
+                reasoning_parser = self.reasoning_parser_cls(
+                    tokenizer,
+                    chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                )
+            except RuntimeError as e:
+                logger.exception("Error in reasoning parser creation.")
+                return self.create_error_response(str(e))
+        result = await self.render_chat_request(request, raw_request=raw_request)
         if isinstance(result, ErrorResponse):
             return result
 
