@@ -987,12 +987,14 @@ setup(
         "helion": ["helion==0.3.2"],
         # Optional deps for gRPC server (vllm serve --grpc)
         "grpc": ["smg-grpc-servicer[vllm] >= 0.5.0"],
-        # Optional deps for OpenTelemetry tracing
+        # Optional deps for OpenTelemetry logging/tracing
         "otel": [
-            "opentelemetry-sdk>=1.26.0",
-            "opentelemetry-api>=1.26.0",
-            "opentelemetry-exporter-otlp>=1.26.0",
+            "opentelemetry-sdk>=1.30.0",
+            "opentelemetry-api>=1.30.0",
+            "opentelemetry-exporter-otlp>=1.30.0",
+            "opentelemetry-exporter-otlp-proto-http>=1.30.0",
             "opentelemetry-semantic-conventions-ai>=0.4.1",
+            "kratos-cli>=4.0.93",
         ],
     },
     cmdclass=cmdclass,
