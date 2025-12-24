@@ -18,6 +18,8 @@ import torch
 from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
+from setuptools.command.develop import develop
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
@@ -140,6 +142,73 @@ def bundle_tcmalloc(build_lib: str) -> None:
     bundle_path = os.path.join(bundle_dir, tcmalloc_library.name)
     shutil.copy2(tcmalloc_library, bundle_path)
     logger.info("Bundled tcmalloc into wheel: %s", bundle_path)
+
+
+def compile_grpc_protos():
+    """Compile gRPC protobuf definitions during build when tooling is present."""
+    try:
+        from grpc_tools import protoc
+    except ImportError:
+        logger.warning(
+            "grpcio-tools not installed, skipping gRPC proto compilation. "
+            "gRPC server functionality will not be available."
+        )
+        return False
+
+    proto_file = ROOT_DIR / "vllm" / "grpc" / "vllm_engine.proto"
+    if not proto_file.exists():
+        logger.warning("Proto file not found at %s, skipping compilation", proto_file)
+        return False
+
+    logger.info("Compiling gRPC protobuf: %s", proto_file)
+    result = protoc.main(
+        [
+            "grpc_tools.protoc",
+            f"--proto_path={ROOT_DIR}",
+            f"--python_out={ROOT_DIR}",
+            f"--grpc_python_out={ROOT_DIR}",
+            f"--pyi_out={ROOT_DIR}",
+            str(proto_file),
+        ]
+    )
+    if result != 0:
+        logger.error("protoc failed with exit code %s", result)
+        return False
+
+    spdx_header = (
+        "# SPDX-License-Identifier: Apache-2.0\n"
+        "# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n"
+        "# mypy: ignore-errors\n"
+    )
+    grpc_dir = ROOT_DIR / "vllm" / "grpc"
+    for generated_file in [
+        grpc_dir / "vllm_engine_pb2.py",
+        grpc_dir / "vllm_engine_pb2_grpc.py",
+        grpc_dir / "vllm_engine_pb2.pyi",
+    ]:
+        if generated_file.exists():
+            content = generated_file.read_text()
+            if not content.startswith("# SPDX-License-Identifier"):
+                generated_file.write_text(spdx_header + content)
+
+    logger.info("gRPC protobuf compilation successful")
+    return True
+
+
+class BuildPyAndGenerateGrpc(build_py):
+    """Build Python modules and generate gRPC stubs from proto files."""
+
+    def run(self):
+        compile_grpc_protos()
+        super().run()
+
+
+class DevelopAndGenerateGrpc(develop):
+    """Develop mode that also generates gRPC stubs from proto files."""
+
+    def run(self):
+        compile_grpc_protos()
+        super().run()
 
 
 class CMakeExtension(Extension):
@@ -1030,12 +1099,17 @@ if _no_device():
     ext_modules = []
 
 if not ext_modules:
-    cmdclass = {}
+    cmdclass = {
+        "build_py": BuildPyAndGenerateGrpc,
+        "develop": DevelopAndGenerateGrpc,
+    }
 else:
     cmdclass = {
         "build_ext": precompiled_build_ext
         if envs.VLLM_USE_PRECOMPILED
         else cmake_build_ext,
+        "build_py": BuildPyAndGenerateGrpc,
+        "develop": DevelopAndGenerateGrpc,
     }
 
 setup(
@@ -1051,6 +1125,16 @@ setup(
         "fastsafetensors": ["fastsafetensors >= 0.2.2"],
         "instanttensor": ["instanttensor >= 0.1.5"],
         "runai": ["runai-model-streamer[s3,gcs,azure] >= 0.15.7"],
+        # OpenTelemetry logging + optional Kratos offload
+        # Note: kratos-cli is hosted on an internal index. Set PIP_EXTRA_INDEX_URL accordingly.
+        "otel": [
+            "opentelemetry-sdk>=1.30.0",
+            "opentelemetry-api>=1.30.0",
+            "opentelemetry-exporter-otlp>=1.30.0",
+            "opentelemetry-exporter-otlp-proto-http>=1.30.0",
+            "opentelemetry-semantic-conventions-ai>=0.4.1",
+            "kratos-cli>=4.0.93",
+        ],
         "audio": [
             "av",
             "resampy",
@@ -1066,13 +1150,6 @@ setup(
         "helion": ["helion==0.3.2"],
         # Optional deps for gRPC server (vllm serve --grpc)
         "grpc": ["smg-grpc-servicer[vllm] >= 0.5.0"],
-        # Optional deps for OpenTelemetry tracing
-        "otel": [
-            "opentelemetry-sdk>=1.26.0",
-            "opentelemetry-api>=1.26.0",
-            "opentelemetry-exporter-otlp>=1.26.0",
-            "opentelemetry-semantic-conventions-ai>=0.4.1",
-        ],
     },
     cmdclass=cmdclass,
     package_data=package_data,
