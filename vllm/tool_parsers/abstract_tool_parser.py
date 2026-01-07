@@ -57,6 +57,16 @@ class ToolParser:
         """
         if not request.tools:
             return request
+
+        # In production we sometimes receive tool_choice="required", but
+        # constrained decoding for tool schemas (structured outputs) can be
+        # unavailable or unstable depending on tokenizer/backend availability.
+        # For robustness, treat "required" like "auto": do not apply any grammar
+        # constraints and let the tool parser extract tool calls if present.
+        if request.tool_choice == "required":
+            request.tool_choice = "auto"
+            return request
+
         json_schema_from_tool = get_json_schema_from_tools(
             tool_choice=request.tool_choice, tools=request.tools
         )
