@@ -58,12 +58,11 @@ class XgrammarBackend(StructuredOutputBackend):
                 add_prefix_space=True,
             )
         elif isinstance(self.tokenizer, DeepseekV32Tokenizer):
-            # copy from xgr.TokenizerInfo.from_huggingface()
-            # because we are using a custom tokenizer wrapper here.
+            # DeepseekV32Tokenizer is a custom wrapper; explicitly build the encoded
+            # vocab so xgrammar can operate without relying on HF internals.
             vocab_dict = self.tokenizer.get_vocab()
             tokenizer_vocab_size = max(len(vocab_dict), self.tokenizer.max_token_id + 1)
             vocab_size = self.vocab_size or tokenizer_vocab_size
-            # maintain tokenizer's indexing
             encoded_vocab = [""] * vocab_size
             for token, idx in vocab_dict.items():
                 if idx < vocab_size:
@@ -278,7 +277,13 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
 
         # Unsupported keywords for objects
         if obj.get("type") == "object" and any(
-            key in obj for key in ("patternProperties", "propertyNames")
+            key in obj
+            for key in (
+                "minProperties",
+                "maxProperties",
+                "propertyNames",
+                "patternProperties",
+            )
         ):
             return True
 

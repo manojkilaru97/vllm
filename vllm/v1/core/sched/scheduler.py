@@ -1165,9 +1165,24 @@ class Scheduler(SchedulerInterface):
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
-                assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
+                grammar = (
+                    None
+                    if struct_output_request is None
+                    else struct_output_request.grammar
+                )
+                # Defensive guard: structured outputs can fail to initialize
+                # (e.g., missing optional deps or tokenizer incompatibilities).
+                # Never crash the engine; instead, disable structured outputs
+                # for the request and continue unconstrained decoding.
+                if grammar is None:
+                    logger.warning(
+                        "Structured outputs grammar missing for request %s; "
+                        "disabling structured outputs for this request.",
+                        req_id,
+                    )
+                    request.structured_output_request = None
+                else:
+                    grammar.accept_tokens(req_id, new_token_ids)
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
