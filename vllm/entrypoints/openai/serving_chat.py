@@ -2082,18 +2082,24 @@ class OpenAIServingChat(OpenAIServing):
 
         return ChatCompletionLogProbs(content=logprobs_content)
 
+    @staticmethod
     def _resolve_nvcf_image_assets(
-        self, messages: list[dict], raw_request: Request
+        messages: list[dict], raw_request: Request
     ) -> list[dict]:
         """
-        Convert any NVCF image asset references to base64 data URLs and, when
-        present inside plain text content with <img src="...">, transform the
-        message into structured parts to ensure image loading by the multimodal
-        parser.
+        Convert any NVCF media asset references (image/audio) to base64 data URLs
+        and, when present inside plain text content with <img ...> / <audio ...>,
+        transform the message into structured parts to ensure multimodal loading
+        by the multimodal parser.
 
         Supported inputs:
-        - Structured: {"type":"image_url", "image_url":{"url":"data:image/...;asset_id,<id>"}}
-        - Text with HTML: "... <img src=\"data:image/...;asset_id,<id>\"/> ..."
+        - Structured:
+          - {"type":"image_url", "image_url":{"url":"data:image/...;asset_id,<id>"}}
+          - {"type":"audio_url", "audio_url":{"url":"data:audio/...;asset_id,<id>"}}
+        - Text with HTML:
+          - "... <img src=\"data:image/...;asset_id,<id>\"/> ..."
+          - "... <audio src=\"data:audio/...;base64,<b64>\"/> ..."
+          - "... <audio src=\"data:audio/...;asset_id,<id>\"/> ..."
         Headers used:
         - NVCF-ASSET-DIR: absolute directory containing assets
         - NVCF-FUNCTION-ASSET-IDS: comma-separated allowed asset ids
@@ -2102,25 +2108,29 @@ class OpenAIServingChat(OpenAIServing):
         asset_dir = headers.get("NVCF-ASSET-DIR")
         allowed_ids_hdr = headers.get("NVCF-FUNCTION-ASSET-IDS")
 
-        if not asset_dir or not allowed_ids_hdr:
-            # Nothing to resolve
-            return messages
-
-        asset_root = Path(asset_dir)
-        if not asset_root.exists() or not asset_root.is_dir():
-            raise ValueError(f"Invalid NVCF-ASSET-DIR: {asset_dir}")
-
-        allowed_ids = {s.strip() for s in allowed_ids_hdr.split(',') if s.strip()}
+        asset_root: Path | None = None
+        allowed_ids: set[str] | None = None
+        if asset_dir and allowed_ids_hdr:
+            asset_root = Path(asset_dir)
+            if not asset_root.exists() or not asset_root.is_dir():
+                raise ValueError(f"Invalid NVCF-ASSET-DIR: {asset_dir}")
+            allowed_ids = {s.strip() for s in allowed_ids_hdr.split(",") if s.strip()}
 
         def to_base64_data_url(data_url: str) -> str:
-            # data:image/<type>;asset_id,<id>
-            m = re.match(r"^data:(image/[^;]+);asset_id,([^,]+)$", data_url)
+            # data:<mime>;asset_id,<id>
+            if asset_root is None or allowed_ids is None:
+                return data_url
+            m = re.match(r"^data:((?:image|audio)/[^;]+);asset_id,([^,]+)$",
+                         data_url)
             if not m:
                 return data_url
             mime = m.group(1)
             asset_id = m.group(2)
             if asset_id not in allowed_ids:
-                raise ValueError(f"Asset id '{asset_id}' not permitted by NVCF-FUNCTION-ASSET-IDS")
+                raise ValueError(
+                    f"Asset id '{asset_id}' not permitted by "
+                    "NVCF-FUNCTION-ASSET-IDS"
+                )
             file_path = (asset_root / asset_id).resolve()
             # prevent traversal
             if asset_root not in file_path.parents and file_path != asset_root:
@@ -2144,28 +2154,64 @@ class OpenAIServingChat(OpenAIServing):
                         elif isinstance(url_obj, str) and ";asset_id," in url_obj:
                             part["image_url"] = {"url": to_base64_data_url(url_obj)}
                         new_parts.append(part)
+                    elif isinstance(part, dict) and "audio_url" in part:
+                        url_obj = part["audio_url"]
+                        if isinstance(url_obj, dict):
+                            url = url_obj.get("url")
+                            if isinstance(url, str) and ";asset_id," in url:
+                                url_obj["url"] = to_base64_data_url(url)
+                        elif isinstance(url_obj, str) and ";asset_id," in url_obj:
+                            part["audio_url"] = {"url": to_base64_data_url(url_obj)}
+                        new_parts.append(part)
                     else:
                         new_parts.append(part)
                 msg["content"] = new_parts
                 return msg
 
-            # Case 2: plain text possibly containing <img src="...">
+            # Case 2: plain text possibly containing <img ...> / <audio ...>
             if isinstance(content, str):
-                pattern = re.compile(r"<img\s+[^>]*src=\"([^\"]+)\"[^>]*/?>")
+                pattern = re.compile(
+                    r"<(img|audio)\s+[^>]*src=\"([^\"]+)\"[^>]*/?>",
+                    flags=re.IGNORECASE,
+                )
                 idx = 0
                 parts = []
                 for m in pattern.finditer(content):
                     start, end = m.span()
-                    url = m.group(1)
+                    tag = m.group(1).lower()
+                    url = m.group(2)
                     if start > idx:
                         text_chunk = content[idx:start]
                         if text_chunk:
                             parts.append({"type": "text", "text": text_chunk})
-                    if url.startswith("data:image/") and ";asset_id," in url:
-                        b64_url = to_base64_data_url(url)
-                        parts.append({"type": "image_url", "image_url": {"url": b64_url}})
+
+                    # Only auto-structure data URLs. Keep non-data URLs as text.
+                    if url.startswith("data:image/") or url.startswith("data:audio/"):
+                        resolved_url = url
+                        if ";asset_id," in url:
+                            # Only resolvable if NVCF headers are present; otherwise
+                            # preserve as text (backward-compatible).
+                            if asset_root is not None and allowed_ids is not None:
+                                resolved_url = to_base64_data_url(url)
+                            else:
+                                parts.append({"type": "text", "text": m.group(0)})
+                                idx = end
+                                continue
+
+                        if tag == "img" and resolved_url.startswith("data:image/"):
+                            parts.append(
+                                {"type": "image_url",
+                                 "image_url": {"url": resolved_url}}
+                            )
+                        elif tag == "audio" and resolved_url.startswith("data:audio/"):
+                            parts.append(
+                                {"type": "audio_url",
+                                 "audio_url": {"url": resolved_url}}
+                            )
+                        else:
+                            # Mismatched tag/mime (keep literal)
+                            parts.append({"type": "text", "text": m.group(0)})
                     else:
-                        # keep as text if not asset_id pattern
                         parts.append({"type": "text", "text": m.group(0)})
                     idx = end
                 if parts:
