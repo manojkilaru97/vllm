@@ -901,13 +901,36 @@ class OpenAIServingResponses(OpenAIServing):
     ) -> list[ResponseOutputItem]:
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
-            self.request_logger.log_outputs(
-                request_id=request.request_id,
-                outputs=final_output.text,
-                output_token_ids=final_output.token_ids,
-                finish_reason=final_output.finish_reason,
-                is_streaming=False,
-                delta=False,
+            if reasoning:
+                self.request_logger.log_outputs(
+                    request_id=request.request_id,
+                    outputs=f"[reasoning] {reasoning}",
+                    output_token_ids=None,
+                    finish_reason=final_output.finish_reason,
+                    is_streaming=False,
+                    delta=False,
+                )
+            if content:
+                self.request_logger.log_outputs(
+                    request_id=request.request_id,
+                    outputs=content,
+                    output_token_ids=None,
+                    finish_reason=final_output.finish_reason,
+                    is_streaming=False,
+                    delta=False,
+                )
+
+        reasoning_item = None
+        message_item = None
+        if reasoning:
+            reasoning_item = ResponseReasoningItem(
+                id=f"rs_{random_uuid()}",
+                summary=[],
+                type="reasoning",
+                content=[
+                    ResponseReasoningTextContent(text=reasoning, type="reasoning_text")
+                ],
+                status=None,  # NOTE: Only the last output item has status.
             )
 
         # Compute logprobs if requested
