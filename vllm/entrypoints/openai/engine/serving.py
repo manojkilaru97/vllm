@@ -878,6 +878,49 @@ class OpenAIServing:
             return None
 
     @staticmethod
+    def _has_kimi_k2_markers(text: str) -> bool:
+        """Check if text contains Kimi K2 tool call markers."""
+        markers = [
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>",
+            "<|tool_call_argument_begin|>",
+        ]
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _extract_kimi_k2_tool_calls(content: str) -> list[tuple[str, str]]:
+        """
+        Extract tool calls from Kimi K2 marker format.
+        Returns: List of (function_name, arguments_json) tuples.
+        """
+        import re as re_std
+        tool_calls = []
+
+        # Pattern to match each tool call block
+        pattern = r"<\|tool_call_begin\|>\s*(?:functions\.)?(\w+):\d+\s*<\|tool_call_argument_begin\|>\s*(.*?)\s*<\|tool_call_end\|>"
+        matches = re_std.findall(pattern, content, re_std.DOTALL)
+
+        for func_name, args in matches:
+            tool_calls.append((func_name, args.strip()))
+
+        return tool_calls
+
+    @staticmethod
+    def _extract_kimi_k2_single_arguments(text: str) -> str | None:
+        """Extract arguments from a single Kimi K2 tool call format."""
+        arg_begin = "<|tool_call_argument_begin|>"
+        arg_end = "<|tool_call_end|>"
+
+        if arg_begin in text:
+            start = text.find(arg_begin) + len(arg_begin)
+            end_pos = text.find(arg_end, start)
+            if end_pos > start:
+                return text[start:end_pos].strip()
+            else:
+                return text[start:].strip()
+        return None
+
+    @staticmethod
     def _parse_tool_calls_from_content(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
@@ -888,34 +931,57 @@ class OpenAIServing:
         function_calls = list[FunctionCall]()
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
-            # Forced Function Call
+            # Forced Function Call - handle Kimi K2 marker format
+            if OpenAIServing._has_kimi_k2_markers(content):
+                arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
+                if arguments is None:
+                    arguments = ""
+            else:
+                arguments = content
             function_calls.append(
-                FunctionCall(name=request.tool_choice.name, arguments=content)
+                FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice and isinstance(
             request.tool_choice, ChatCompletionNamedToolChoiceParam
         ):
             assert content is not None
-            # Forced Function Call
+            # Forced Function Call - handle Kimi K2 marker format
+            if OpenAIServing._has_kimi_k2_markers(content):
+                arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
+                if arguments is None:
+                    arguments = ""
+            else:
+                arguments = content
             function_calls.append(
-                FunctionCall(name=request.tool_choice.function.name, arguments=content)
+                FunctionCall(name=request.tool_choice.function.name, arguments=arguments)
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice == "required":
-            tool_calls = []
-            with contextlib.suppress(ValidationError):
-                content = content or ""
-                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                    content
-                )
-            for tool_call in tool_calls:
-                function_calls.append(
-                    FunctionCall(
-                        name=tool_call.name,
-                        arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
+            # Handle Kimi K2 marker format for tool_choice=required
+            content = content or ""
+            if OpenAIServing._has_kimi_k2_markers(content):
+                extracted_calls = OpenAIServing._extract_kimi_k2_tool_calls(content)
+                for func_name, args in extracted_calls:
+                    function_calls.append(
+                        FunctionCall(name=func_name, arguments=args)
                     )
-                )
+            else:
+                # Standard JSON format
+                tool_calls = []
+                with contextlib.suppress(ValidationError):
+                    tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
+                        content
+                    )
+                for tool_call in tool_calls:
+                    function_calls.append(
+                        FunctionCall(
+                            name=tool_call.name,
+                            arguments=json.dumps(
+                                tool_call.parameters, ensure_ascii=False
+                            ),
+                        )
+                    )
             content = None  # Clear content since tool is called.
         elif (
             tool_parser_cls

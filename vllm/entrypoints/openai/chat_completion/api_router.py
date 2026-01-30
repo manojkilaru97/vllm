@@ -73,7 +73,6 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
-
 @router.post(
     "/v1/chat/completions/batch",
     dependencies=[Depends(validate_json_request)],
@@ -100,7 +99,5 @@ async def create_batch_chat_completion(
         return JSONResponse(content=result.model_dump(), status_code=result.error.code)
 
     return JSONResponse(content=result.model_dump())
-
-
 def attach_router(app: FastAPI):
     app.include_router(router)

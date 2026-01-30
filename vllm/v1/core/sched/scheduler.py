@@ -1434,14 +1434,25 @@ class Scheduler(SchedulerInterface):
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                ok = struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
-                if not ok:
-                    logger.warning(
-                        "Unexpected: grammar rejected tokens %s for request %s.",
-                        new_token_ids,
+                # Check if grammar is ready (handles async compilation race condition)
+                if not struct_output_request.is_grammar_ready:
+                    logger.debug(
+                        "Grammar not ready yet for request %s, skipping accept_tokens",
                         req_id,
                     )
+                elif struct_output_request.grammar is None:
+                    logger.warning(
+                        "Grammar is None for request %s despite is_grammar_ready=True",
+                        req_id,
+                    )
+                else:
+                    ok = struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
+                    if not ok:
+                        logger.warning(
+                            "Unexpected: grammar rejected tokens %s for request %s.",
+                            new_token_ids,
+                            req_id,
+                        )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
