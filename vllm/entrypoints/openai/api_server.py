@@ -699,7 +699,7 @@ async def run_server_worker(
                 def filter(self, record):
                     msg = record.getMessage()
                     # Exclude request/response logs from console (OTEL only)
-                    if 'openai.request' in msg or 'openai.response' in msg:
+                    if 'openai.request' in msg or 'openai.response' in msg or 'openai.media_mirror' in msg:
                         return False
                     if 'Generated response' in msg and 'chatcmpl-' in msg:
                         return False
