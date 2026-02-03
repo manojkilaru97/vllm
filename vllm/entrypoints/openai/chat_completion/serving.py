@@ -77,6 +77,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.tool_parsers.utils import partial_json_loads
+from vllm.request_context import reset_request_id, set_request_id
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer
 
@@ -222,35 +223,74 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        # Resolve NVCF assets in-place before preprocessing.
-        # This happens after request payload logging so we preserve what
-        # the caller actually sent (asset_id refs, base64, etc.).
-        if raw_request is not None:
-            try:
-                request.messages = self._resolve_nvcf_image_assets(
-                    request.messages, raw_request
-                )
-            except Exception as e:
-                logger.exception("Error while resolving NVCF assets")
-                return self.create_error_response(str(e))
-
-        # Strip raw multimodal special tokens from plain text to avoid
-        # backend crashes when no corresponding media is provided.
+        rid_hint = self._base_request_id(raw_request, getattr(request, "request_id", None))
+        ctx_token = set_request_id(rid_hint)
         try:
-            request.messages = self._strip_mm_special_tokens_in_messages(
-                request.messages
-            )
-        except Exception:
-            logger.exception("Error while stripping MM special tokens")
-        # For gpt-oss (harmony) models, special tokens are part of the
-        # protocol framing. By default, OpenAI-compatible requests set
-        # `skip_special_tokens=True`, which can strip these markers from
-        # the streamed text. If the caller didn't explicitly set this
-        # field, default to keeping special tokens for harmony models.
-        if self.use_harmony and "skip_special_tokens" not in request.model_fields_set:
-            request.skip_special_tokens = False
+            # Log request payload BEFORE any chat template is applied
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                # Collect all incoming headers unfiltered
+                headers_obj = None
+                try:
+                    if raw_request is not None:
+                        headers_obj = {k: v for k, v in raw_request.headers.items()}
+                except Exception:
+                    headers_obj = None
+                try:
+                    req_dump = request.model_dump()
+                except Exception:
+                    req_dump = None
+                try:
+                    payload_logger.info(
+                        "openai.request",
+                        extra={
+                            "rid": rid_hint or "",
+                            "endpoint": self.__class__.__name__,
+                            # Pass dict directly for proper OTEL structured logging
+                            "payload": req_dump,
+                            "headers": headers_obj,
+                        },
+                    )
+                except Exception:
+                    pass
 
-        return await self.openai_serving_render.render_chat(request)
+            # Resolve NVCF assets in-place before preprocessing.
+            # This happens after request payload logging so we preserve what
+            # the caller actually sent (asset_id refs, base64, etc.).
+            if raw_request is not None:
+                try:
+                    request.messages = self._resolve_nvcf_image_assets(
+                        request.messages, raw_request
+                    )
+                except Exception as e:
+                    logger.exception("Error while resolving NVCF assets")
+                    return self.create_error_response(str(e))
+
+            # Strip raw multimodal special tokens from plain text to avoid
+            # backend crashes when no corresponding media is provided.
+            try:
+                request.messages = self._strip_mm_special_tokens_in_messages(
+                    request.messages
+                )
+            except Exception:
+                logger.exception("Error while stripping MM special tokens")
+
+            # For gpt-oss (harmony) models, special tokens are part of the
+            # protocol framing. By default, OpenAI-compatible requests set
+            # `skip_special_tokens=True`, which can strip these markers from
+            # the streamed text. If the caller didn't explicitly set this
+            # field, default to keeping special tokens for harmony models.
+            if (
+                self.use_harmony
+                and "skip_special_tokens" not in request.model_fields_set
+            ):
+                request.skip_special_tokens = False
+
+            return await self.openai_serving_render.render_chat(request)
+        finally:
+            try:
+                reset_request_id(ctx_token)
+            except Exception:
+                pass
 
     async def create_chat_completion(
         self,
@@ -2561,7 +2601,27 @@ class OpenAIServingChat(OpenAIServing):
             if asset_root not in file_path.parents and file_path != asset_root:
                 raise ValueError("Asset path escapes NVCF-ASSET-DIR")
             with open(file_path, 'rb') as f:
-                data_b64 = base64.b64encode(f.read()).decode('ascii')
+                raw = f.read()
+
+            # Emit a durable mapping for short-lived NVCF assets (async).
+            try:
+                from vllm.request_context import get_request_id
+                from vllm.otel_instrumentation import enqueue_media_mirror
+
+                rid = get_request_id() or ""
+                kind = "video" if mime.startswith("video/") else "image"
+                enqueue_media_mirror(
+                    rid=rid,
+                    kind=kind,
+                    original=f"asset_id:{asset_id}",
+                    data=raw,
+                    mime=mime,
+                    source="nvcf_asset",
+                )
+            except Exception:
+                pass
+
+            data_b64 = base64.b64encode(raw).decode('ascii')
             return f"data:{mime};base64,{data_b64}"
 
         def transform_message(msg: dict) -> dict:
