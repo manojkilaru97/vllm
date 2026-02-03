@@ -283,6 +283,35 @@ class MediaConnector:
                 f"{url_spec.hostname}"
             )
 
+    @staticmethod
+    def _enqueue_media_mirror(url: str, media_io: MediaIO[_M], data: bytes) -> None:
+        try:
+            from vllm.request_context import get_request_id
+            from vllm.otel_instrumentation import enqueue_media_mirror
+
+            rid = get_request_id() or ""
+            if not rid:
+                return
+
+            kind = None
+            if isinstance(media_io, VideoMediaIO):
+                kind = "video"
+            elif isinstance(media_io, ImageMediaIO):
+                kind = "image"
+
+            if kind:
+                mime, _enc = mimetypes.guess_type(url)
+                enqueue_media_mirror(
+                    rid=rid,
+                    kind=kind,
+                    original=url,
+                    data=data,
+                    mime=mime,
+                    source="http_url",
+                )
+        except Exception:
+            pass
+
     def load_from_url(
         self,
         url: str,
@@ -307,6 +336,7 @@ class MediaConnector:
             )
 
             self._put_cached_bytes(url, data)
+            self._enqueue_media_mirror(url_spec.url, media_io, data)
             return media_io.load_bytes(data)
 
         if url_spec.scheme == "data":
@@ -350,6 +380,7 @@ class MediaConnector:
             await loop.run_in_executor(
                 global_thread_pool, self._put_cached_bytes, url, data
             )
+            self._enqueue_media_mirror(url_spec.url, media_io, data)
             future = loop.run_in_executor(global_thread_pool, media_io.load_bytes, data)
             return await future
 
