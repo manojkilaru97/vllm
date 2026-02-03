@@ -24,6 +24,7 @@ import json
 from typing import Optional, Tuple, Dict, Tuple as Tup, Any
 import threading
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 from prometheus_client.parser import text_string_to_metric_families
 import base64
 import re
@@ -54,6 +55,12 @@ _QUEUE_LISTENER: Optional[QueueListener] = None
 # Cached bucket per namespace (best-effort)
 _KRATOS_BUCKET_CACHE: Dict[str, str] = {}
 _OFFLOAD_CACHE: Dict[str, str] = {}  # sha256(data) -> uri (best-effort dedup)
+
+# Media mirroring (HTTP URLs / NVCF assets -> S3 via kratos) is intentionally
+# separate from "log offload" so it can emit a correlation event without
+# changing the original request log line.
+_MEDIA_MIRROR_QUEUE: Optional["queue.Queue[dict[str, Any]]"] = None
+_MEDIA_MIRROR_THREAD: Optional[threading.Thread] = None
 
 
 
@@ -445,6 +452,146 @@ def _kratos_bulk_upload_bytes(data: bytes, fname: str, cfg: Dict[str, str]) -> T
             return None, None
     except Exception:
         return None, None
+
+
+def _sanitize_url_no_query(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        # Drop query + fragment to avoid leaking presigned tokens.
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    except Exception:
+        return url
+
+
+def _media_mirror_enabled() -> bool:
+    # Default to enabled when kratos is enabled, since mirroring relies on it.
+    return _is_truthy(os.getenv("VLLM_MEDIA_MIRROR_ENABLE", os.getenv("KRATOS_BULKUPLOAD_ENABLE", "0")))
+
+
+def _start_media_mirror_worker() -> None:
+    global _MEDIA_MIRROR_QUEUE, _MEDIA_MIRROR_THREAD
+    if _MEDIA_MIRROR_THREAD is not None and _MEDIA_MIRROR_QUEUE is not None:
+        return
+
+    # Bounded by default to prevent runaway memory usage; set to 0 for unbounded.
+    qsize = _env_int("VLLM_MEDIA_MIRROR_MAX_QUEUE", 256)
+    _MEDIA_MIRROR_QUEUE = queue.Queue(maxsize=qsize)
+
+    def _worker() -> None:
+        media_logger = logging.getLogger("vllm.payload")
+        cfg = _kratos_defaults()
+        while True:
+            try:
+                assert _MEDIA_MIRROR_QUEUE is not None
+                item = _MEDIA_MIRROR_QUEUE.get()
+                if item is None:  # type: ignore[comparison-overlap]
+                    continue
+                rid = str(item.get("rid") or "")
+                kind = str(item.get("kind") or "")
+                original = str(item.get("original") or "")
+                source = str(item.get("source") or "")
+                mime = item.get("mime")
+                mime_s = str(mime) if isinstance(mime, str) else ""
+                data = item.get("data")
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                b = bytes(data)
+                size = len(b)
+
+                digest = hashlib.sha256(b).hexdigest()
+                uri = _OFFLOAD_CACHE.get(digest)
+                bulk_id = None
+                if uri is None:
+                    ext = _guess_ext_from_mime(mime_s) or "bin"
+                    fname = f"media_{uuid.uuid4().hex}.{ext}"
+                    bulk_id, uri = _kratos_bulk_upload_bytes(b, fname, cfg)
+                    if uri:
+                        if len(_OFFLOAD_CACHE) > 2048:
+                            try:
+                                _OFFLOAD_CACHE.pop(next(iter(_OFFLOAD_CACHE)))
+                            except Exception:
+                                _OFFLOAD_CACHE.clear()
+                        _OFFLOAD_CACHE[digest] = uri
+
+                extra = {
+                    "rid": rid,
+                    "kind": kind,
+                    "source": source,
+                    "original": original,
+                    "original_no_query": _sanitize_url_no_query(original),
+                    "original_had_query": ("?" in original),
+                    "mime": mime_s,
+                    "size_bytes": size,
+                    "sha256": digest,
+                    "s3_uri": str(uri or ""),
+                    "status": "success" if uri else "failed",
+                }
+                if bulk_id is not None:
+                    extra["kratos_bulk_upload_id"] = str(bulk_id)
+
+                # Separate line so automation can correlate durable media pointers.
+                media_logger.info("openai.media_mirror", extra=extra)
+            except Exception:
+                # Never crash the worker; best-effort only.
+                try:
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+
+    _MEDIA_MIRROR_THREAD = threading.Thread(
+        target=_worker, name="vllm-media-mirror", daemon=True
+    )
+    try:
+        _MEDIA_MIRROR_THREAD.start()
+    except Exception:
+        _MEDIA_MIRROR_THREAD = None
+        _MEDIA_MIRROR_QUEUE = None
+
+
+def enqueue_media_mirror(
+    *,
+    rid: str,
+    kind: str,
+    original: str,
+    data: bytes,
+    mime: str | None = None,
+    source: str = "",
+) -> None:
+    """Enqueue a best-effort media upload to S3 and emit a correlation log line.
+
+    This must never block request handling. It drops work when the queue is full.
+    """
+    if not rid or not original or not isinstance(data, (bytes, bytearray)):
+        return
+    if not _media_mirror_enabled():
+        return
+
+    k = (kind or "").lower()
+    if k not in ("image", "video"):
+        return
+
+    # Always mirror videos. Images are configurable (default: mirror all).
+    img_thresh = _env_int("VLLM_MEDIA_MIRROR_IMAGE_THRESHOLD_BYTES", 0)
+    if k == "image" and len(data) < img_thresh:
+        return
+
+    _start_media_mirror_worker()
+    if _MEDIA_MIRROR_QUEUE is None:
+        return
+
+    item = {
+        "rid": rid,
+        "kind": k,
+        "original": original,
+        "mime": mime,
+        "source": source,
+        "data": bytes(data),
+    }
+    try:
+        _MEDIA_MIRROR_QUEUE.put_nowait(item)
+    except Exception:
+        # Drop when the queue is full or on any unexpected queue issues.
+        return
 
 
 class _KratosOffloadFilter(logging.Filter):
@@ -856,4 +1003,3 @@ def start_prom_to_otel_bridge(scrape_url: str, interval_seconds: float = 10.0) -
 
     _PROM_BRIDGE_THREAD = threading.Thread(target=_run, name="vllm-prom-bridge", daemon=True)
     _PROM_BRIDGE_THREAD.start()
-
