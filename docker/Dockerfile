@@ -803,10 +803,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi; \
     if [ "$VLLM_WITH_OTEL" = "1" ]; then \
         uv pip install --system \
-          'opentelemetry-sdk>=1.26.0,<1.27.0' \
-          'opentelemetry-api>=1.26.0,<1.27.0' \
-          'opentelemetry-exporter-otlp>=1.26.0,<1.27.0' \
-          'opentelemetry-semantic-conventions-ai>=0.4.1,<0.5.0'; \
+          'opentelemetry-sdk>=1.30.0' \
+          'opentelemetry-api>=1.30.0' \
+          'opentelemetry-exporter-otlp>=1.30.0' \
+          'opentelemetry-exporter-otlp-proto-http>=1.30.0' \
+          'opentelemetry-semantic-conventions-ai>=0.4.1' \
+          'kratos-cli>=4.0.93'; \
     fi
 
 ENV VLLM_USAGE_SOURCE production-docker-image
