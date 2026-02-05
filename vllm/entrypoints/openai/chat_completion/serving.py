@@ -636,6 +636,103 @@ class OpenAIServingChat(OpenAIServing):
                     break
         return updated_delta, passed_zero
 
+    @staticmethod
+    def _extract_nth_parameters_obj(text: str, n: int) -> str | None:
+        """Best-effort extraction of the n-th `"parameters": {...}` object.
+
+        This is intentionally tolerant to partial/incomplete JSON and is used to
+        avoid leaking tokens from a *next* tool call into the current tool's
+        streamed `arguments` when `tool_choice=required`.
+        """
+        if n < 0:
+            return None
+
+        # 1) Find the n-th occurrence of the `"parameters"` key *outside* of
+        # JSON strings.
+        needle = "\"parameters\""
+        i = 0
+        in_str = False
+        esc = False
+        found = -1
+        key_pos = None
+        while i < len(text):
+            c = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == "\"":
+                    in_str = False
+                i += 1
+                continue
+
+            if c == "\"":
+                # Potential start of a JSON string / key.
+                if text.startswith(needle, i):
+                    # Ensure this looks like a key: `"parameters"\s*:`
+                    j = i + len(needle)
+                    while j < len(text) and text[j].isspace():
+                        j += 1
+                    if j < len(text) and text[j] == ":":
+                        found += 1
+                        if found == n:
+                            key_pos = j + 1  # position after ':'
+                            break
+                    i = j
+                else:
+                    in_str = True
+                i += 1
+                continue
+
+            i += 1
+
+        if key_pos is None:
+            return None
+
+        # 2) From after the colon, find the opening '{' for the object.
+        j = key_pos
+        while j < len(text) and text[j].isspace():
+            j += 1
+        while j < len(text) and text[j] != "{":
+            # For required tool calling, parameters should be an object.
+            # If we don't see it yet, bail (partial generation).
+            if not text[j].isspace():
+                return None
+            j += 1
+        if j >= len(text) or text[j] != "{":
+            return None
+
+        # 3) Capture a JSON object starting at '{', respecting strings/escapes.
+        out: list[str] = []
+        depth = 0
+        in_str = False
+        esc = False
+        k = j
+        while k < len(text):
+            c = text[k]
+            out.append(c)
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == "\"":
+                    in_str = False
+            else:
+                if c == "\"":
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return "".join(out)
+            k += 1
+
+        # Partial (unterminated) object.
+        return "".join(out)
+
     def extract_tool_call_required_streaming(
         self,
         previous_text: str,
@@ -657,6 +754,22 @@ class OpenAIServingChat(OpenAIServing):
         ):
             logger.debug("not enough tokens to parse into JSON yet")
             obj = None
+
+        # For robust multi-tool streaming, also parse previous_text so we can
+        # detect when a new tool object is appended to the JSON array. Relying
+        # on `tool_call_idx` (which may include history) can cause the server to
+        # reuse/shift indices and corrupt arguments by concatenating multiple
+        # tools into a single streamed `arguments` buffer.
+        prev_obj = None
+        if previous_text:
+            try:
+                flags = Allow.ALL
+                prev_obj, _ = partial_json_loads(previous_text, flags)
+            except (
+                partial_json_parser.core.exceptions.MalformedJSON,
+                json.JSONDecodeError,
+            ):
+                prev_obj = None
 
         # check if the current text is a valid array
         # containing a partial tool calling object
@@ -715,47 +828,22 @@ class OpenAIServingChat(OpenAIServing):
 
                 else:
                     # Check if a NEW tool call has appeared in the array
-                    # tool_call_idx tracks tools we've already sent names for
-                    # If len(obj) > tool_call_idx, we have a new tool
                     current_tool_idx = len(obj) - 1
+                    prev_len = len(prev_obj) if isinstance(prev_obj, list) else 0
+                    new_tool_appended = prev_len != 0 and len(obj) > prev_len
                     is_new_tool = (
-                        tool_call_idx is not None
-                        and current_tool_idx >= tool_call_idx
+                        new_tool_appended
                         and "name" in current_tool_call
                         and "parameters" in current_tool_call
                     )
 
                     if is_new_tool:
-                        # This is a NEW tool call - send its name with empty args
-                        # The args will be filled in by subsequent delta streaming
-                        # We can't use json.dumps(parameters) because partial_json_loads
-                        # may have parsed incomplete strings (e.g., "15 becomes "15")
-
-                        # Find the start of this tool's parameters in current_text
-                        # and extract only the raw parameter portion
-                        # Look for the pattern after the tool name
-                        # IMPORTANT: When the same tool name appears multiple times,
-                        # we need to find the Nth occurrence where N = current_tool_idx
-                        tool_start_pattern = rf'"name":\s*"{re.escape(current_tool_call["name"])}"[^{{]*"parameters":\s*'
-                        matches = list(re.finditer(tool_start_pattern, current_text))
-
-                        # Count how many times this tool name has appeared before
-                        # in the array (to find the correct match)
-                        same_name_count = sum(
-                            1 for i, t in enumerate(obj)
-                            if i < current_tool_idx and t.get("name") == current_tool_call["name"]
-                        )
-                        match_idx = same_name_count  # 0-indexed: first=0, second=1, etc.
-
-                        if matches and match_idx < len(matches):
-                            match = matches[match_idx]
-                            # Get everything after "parameters": for this tool
-                            param_start = match.end()
-                            raw_params = current_text[param_start:]
-                            # Filter to get only valid JSON portion
-                            arguments, _ = OpenAIServingChat._filter_delta_text(raw_params, "")
-                        else:
-                            arguments = ""
+                        # This is a NEW tool call appended to the array. Extract
+                        # its parameters object directly to avoid mixing with
+                        # adjacent tool objects.
+                        arguments = OpenAIServingChat._extract_nth_parameters_obj(
+                            current_text, current_tool_idx
+                        ) or ""
 
                         tool_call_id = make_tool_call_id(
                             id_type=self.tool_call_id_type,
@@ -776,31 +864,46 @@ class OpenAIServingChat(OpenAIServing):
                             ]
                         )
                     else:
-                        # Continue streaming arguments for current tool
-                        delta_text_filtered, finishes_tool = OpenAIServingChat._filter_delta_text(
-                            delta_text, previous_text
-                        )
-                        # The correct index is the tool we're currently streaming args for
-                        # which is (tool_call_idx - 1) since tool_call_idx was incremented
-                        # after we returned that tool's name
-                        current_streaming_idx = max(0, (tool_call_idx or 1) - 1)
+                        # Continue streaming arguments for the current (last)
+                        # tool in the array. We stream a safe suffix delta of
+                        # that tool's parameters object to avoid accidentally
+                        # appending tokens from an adjacent tool call.
+                        current_streaming_idx = len(obj) - 1
 
-                        if delta_text_filtered != "":
-                            delta_message = DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        function=DeltaFunctionCall(
-                                            # OpenAI API returns None
-                                            # instead of name every time
-                                            name=None,
-                                            arguments=delta_text_filtered,
-                                        ),
-                                        index=current_streaming_idx,
-                                    )
-                                ]
-                            )
-                        else:
+                        prev_args = OpenAIServingChat._extract_nth_parameters_obj(
+                            previous_text, current_streaming_idx
+                        )
+                        curr_args = OpenAIServingChat._extract_nth_parameters_obj(
+                            current_text, current_streaming_idx
+                        )
+
+                        if not curr_args:
                             delta_message = None
+                        else:
+                            if prev_args and curr_args.startswith(prev_args):
+                                arguments_delta = curr_args[len(prev_args) :]
+                            elif prev_args is None:
+                                # First time we can extract params for this tool.
+                                arguments_delta = curr_args
+                            else:
+                                # If we can't compute a safe delta, don't stream
+                                # anything rather than corrupting JSON.
+                                arguments_delta = ""
+
+                            if arguments_delta:
+                                delta_message = DeltaMessage(
+                                    tool_calls=[
+                                        DeltaToolCall(
+                                            function=DeltaFunctionCall(
+                                                name=None,
+                                                arguments=arguments_delta,
+                                            ),
+                                            index=current_streaming_idx,
+                                        )
+                                    ]
+                                )
+                            else:
+                                delta_message = None
 
         return delta_message, function_name_returned
 
@@ -1284,66 +1387,103 @@ class OpenAIServingChat(OpenAIServing):
                             # either finished reasoning or no reasoning at all
                             content = current_text
 
-                            # Check if the model outputs Kimi K2 marker format
-                            # instead of the expected JSON format
-                            if OpenAIServingChat._has_kimi_k2_markers(content):
-                                # Handle Kimi K2 marker format for tool_choice=required
-                                # Wait for complete arguments (partial_ok=False)
-                                extracted_args = OpenAIServingChat._extract_kimi_k2_arguments(content, partial_ok=False)
+                            # For `tool_choice=required`, we only emit tool_call
+                            # deltas once we have the *full* tool-call JSON.
+                            # Incremental parsing here is fragile and can
+                            # mis-index tool calls (merging arguments across
+                            # tools), especially when the JSON array grows
+                            # between token boundaries.
+                            if output.finish_reason is None:
+                                delta_message = None
+                            elif OpenAIServingChat._has_kimi_k2_markers(content):
+                                # Best-effort: only support single-call marker format.
+                                extracted_args = OpenAIServingChat._extract_kimi_k2_arguments(
+                                    content, partial_ok=False
+                                )
                                 if extracted_args is not None and extracted_args.strip():
-                                    # Try to parse the function name from markers
                                     func_name = None
                                     import re as re_std
-                                    # Pattern: <|tool_call_begin|>functions.name:0 or name:0
+
                                     name_match = re_std.search(
                                         r"<\|tool_call_begin\|>\s*(?:functions\.)?(\w+):\d+",
-                                        content
+                                        content,
                                     )
                                     if name_match:
                                         func_name = name_match.group(1)
-
-                                    if not fn_name_returned and func_name:
+                                    if func_name:
+                                        tool_call_id = make_tool_call_id(
+                                            id_type=self.tool_call_id_type,
+                                            func_name=func_name,
+                                            idx=history_tool_call_cnt,
+                                        )
                                         delta_message = DeltaMessage(
                                             tool_calls=[
                                                 DeltaToolCall(
-                                                    id=make_tool_call_id(),
+                                                    id=tool_call_id,
                                                     type="function",
                                                     function=DeltaFunctionCall(
                                                         name=func_name,
                                                         arguments=extracted_args,
                                                     ),
-                                                    index=i,
+                                                    index=0,
                                                 )
                                             ]
                                         )
                                         function_name_returned[i] = True
-                                    elif fn_name_returned:
-                                        # Continue streaming arguments
-                                        delta_message = DeltaMessage(
-                                            tool_calls=[
-                                                DeltaToolCall(
-                                                    function=DeltaFunctionCall(
-                                                        arguments="",  # Kimi K2 sends all args at once
-                                                    ),
-                                                    index=i,
-                                                )
-                                            ]
-                                        )
                                     else:
                                         delta_message = None
                                 else:
                                     delta_message = None
                             else:
-                                # Standard JSON format - use existing method
-                                delta_message, function_name_returned[i] = (
-                                    self.extract_tool_call_required_streaming(
-                                        previous_text=previous_text,
-                                        current_text=content,
-                                        delta_text=delta_text,
-                                        function_name_returned=fn_name_returned,
-                                        tool_call_idx=history_tool_call_cnt,
-                                    )
-                                )
+                                # Standard JSON format (OpenAI-style array)
+                                tool_calls_obj = None
+                                try:
+                                    tool_calls_obj = json.loads(content)
+                                except json.JSONDecodeError:
+                                    try:
+                                        tool_calls_obj, _ = partial_json_loads(
+                                            content, Allow.ALL
+                                        )
+                                    except (
+                                        partial_json_parser.core.exceptions.MalformedJSON,
+                                        json.JSONDecodeError,
+                                    ):
+                                        tool_calls_obj = None
+
+                                delta_tool_calls: list[DeltaToolCall] = []
+                                if isinstance(tool_calls_obj, list):
+                                    for j, tc in enumerate(tool_calls_obj):
+                                        if not isinstance(tc, dict):
+                                            continue
+                                        name = tc.get("name")
+                                        params = tc.get("parameters")
+                                        if not isinstance(name, str):
+                                            continue
+                                        if params is None:
+                                            params = {}
+                                        args = json.dumps(params, ensure_ascii=False)
+                                        tool_call_id = make_tool_call_id(
+                                            id_type=self.tool_call_id_type,
+                                            func_name=name,
+                                            idx=history_tool_call_cnt + j,
+                                        )
+                                        delta_tool_calls.append(
+                                            DeltaToolCall(
+                                                id=tool_call_id,
+                                                type="function",
+                                                function=DeltaFunctionCall(
+                                                    name=name,
+                                                    arguments=args,
+                                                ),
+                                                index=j,
+                                            )
+                                        )
+
+                                if delta_tool_calls:
+                                    delta_message = DeltaMessage(tool_calls=delta_tool_calls)
+                                    function_name_returned[i] = True
+                                else:
+                                    delta_message = None
                             if (
                                 delta_message
                                 and delta_message.tool_calls
