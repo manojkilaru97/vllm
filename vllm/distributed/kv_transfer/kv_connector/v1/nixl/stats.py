@@ -155,7 +155,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             5.0,
         ]
         nixl_histogram_xfer_time = self._histogram_cls(
-            name="vllm:nixl_xfer_time_seconds",
+            name="nixl_xfer_time_seconds",
             documentation="Histogram of transfer duration for NIXL KV Cache transfers.",
             buckets=buckets[1:],
             labelnames=labelnames,
@@ -164,7 +164,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             nixl_histogram_xfer_time, self.per_engine_labelvalues
         )
         nixl_histogram_post_time = self._histogram_cls(
-            name="vllm:nixl_post_time_seconds",
+            name="nixl_post_time_seconds",
             documentation="Histogram of transfer post time for NIXL KV"
             " Cache transfers.",
             buckets=buckets,
@@ -176,7 +176,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         # uniform 2kb to 16gb range
         buckets = [2 ** (10 + i) for i in range(1, 25, 2)]
         nixl_histogram_bytes_transferred = self._histogram_cls(
-            name="vllm:nixl_bytes_transferred",
+            name="nixl_bytes_transferred",
             documentation="Histogram of bytes transferred per NIXL KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
@@ -201,7 +201,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             50000,
         ]
         nixl_histogram_num_descriptors = self._histogram_cls(
-            name="vllm:nixl_num_descriptors",
+            name="nixl_num_descriptors",
             documentation="Histogram of number of descriptors per NIXL"
             "  KV Cache transfers.",
             buckets=buckets,
@@ -211,7 +211,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             nixl_histogram_num_descriptors, self.per_engine_labelvalues
         )
         counter_nixl_num_failed_transfers = self._counter_cls(
-            name="vllm:nixl_num_failed_transfers",
+            name="nixl_num_failed_transfers",
             documentation="Number of failed NIXL KV Cache transfers.",
             labelnames=labelnames,
         )
@@ -219,7 +219,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             counter_nixl_num_failed_transfers, self.per_engine_labelvalues
         )
         counter_nixl_num_failed_notifications = self._counter_cls(
-            name="vllm:nixl_num_failed_notifications",
+            name="nixl_num_failed_notifications",
             documentation="Number of failed NIXL KV Cache notifications.",
             labelnames=labelnames,
         )
@@ -228,13 +228,23 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         )
 
         counter_nixl_num_kv_expired_reqs = self._counter_cls(
-            name="vllm:nixl_num_kv_expired_reqs",
+            name="nixl_num_kv_expired_reqs",
             documentation="Number of requests that had their KV expire. "
             "NOTE: This metric is tracked on the P instance.",
             labelnames=labelnames,
         )
         self.counter_nixl_num_kv_expired_reqs = create_metric_per_engine(
             counter_nixl_num_kv_expired_reqs, self.per_engine_labelvalues
+        )
+
+        gauge_kv_transfer_speed = self._gauge_cls(
+            name="kv_transfer_speed_gb_s",
+            documentation="KV cache transfer speed in GB/s.",
+            labelnames=labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.gauge_kv_transfer_speed = create_metric_per_engine(
+            gauge_kv_transfer_speed, self.per_engine_labelvalues
         )
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
@@ -264,3 +274,12 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         ):
             for list_item in transfer_stats_data[counter_item_key]:
                 counter_obj[engine_idx].inc(list_item)
+
+        bytes_list = transfer_stats_data.get("bytes_transferred", [])
+        time_list = transfer_stats_data.get("transfer_duration", [])
+        if bytes_list and time_list:
+            total_bytes = sum(bytes_list)
+            total_time = sum(time_list)
+            if total_time > 0:
+                speed_gb_s = (total_bytes / total_time) / 1e9
+                self.gauge_kv_transfer_speed[engine_idx].set(speed_gb_s)
