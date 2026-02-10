@@ -62,6 +62,21 @@ class ChatMessage(OpenAIBaseModel):
 
     # vLLM-specific fields that are not in OpenAI spec
     reasoning: str | None = None
+    reasoning_content: str | None = None
+
+    @model_validator(mode="after")
+    def sync_reasoning_fields(self):
+        if self.reasoning is None and self.reasoning_content is not None:
+            self.reasoning = self.reasoning_content
+        elif self.reasoning is not None and self.reasoning_content is None:
+            self.reasoning_content = self.reasoning
+        elif (
+            self.reasoning is not None
+            and self.reasoning_content is not None
+            and self.reasoning != self.reasoning_content
+        ):
+            self.reasoning_content = self.reasoning
+        return self
 
 
 class ChatCompletionLogProb(OpenAIBaseModel):
