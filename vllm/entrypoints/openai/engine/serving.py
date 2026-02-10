@@ -1248,6 +1248,29 @@ class OpenAIServing:
         return any(marker in text for marker in markers)
 
     @staticmethod
+    def _strip_non_json_prefix(content: str, prefer_array: bool = False) -> str:
+        """Best-effort removal of natural-language prefixes before JSON payload."""
+        stripped = content.lstrip()
+        if not stripped:
+            return stripped
+
+        if prefer_array:
+            idx = stripped.find("[")
+            if idx != -1:
+                return stripped[idx:]
+        else:
+            idx = stripped.find("{")
+            if idx != -1:
+                return stripped[idx:]
+
+        first_obj = stripped.find("{")
+        first_arr = stripped.find("[")
+        starts = [i for i in (first_obj, first_arr) if i != -1]
+        if not starts:
+            return stripped
+        return stripped[min(starts):]
+
+    @staticmethod
     def _extract_tool_calls_with_parser(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
@@ -1308,6 +1331,9 @@ class OpenAIServing:
                     arguments = ""
             else:
                 stripped_content = content.strip()
+                json_candidate = OpenAIServing._strip_non_json_prefix(
+                    stripped_content, prefer_array=False
+                )
                 arguments = content
                 if OpenAIServing._looks_like_xml_tool_call(stripped_content):
                     parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
@@ -1326,11 +1352,13 @@ class OpenAIServing:
                 else:
                     # Normalize direct JSON object arguments when present.
                     try:
-                        parsed_obj = json.loads(stripped_content)
+                        parsed_obj = json.loads(json_candidate)
                         if isinstance(parsed_obj, dict):
                             arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                        else:
+                            arguments = json_candidate
                     except json.JSONDecodeError:
-                        pass
+                        arguments = json_candidate
             function_calls.append(
                 FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
@@ -1347,6 +1375,9 @@ class OpenAIServing:
                     arguments = ""
             else:
                 stripped_content = content.strip()
+                json_candidate = OpenAIServing._strip_non_json_prefix(
+                    stripped_content, prefer_array=False
+                )
                 arguments = content
                 if OpenAIServing._looks_like_xml_tool_call(stripped_content):
                     parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
@@ -1365,11 +1396,13 @@ class OpenAIServing:
                 else:
                     # Normalize direct JSON object arguments when present.
                     try:
-                        parsed_obj = json.loads(stripped_content)
+                        parsed_obj = json.loads(json_candidate)
                         if isinstance(parsed_obj, dict):
                             arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                        else:
+                            arguments = json_candidate
                     except json.JSONDecodeError:
-                        pass
+                        arguments = json_candidate
             function_calls.append(
                 FunctionCall(name=request.tool_choice.function.name, arguments=arguments)
             )
@@ -1385,9 +1418,12 @@ class OpenAIServing:
                     )
             else:
                 # Standard JSON format, with parser fallback for XML-like model outputs.
+                stripped_content = OpenAIServing._strip_non_json_prefix(
+                    content, prefer_array=True
+                )
                 try:
                     tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                        content
+                        stripped_content
                     )
                     function_calls.extend(
                         [
