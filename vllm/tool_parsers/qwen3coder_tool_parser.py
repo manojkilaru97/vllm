@@ -108,6 +108,14 @@ class Qwen3CoderToolParser(ToolParser):
         # Store accumulated parameters for type conversion
         self.accumulated_params = {}
         self.streaming_request = None
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool = []
+        self.tool_calls_emitted = False
+
+    def _emit_delta(self, delta: DeltaMessage | None) -> DeltaMessage | None:
+        if delta is not None and delta.tool_calls:
+            self.tool_calls_emitted = True
+        return delta
 
     def _get_arguments_config(
         self, func_name: str, tools: list[ChatCompletionToolsParam] | None
@@ -503,17 +511,19 @@ class Qwen3CoderToolParser(ToolParser):
                     self.streamed_args_for_tool.append("")
 
                     # Send header with function info
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_index,
-                                id=self.current_tool_id,
-                                function=DeltaFunctionCall(
-                                    name=self.current_function_name, arguments=""
-                                ),
-                                type="function",
-                            )
-                        ]
+                    return self._emit_delta(
+                        DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_index,
+                                    id=self.current_tool_id,
+                                    function=DeltaFunctionCall(
+                                        name=self.current_function_name, arguments=""
+                                    ),
+                                    type="function",
+                                )
+                            ]
+                        )
                     )
             return None
 
@@ -527,13 +537,15 @@ class Qwen3CoderToolParser(ToolParser):
             if not self.json_started:
                 self.json_started = True
                 self.streamed_args_for_tool[self.current_tool_index] += "{"
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(arguments="{"),
-                        )
-                    ]
+                return self._emit_delta(
+                    DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.current_tool_index,
+                                function=DeltaFunctionCall(arguments="{"),
+                            )
+                        ]
+                    )
                 )
 
             # Find all parameter start positions in current tool_text
@@ -639,13 +651,15 @@ class Qwen3CoderToolParser(ToolParser):
                         len(self.streamed_args_for_tool),
                     )
 
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(arguments=combined),
-                        )
-                    ]
+                return self._emit_delta(
+                    DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.current_tool_index,
+                                function=DeltaFunctionCall(arguments=combined),
+                            )
+                        ]
+                    )
                 )
 
             # Check for function end AFTER processing parameters.
@@ -705,6 +719,6 @@ class Qwen3CoderToolParser(ToolParser):
                 self.json_closed = True
                 self.accumulated_params = {}
 
-                return result
+                return self._emit_delta(result)
 
         return None

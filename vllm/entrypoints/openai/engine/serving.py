@@ -1145,6 +1145,70 @@ class OpenAIServing:
         return None
 
     @staticmethod
+    def _looks_like_xml_tool_call(text: str) -> bool:
+        """Best-effort detection for XML-style tool-call envelopes."""
+        markers = ("<tool_call>", "</tool_call>", "<function=", "<parameter=")
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _strip_non_json_prefix(content: str, prefer_array: bool = False) -> str:
+        """Best-effort removal of natural-language prefixes before JSON payload."""
+        stripped = content.lstrip()
+        if not stripped:
+            return stripped
+
+        if prefer_array:
+            idx = stripped.find("[")
+            if idx != -1:
+                return stripped[idx:]
+        else:
+            idx = stripped.find("{")
+            if idx != -1:
+                return stripped[idx:]
+
+        first_obj = stripped.find("{")
+        first_arr = stripped.find("[")
+        starts = [i for i in (first_obj, first_arr) if i != -1]
+        if not starts:
+            return stripped
+        return stripped[min(starts):]
+
+    @staticmethod
+    def _extract_tool_calls_with_parser(
+        request: ResponsesRequest | ChatCompletionRequest,
+        tokenizer: TokenizerLike | None,
+        tool_parser_cls: Callable[[TokenizerLike], ToolParser] | None,
+        content: str,
+    ) -> list[FunctionCall] | None:
+        """Try extracting tool calls via the configured parser as a fallback."""
+        if tool_parser_cls is None or tokenizer is None:
+            return None
+        if not isinstance(request, ChatCompletionRequest):
+            return None
+
+        try:
+            tool_parser = tool_parser_cls(tokenizer)
+            tool_call_info = tool_parser.extract_tool_calls(content, request=request)
+        except Exception:
+            return None
+
+        if not tool_call_info or not tool_call_info.tools_called:
+            return None
+
+        parsed_calls: list[FunctionCall] = []
+        for tool_call in tool_call_info.tool_calls:
+            function = tool_call.function
+            if function and function.name:
+                parsed_calls.append(
+                    FunctionCall(
+                        id=tool_call.id,
+                        name=function.name,
+                        arguments=function.arguments,
+                    )
+                )
+        return parsed_calls if parsed_calls else None
+
+    @staticmethod
     def _get_request_tool_name(tool: Any) -> str | None:
         function = getattr(tool, "function", None)
         if function is None and isinstance(tool, dict):
@@ -1421,13 +1485,40 @@ class OpenAIServing:
         function_calls = list[FunctionCall]()
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
+            target_name = request.tool_choice.name
             # Forced Function Call - handle Kimi K2 marker format
             if OpenAIServing._has_kimi_k2_markers(content):
                 arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
                 if arguments is None:
                     arguments = ""
             else:
+                stripped_content = content.strip()
+                json_candidate = OpenAIServing._strip_non_json_prefix(
+                    stripped_content, prefer_array=False
+                )
                 arguments = content
+                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                    )
+                    if parsed_calls:
+                        matched = next(
+                            (fc for fc in parsed_calls if fc.name == target_name),
+                            parsed_calls[0],
+                        )
+                        arguments = matched.arguments
+                else:
+                    try:
+                        parsed_obj = json.loads(json_candidate)
+                        if isinstance(parsed_obj, dict):
+                            arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                        else:
+                            arguments = json_candidate
+                    except json.JSONDecodeError:
+                        arguments = json_candidate
             function_calls.append(
                 FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
@@ -1436,13 +1527,40 @@ class OpenAIServing:
             request.tool_choice, ChatCompletionNamedToolChoiceParam
         ):
             assert content is not None
+            target_name = request.tool_choice.function.name
             # Forced Function Call - handle Kimi K2 marker format
             if OpenAIServing._has_kimi_k2_markers(content):
                 arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
                 if arguments is None:
                     arguments = ""
             else:
+                stripped_content = content.strip()
+                json_candidate = OpenAIServing._strip_non_json_prefix(
+                    stripped_content, prefer_array=False
+                )
                 arguments = content
+                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                    )
+                    if parsed_calls:
+                        matched = next(
+                            (fc for fc in parsed_calls if fc.name == target_name),
+                            parsed_calls[0],
+                        )
+                        arguments = matched.arguments
+                else:
+                    try:
+                        parsed_obj = json.loads(json_candidate)
+                        if isinstance(parsed_obj, dict):
+                            arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                        else:
+                            arguments = json_candidate
+                    except json.JSONDecodeError:
+                        arguments = json_candidate
             function_calls.append(
                 FunctionCall(name=request.tool_choice.function.name, arguments=arguments)
             )
@@ -1456,8 +1574,12 @@ class OpenAIServing:
                     function_calls.append(FunctionCall(name=func_name, arguments=args))
             else:
                 try:
-                    tool_calls = TypeAdapter(
-                        list[FunctionDefinition]).validate_json(content)
+                    stripped_content = OpenAIServing._strip_non_json_prefix(
+                        content, prefer_array=True
+                    )
+                    tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
+                        stripped_content
+                    )
                     function_calls.extend(
                         [
                             FunctionCall(
@@ -1469,12 +1591,17 @@ class OpenAIServing:
                         ]
                     )
                 except (ValidationError, JSONDecodeError, ValueError):
-                    recovered_calls = OpenAIServing._recover_required_tool_calls(
+                    recovered_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                    ) or OpenAIServing._recover_required_tool_calls(
                         request, content
                     )
                     if recovered_calls:
                         logger.warning(
-                            "Recovered %d required tool call(s) from malformed JSON output.",
+                            "Recovered %d required tool call(s) from malformed or non-JSON output.",
                             len(recovered_calls),
                         )
                         function_calls.extend(recovered_calls)
