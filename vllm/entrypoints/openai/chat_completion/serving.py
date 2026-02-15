@@ -1364,13 +1364,6 @@ class OpenAIServingChat(OpenAIServing):
                                                 tool_parser_cls=self.tool_parser,
                                             )
                                         except Exception:
-                                            logger.exception(
-                                                "named streaming: final parse failed "
-                                                "(rid=%s, fn=%s, len=%d)",
-                                                rid_hint,
-                                                tool_choice_function_name,
-                                                len(accumulated_text),
-                                            )
                                             parsed_calls = None
 
                                         matched_call = None
@@ -1392,15 +1385,6 @@ class OpenAIServingChat(OpenAIServing):
                                             try:
                                                 json.loads(extracted_args)
                                             except json.JSONDecodeError:
-                                                logger.warning(
-                                                    "named streaming: invalid JSON args at finish; "
-                                                    "emitting empty args (rid=%s, fn=%s, len=%d, "
-                                                    "finish_reason=%s)",
-                                                    rid_hint,
-                                                    tool_choice_function_name,
-                                                    len(extracted_args),
-                                                    output.finish_reason,
-                                                )
                                                 extracted_args = ""
                                         previous_args = named_tool_previous_args[i]
                                         if extracted_args.startswith(previous_args):
@@ -1427,17 +1411,6 @@ class OpenAIServingChat(OpenAIServing):
                                                         arguments=arguments_delta,
                                                     ),
                                                     index=i,
-                                                )
-                                                logger.info(
-                                                    "named streaming emit request_id=%s "
-                                                    "choice=%d tool=%s tool_call_id=%s "
-                                                    "args_delta_len=%d parsed=%s",
-                                                    rid_hint,
-                                                    i,
-                                                    tool_choice_function_name,
-                                                    emitted_tool_call_id,
-                                                    len(arguments_delta),
-                                                    bool(parsed_calls),
                                                 )
                                                 function_name_returned[i] = True
                                             delta_message = DeltaMessage(
@@ -1503,21 +1476,8 @@ class OpenAIServingChat(OpenAIServing):
                                         tool_parser_cls=self.tool_parser,
                                     )
                                 except Exception:
-                                    logger.exception(
-                                        "required streaming: final parse failed "
-                                        "(rid=%s, len=%d)",
-                                        rid_hint,
-                                        len(content),
-                                    )
                                     parsed_calls = None
 
-                                if parsed_calls:
-                                    logger.info(
-                                        "required streaming: parsed %d tool call(s) "
-                                        "at finish (rid=%s)",
-                                        len(parsed_calls),
-                                        rid_hint,
-                                    )
                                 delta_tool_calls: list[DeltaToolCall] = []
                                 for j, call in enumerate(parsed_calls or []):
                                     if not call.name:
@@ -1530,15 +1490,6 @@ class OpenAIServingChat(OpenAIServing):
                                             func_name=call.name,
                                             idx=history_tool_call_cnt + j,
                                         )
-                                    logger.info(
-                                        "required streaming emit request_id=%s choice=%d "
-                                        "tool=%s tool_call_id=%s args_len=%d",
-                                        rid_hint,
-                                        i,
-                                        call.name,
-                                        tool_call_id,
-                                        len(args),
-                                    )
                                     delta_tool_calls.append(
                                         DeltaToolCall(
                                             id=tool_call_id,
@@ -1631,44 +1582,6 @@ class OpenAIServingChat(OpenAIServing):
                                 request=request,
                             )
                             if delta_message and delta_message.tool_calls:
-                                logger.info(
-                                    "auto streaming parse request_id=%s choice=%d "
-                                    "stage=reasoning_end prev_len=%d curr_len=%d "
-                                    "delta_len=%d tool_calls=%d",
-                                    rid_hint,
-                                    i,
-                                    len(previous_text),
-                                    len(current_text),
-                                    len(delta_text),
-                                    len(delta_message.tool_calls),
-                                )
-                                for delta_tc in delta_message.tool_calls:
-                                    fn = delta_tc.function
-                                    if isinstance(fn, dict):
-                                        fn_name = fn.get("name")
-                                        fn_args = fn.get("arguments")
-                                    else:
-                                        fn_name = fn.name if fn else None
-                                        fn_args = fn.arguments if fn else None
-                                    args_len = len(fn_args) if isinstance(fn_args, str) else -1
-                                    args_tail = (
-                                        fn_args[-64:].replace("\n", "\\n")
-                                        if isinstance(fn_args, str)
-                                        else ""
-                                    )
-                                    logger.info(
-                                        "auto streaming delta request_id=%s choice=%d "
-                                        "stage=reasoning_end tc_index=%s tc_id=%s "
-                                        "tc_type=%s name=%s args_len=%d args_tail=%r",
-                                        rid_hint,
-                                        i,
-                                        delta_tc.index,
-                                        delta_tc.id,
-                                        delta_tc.type,
-                                        fn_name,
-                                        args_len,
-                                        args_tail,
-                                    )
                                 tools_streamed[i] = True
                     # when only tool calls
                     elif tool_choice_auto:
@@ -1683,44 +1596,6 @@ class OpenAIServingChat(OpenAIServing):
                             request=request,
                         )
                         if delta_message and delta_message.tool_calls:
-                            logger.info(
-                                "auto streaming parse request_id=%s choice=%d "
-                                "stage=auto prev_len=%d curr_len=%d "
-                                "delta_len=%d tool_calls=%d",
-                                rid_hint,
-                                i,
-                                len(previous_text),
-                                len(current_text),
-                                len(delta_text),
-                                len(delta_message.tool_calls),
-                            )
-                            for delta_tc in delta_message.tool_calls:
-                                fn = delta_tc.function
-                                if isinstance(fn, dict):
-                                    fn_name = fn.get("name")
-                                    fn_args = fn.get("arguments")
-                                else:
-                                    fn_name = fn.name if fn else None
-                                    fn_args = fn.arguments if fn else None
-                                args_len = len(fn_args) if isinstance(fn_args, str) else -1
-                                args_tail = (
-                                    fn_args[-64:].replace("\n", "\\n")
-                                    if isinstance(fn_args, str)
-                                    else ""
-                                )
-                                logger.info(
-                                    "auto streaming delta request_id=%s choice=%d "
-                                    "stage=auto tc_index=%s tc_id=%s tc_type=%s "
-                                    "name=%s args_len=%d args_tail=%r",
-                                    rid_hint,
-                                    i,
-                                    delta_tc.index,
-                                    delta_tc.id,
-                                    delta_tc.type,
-                                    fn_name,
-                                    args_len,
-                                    args_tail,
-                                )
                             tools_streamed[i] = True
 
                     # when only reasoning
@@ -1759,15 +1634,6 @@ class OpenAIServingChat(OpenAIServing):
                             )
                             if is_empty_boundary:
                                 dropped_empty += 1
-                                logger.info(
-                                    "auto streaming drop empty tool delta request_id=%s "
-                                    "choice=%d tc_index=%s tc_id=%s tc_type=%s",
-                                    rid_hint,
-                                    i,
-                                    delta_tc.index,
-                                    delta_tc.id,
-                                    delta_tc.type,
-                                )
                                 continue
 
                             if delta_tc.index is not None:
@@ -1777,16 +1643,6 @@ class OpenAIServingChat(OpenAIServing):
                                     dense_map[raw_idx] = tool_index_dense_next[i]
                                     tool_index_dense_next[i] += 1
                                 dense_idx = dense_map[raw_idx]
-                                if dense_idx != raw_idx:
-                                    logger.info(
-                                        "auto streaming remap tool index request_id=%s "
-                                        "choice=%d raw_index=%d dense_index=%d tc_id=%s",
-                                        rid_hint,
-                                        i,
-                                        raw_idx,
-                                        dense_idx,
-                                        delta_tc.id,
-                                    )
                                 delta_tc.index = dense_idx
                             kept_tool_calls.append(delta_tc)
 
@@ -2003,15 +1859,6 @@ class OpenAIServingChat(OpenAIServing):
                                     ),
                                     index=i,
                                 )
-                                logger.info(
-                                    "named finish emit request_id=%s choice=%d "
-                                    "tool=%s tool_call_id=%s args_len=%d",
-                                    rid_hint,
-                                    i,
-                                    tool_choice_function_name,
-                                    finish_tool_call_id,
-                                    len(finish_accumulated_text.strip()),
-                                )
                                 delta_message = DeltaMessage(tool_calls=[finish_tool_call])
                                 function_name_returned[i] = True
                                 tools_streamed[i] = True
@@ -2060,13 +1907,6 @@ class OpenAIServingChat(OpenAIServing):
                             and tool_parser
                             and tool_parser.__class__.__name__ == "Qwen3XMLToolParser"
                         ):
-                            logger.info(
-                                "auto streaming: skip remaining-args reconciliation "
-                                "for parser=%s request_id=%s choice=%d",
-                                tool_parser.__class__.__name__,
-                                rid_hint,
-                                i,
-                            )
                             should_check_unstreamed = False
 
                         if should_check_unstreamed:
@@ -2113,18 +1953,6 @@ class OpenAIServingChat(OpenAIServing):
                             else:
                                 remaining_call = ""
                                 prefix_ok = False
-                                logger.info(
-                                    "auto streaming remaining mismatch request_id=%s "
-                                    "choice=%d tool_index=%d expected_len=%d "
-                                    "actual_len=%d expected_tail=%r actual_tail=%r",
-                                    rid_hint,
-                                    i,
-                                    index,
-                                    len(expected_call),
-                                    len(actual_call),
-                                    expected_call[-80:],
-                                    actual_call[-80:],
-                                )
 
                             # CRITICAL: Check if name was sent for this tool. If not, include it!
                             # This handles the race condition in parallel tool calls where
@@ -2145,21 +1973,6 @@ class OpenAIServingChat(OpenAIServing):
 
                             should_emit_remaining = bool(
                                 remaining_call or tool_name or tool_id or tool_type
-                            )
-                            logger.info(
-                                "auto streaming remaining request_id=%s choice=%d "
-                                "tool_index=%d prefix_ok=%s expected_len=%d "
-                                "actual_len=%d remaining_len=%d emit=%s name=%s id=%s",
-                                rid_hint,
-                                i,
-                                index,
-                                prefix_ok,
-                                len(expected_call),
-                                len(actual_call),
-                                len(remaining_call),
-                                should_emit_remaining,
-                                tool_name,
-                                tool_id,
                             )
 
                             if should_emit_remaining:
@@ -2192,16 +2005,6 @@ class OpenAIServingChat(OpenAIServing):
                                 )
                                 if not name_was_sent and tool_info.get("name"):
                                     # This tool's name was never sent - send it now!
-                                    logger.info(
-                                        "auto streaming missed name emit request_id=%s "
-                                        "choice=%d tool_index=%d tool=%s id=%s args_len=%d",
-                                        rid_hint,
-                                        i,
-                                        tidx,
-                                        tool_info.get("name"),
-                                        tool_info.get("id"),
-                                        len(str(tool_info.get("arguments", ""))),
-                                    )
                                     missed_tool_delta = DeltaMessage(
                                         tool_calls=[
                                             DeltaToolCall(
@@ -2391,17 +2194,8 @@ class OpenAIServingChat(OpenAIServing):
                     reasoning_text = previous_reasoning_texts[i]
                     content_text = previous_content_texts[i]
                     tool_calls_list = previous_tool_calls[i]
-                    
-                    logger.debug(
-                        "Streaming complete for request %s, choice %d: reasoning_length=%d, content_length=%d, tool_calls=%d",
-                        request_id, i, len(reasoning_text), len(content_text), len(tool_calls_list)
-                    )
-                    
+
                     if reasoning_text:
-                        logger.debug(
-                            "Logging reasoning part for request %s: [reasoning] %s...",
-                            request_id, reasoning_text[:100]
-                        )
                         self.request_logger.log_outputs(
                             request_id=request_id,
                             outputs=f"[reasoning] {reasoning_text}",
@@ -2410,12 +2204,8 @@ class OpenAIServingChat(OpenAIServing):
                             is_streaming=True,
                             delta=False,
                         )
-                    
+
                     if content_text:
-                        logger.debug(
-                            "Logging content part for request %s: %s...",
-                            request_id, content_text[:100]
-                        )
                         self.request_logger.log_outputs(
                             request_id=request_id,
                             outputs=content_text,
@@ -2424,7 +2214,7 @@ class OpenAIServingChat(OpenAIServing):
                             is_streaming=True,
                             delta=False,
                         )
-                    
+
                     # Log tool calls if present (similar to non-streaming mode)
                     if tool_calls_list:
                         tool_call_descriptions = []
@@ -2436,10 +2226,6 @@ class OpenAIServingChat(OpenAIServing):
                         if tool_call_descriptions:
                             tool_calls_str = ", ".join(tool_call_descriptions)
                             tool_calls_output = f"[tool_calls: {tool_calls_str}]"
-                            logger.debug(
-                                "Logging tool calls for request %s: %s",
-                                request_id, tool_calls_output[:200]
-                            )
                             self.request_logger.log_outputs(
                                 request_id=request_id,
                                 outputs=tool_calls_output,
@@ -2448,17 +2234,13 @@ class OpenAIServingChat(OpenAIServing):
                                 is_streaming=True,
                                 delta=False,
                             )
-                    
+
                     # If neither reasoning nor content nor tool calls, log a fallback message
                     if not reasoning_text and not content_text and not tool_calls_list:
                         full_text = (
                             previous_texts[i]
                             if previous_texts and i < len(previous_texts)
                             else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
-                        )
-                        logger.debug(
-                            "No separate reasoning/content/tool_calls tracked, logging full text for request %s",
-                            request_id
                         )
                         self.request_logger.log_outputs(
                             request_id=request_id,

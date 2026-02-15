@@ -43,15 +43,6 @@ class StructuredOutputRequest:
             except TimeoutError:
                 return False
             except Exception as exc:
-                # Keep this visible in logs with request correlation.
-                from vllm.logger import init_logger
-                logger = init_logger(__name__)
-                logger.exception(
-                    "Structured output grammar future failed "
-                    "(request_id=%s, backend=%s)",
-                    self.request_id,
-                    self.params._backend,
-                )
                 self._grammar = None
                 self._grammar_error = exc
         return True

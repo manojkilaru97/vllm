@@ -1295,50 +1295,23 @@ class OpenAIServing:
     ) -> list[FunctionCall] | None:
         """Try extracting tool calls via configured parser as a fallback path."""
         if tool_parser_cls is None:
-            logger.info(
-                "tool_parse[%s]: parser fallback unavailable (no tool_parser_cls)",
-                log_context,
-            )
             return None
         if tokenizer is None:
-            logger.info(
-                "tool_parse[%s]: parser fallback unavailable (tokenizer=None)",
-                log_context,
-            )
             return None
         if not isinstance(request, ChatCompletionRequest):
-            logger.info(
-                "tool_parse[%s]: parser fallback unavailable "
-                "(request type=%s unsupported)",
-                log_context,
-                type(request).__name__,
-            )
             return None
 
         try:
             tool_parser = tool_parser_cls(tokenizer)
         except Exception:
-            logger.exception(
-                "tool_parse[%s]: failed to instantiate tool parser for fallback",
-                log_context,
-            )
             return None
 
         try:
             tool_call_info = tool_parser.extract_tool_calls(content, request=request)
         except Exception:
-            logger.exception(
-                "tool_parse[%s]: tool parser fallback extraction raised",
-                log_context,
-            )
             return None
 
         if not tool_call_info or not tool_call_info.tools_called:
-            logger.info(
-                "tool_parse[%s]: parser fallback found no tool calls (content_len=%d)",
-                log_context,
-                len(content),
-            )
             return None
 
         parsed_calls: list[FunctionCall] = []
@@ -1352,12 +1325,6 @@ class OpenAIServing:
                     )
                 )
 
-        logger.info(
-            "tool_parse[%s]: parser fallback extracted %d call(s): %s",
-            log_context,
-            len(parsed_calls),
-            [fc.name for fc in parsed_calls],
-        )
         return parsed_calls if parsed_calls else None
 
     @staticmethod
@@ -1369,32 +1336,14 @@ class OpenAIServing:
         content: str | None = None,
     ) -> tuple[list[FunctionCall] | None, str | None]:
         function_calls = list[FunctionCall]()
-        content_len = len(content) if content is not None else 0
-        logger.info(
-            "tool_parse: start tool_choice=%s content_len=%d enable_auto_tools=%s "
-            "parser_cls=%s",
-            getattr(request, "tool_choice", None),
-            content_len,
-            enable_auto_tools,
-            getattr(tool_parser_cls, "__name__", None),
-        )
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
             target_name = request.tool_choice.name
-            logger.info(
-                "tool_parse: branch=forced_function name=%s content_len=%d",
-                target_name,
-                len(content),
-            )
             # Forced Function Call - handle Kimi K2 marker format
             if OpenAIServing._has_kimi_k2_markers(content):
                 arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
                 if arguments is None:
                     arguments = ""
-                logger.info(
-                    "tool_parse: forced_function using kimi markers args_len=%d",
-                    len(arguments),
-                )
             else:
                 stripped_content = content.strip()
                 arguments = content
@@ -1412,28 +1361,14 @@ class OpenAIServing:
                             parsed_calls[0],
                         )
                         arguments = matched.arguments
-                        logger.info(
-                            "tool_parse: forced_function xml fallback selected name=%s "
-                            "args_len=%d",
-                            matched.name,
-                            len(arguments),
-                        )
                 else:
                     # Normalize direct JSON object arguments when present.
                     try:
                         parsed_obj = json.loads(stripped_content)
                         if isinstance(parsed_obj, dict):
                             arguments = json.dumps(parsed_obj, ensure_ascii=False)
-                            logger.info(
-                                "tool_parse: forced_function normalized JSON object "
-                                "args_len=%d",
-                                len(arguments),
-                            )
                     except json.JSONDecodeError:
-                        logger.info(
-                            "tool_parse: forced_function using raw content args_len=%d",
-                            len(arguments),
-                        )
+                        pass
             function_calls.append(
                 FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
@@ -1443,20 +1378,11 @@ class OpenAIServing:
         ):
             assert content is not None
             target_name = request.tool_choice.function.name
-            logger.info(
-                "tool_parse: branch=named_function name=%s content_len=%d",
-                target_name,
-                len(content),
-            )
             # Forced Function Call - handle Kimi K2 marker format
             if OpenAIServing._has_kimi_k2_markers(content):
                 arguments = OpenAIServing._extract_kimi_k2_single_arguments(content)
                 if arguments is None:
                     arguments = ""
-                logger.info(
-                    "tool_parse: named_function using kimi markers args_len=%d",
-                    len(arguments),
-                )
             else:
                 stripped_content = content.strip()
                 arguments = content
@@ -1474,38 +1400,20 @@ class OpenAIServing:
                             parsed_calls[0],
                         )
                         arguments = matched.arguments
-                        logger.info(
-                            "tool_parse: named_function xml fallback selected name=%s "
-                            "args_len=%d",
-                            matched.name,
-                            len(arguments),
-                        )
                 else:
                     # Normalize direct JSON object arguments when present.
                     try:
                         parsed_obj = json.loads(stripped_content)
                         if isinstance(parsed_obj, dict):
                             arguments = json.dumps(parsed_obj, ensure_ascii=False)
-                            logger.info(
-                                "tool_parse: named_function normalized JSON object "
-                                "args_len=%d",
-                                len(arguments),
-                            )
                     except json.JSONDecodeError:
-                        logger.info(
-                            "tool_parse: named_function using raw content args_len=%d",
-                            len(arguments),
-                        )
+                        pass
             function_calls.append(
                 FunctionCall(name=request.tool_choice.function.name, arguments=arguments)
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice == "required":
             assert content is not None
-            logger.info(
-                "tool_parse: branch=required content_len=%d",
-                len(content),
-            )
             # Handle Kimi K2 marker format for tool_choice=required
             if OpenAIServing._has_kimi_k2_markers(content):
                 extracted_calls = OpenAIServing._extract_kimi_k2_tool_calls(content)
@@ -1513,10 +1421,6 @@ class OpenAIServing:
                     function_calls.append(
                         FunctionCall(name=func_name, arguments=args)
                     )
-                logger.info(
-                    "tool_parse: required parsed %d call(s) from kimi markers",
-                    len(function_calls),
-                )
             else:
                 # Standard JSON format, with parser fallback for XML-like model outputs.
                 try:
@@ -1534,15 +1438,7 @@ class OpenAIServing:
                             for tool_call in tool_calls
                         ]
                     )
-                    logger.info(
-                        "tool_parse: required parsed %d call(s) from JSON",
-                        len(function_calls),
-                    )
-                except Exception as e:
-                    logger.info(
-                        "tool_parse: required JSON parse failed (%s); trying parser fallback",
-                        e,
-                    )
+                except Exception:
                     parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
                         request=request,
                         tokenizer=tokenizer,
@@ -1552,15 +1448,7 @@ class OpenAIServing:
                     )
                     if parsed_calls:
                         function_calls.extend(parsed_calls)
-                        logger.info(
-                            "tool_parse: required parser fallback succeeded "
-                            "with %d call(s)",
-                            len(parsed_calls),
-                        )
                     else:
-                        logger.info(
-                            "tool_parse: required parser fallback failed; re-raising JSON error"
-                        )
                         raise
             content = None  # Clear content since tool is called.
         elif (
@@ -1584,10 +1472,6 @@ class OpenAIServing:
                 request=request,  # type: ignore
             )
             if tool_call_info is not None and tool_call_info.tools_called:
-                logger.info(
-                    "tool_parse: auto extracted %d call(s)",
-                    len(tool_call_info.tool_calls),
-                )
                 # extract_tool_calls() returns a list of tool calls.
                 function_calls.extend(
                     FunctionCall(
@@ -1602,14 +1486,8 @@ class OpenAIServing:
                     content = None
             else:
                 # No tool calls.
-                logger.info("tool_parse: auto extracted no tool calls")
                 return None, content
 
-        logger.info(
-            "tool_parse: done extracted_calls=%d remaining_content_len=%d",
-            len(function_calls),
-            len(content) if content is not None else 0,
-        )
         return function_calls, content
 
     @staticmethod

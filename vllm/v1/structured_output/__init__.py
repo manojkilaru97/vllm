@@ -145,31 +145,11 @@ class StructuredOutputManager:
             else:
                 raise ValueError(f"Unsupported structured output backend: {backend}")
 
-        req_id = request.request_id
-        structured_req = request.structured_output_request
-        assert structured_req is not None
-        req_type, _ = structured_req.structured_output_key
-        logger.info(
-            "so_init request_id=%s backend=%s request_type=%s async_compile=%s "
-            "reasoner=%s enable_in_reasoning=%s",
-            req_id,
-            type(self.backend).__name__ if self.backend else None,
-            req_type.value,
-            self._use_async_grammar_compilation,
-            type(self.reasoner).__name__ if self.reasoner else None,
-            self.enable_in_reasoning,
-        )
-
         if self._use_async_grammar_compilation:
             grammar = self.executor.submit(self._create_grammar, request)
         else:
             grammar = self._create_grammar(request)  # type: ignore[assignment]
         request.structured_output_request.grammar = grammar  # type: ignore[assignment]
-        logger.info(
-            "so_init_done request_id=%s grammar_mode=%s",
-            req_id,
-            "future" if isinstance(grammar, Future) else "ready",
-        )
 
     def _create_grammar(self, request: "Request") -> StructuredOutputGrammar:
         key = request.structured_output_request.structured_output_key  # type: ignore[union-attr]
@@ -306,15 +286,6 @@ class StructuredOutputManager:
         # enable the bitmask filling.
         if self.reasoner is not None:
             if self.enable_in_reasoning:
-                structured_req = request.structured_output_request
-                if structured_req is not None:
-                    log_count = getattr(structured_req, "_so_gate_log_count", 0)
-                    if log_count < 2:
-                        logger.info(
-                            "so_gate request_id=%s apply_bitmask=True reason=enable_in_reasoning",
-                            request.request_id,
-                        )
-                        setattr(structured_req, "_so_gate_log_count", log_count + 1)
                 return True
             assert request.structured_output_request is not None
             if request.structured_output_request.reasoning_ended is None:
@@ -325,24 +296,7 @@ class StructuredOutputManager:
                 request.structured_output_request.reasoning_ended = (
                     self.reasoner.is_reasoning_end(request.prompt_token_ids or [])
                 )
-            apply_bitmask = bool(request.structured_output_request.reasoning_ended)
-            log_count = getattr(request.structured_output_request, "_so_gate_log_count", 0)
-            if log_count < 4:
-                logger.info(
-                    "so_gate request_id=%s apply_bitmask=%s reasoner=%s "
-                    "reasoning_ended=%s prompt_len=%d",
-                    request.request_id,
-                    apply_bitmask,
-                    type(self.reasoner).__name__,
-                    request.structured_output_request.reasoning_ended,
-                    len(request.prompt_token_ids or []),
-                )
-                setattr(
-                    request.structured_output_request,
-                    "_so_gate_log_count",
-                    log_count + 1,
-                )
-            return apply_bitmask
+            return bool(request.structured_output_request.reasoning_ended)
         return True
 
     def should_advance(self, request: "Request") -> bool:
@@ -384,12 +338,6 @@ class StructuredOutputManager:
             if advance_from is None:
                 advance_from = len(delta_token_ids)
             setattr(structured_req, "_so_advance_from", advance_from)
-            logger.info(
-                "so_reasoning_end request_id=%s delta_len=%d advance_from=%d",
-                request.request_id,
-                len(delta_token_ids),
-                advance_from,
-            )
             return advance_from < len(delta_token_ids)
 
         setattr(structured_req, "_so_advance_from", None)

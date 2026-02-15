@@ -1382,14 +1382,6 @@ class Scheduler(SchedulerInterface):
                         constrained_token_ids = []
                     elif isinstance(advance_from, int) and advance_from > 0:
                         constrained_token_ids = new_token_ids[advance_from:]
-                        logger.info(
-                            "so_advance_trim request_id=%s advance_from=%d "
-                            "raw_tokens=%d constrained_tokens=%d",
-                            req_id,
-                            advance_from,
-                            len(new_token_ids),
-                            len(constrained_token_ids),
-                        )
                     # reset one-step trim marker
                     setattr(struct_output_request, "_so_advance_from", 0)
 
@@ -1397,10 +1389,7 @@ class Scheduler(SchedulerInterface):
                     assert struct_output_request is not None
                     # Check if grammar is ready (handles async compilation race condition)
                     if not struct_output_request.is_grammar_ready:
-                        logger.debug(
-                            "Grammar not ready yet for request %s, skipping accept_tokens",
-                            req_id,
-                        )
+                        pass
                     elif struct_output_request.grammar is None:
                         logger.warning(
                             "Grammar is None for request %s despite "

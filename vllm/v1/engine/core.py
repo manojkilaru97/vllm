@@ -672,24 +672,6 @@ class EngineCore:
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
         if req.use_structured_output:
-            so_req = req.structured_output_request
-            so_backend = (
-                req.sampling_params.structured_outputs._backend
-                if req.sampling_params and req.sampling_params.structured_outputs
-                else None
-            )
-            so_key = (
-                so_req.structured_output_key[0].value if so_req is not None else None
-            )
-            logger.info(
-                "so_request_add request_id=%s status=%s backend=%s key=%s "
-                "reasoning_ended=%s",
-                req.request_id,
-                req.status,
-                so_backend,
-                so_key,
-                so_req.reasoning_ended if so_req is not None else None,
-            )
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For
             # `structured_output_manager`, each request is independent and
