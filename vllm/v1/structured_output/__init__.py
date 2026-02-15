@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import multiprocessing
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
@@ -145,11 +145,31 @@ class StructuredOutputManager:
             else:
                 raise ValueError(f"Unsupported structured output backend: {backend}")
 
+        req_id = request.request_id
+        structured_req = request.structured_output_request
+        assert structured_req is not None
+        req_type, _ = structured_req.structured_output_key
+        logger.info(
+            "so_init request_id=%s backend=%s request_type=%s async_compile=%s "
+            "reasoner=%s enable_in_reasoning=%s",
+            req_id,
+            type(self.backend).__name__ if self.backend else None,
+            req_type.value,
+            self._use_async_grammar_compilation,
+            type(self.reasoner).__name__ if self.reasoner else None,
+            self.enable_in_reasoning,
+        )
+
         if self._use_async_grammar_compilation:
             grammar = self.executor.submit(self._create_grammar, request)
         else:
             grammar = self._create_grammar(request)  # type: ignore[assignment]
         request.structured_output_request.grammar = grammar  # type: ignore[assignment]
+        logger.info(
+            "so_init_done request_id=%s grammar_mode=%s",
+            req_id,
+            "future" if isinstance(grammar, Future) else "ready",
+        )
 
     def _create_grammar(self, request: "Request") -> StructuredOutputGrammar:
         key = request.structured_output_request.structured_output_key  # type: ignore[union-attr]
@@ -286,6 +306,15 @@ class StructuredOutputManager:
         # enable the bitmask filling.
         if self.reasoner is not None:
             if self.enable_in_reasoning:
+                structured_req = request.structured_output_request
+                if structured_req is not None:
+                    log_count = getattr(structured_req, "_so_gate_log_count", 0)
+                    if log_count < 2:
+                        logger.info(
+                            "so_gate request_id=%s apply_bitmask=True reason=enable_in_reasoning",
+                            request.request_id,
+                        )
+                        setattr(structured_req, "_so_gate_log_count", log_count + 1)
                 return True
             assert request.structured_output_request is not None
             if request.structured_output_request.reasoning_ended is None:
@@ -296,7 +325,24 @@ class StructuredOutputManager:
                 request.structured_output_request.reasoning_ended = (
                     self.reasoner.is_reasoning_end(request.prompt_token_ids or [])
                 )
-            return request.structured_output_request.reasoning_ended
+            apply_bitmask = bool(request.structured_output_request.reasoning_ended)
+            log_count = getattr(request.structured_output_request, "_so_gate_log_count", 0)
+            if log_count < 4:
+                logger.info(
+                    "so_gate request_id=%s apply_bitmask=%s reasoner=%s "
+                    "reasoning_ended=%s prompt_len=%d",
+                    request.request_id,
+                    apply_bitmask,
+                    type(self.reasoner).__name__,
+                    request.structured_output_request.reasoning_ended,
+                    len(request.prompt_token_ids or []),
+                )
+                setattr(
+                    request.structured_output_request,
+                    "_so_gate_log_count",
+                    log_count + 1,
+                )
+            return apply_bitmask
         return True
 
     def should_advance(self, request: "Request") -> bool:
@@ -311,27 +357,82 @@ class StructuredOutputManager:
         # by default, we should always advance
         # for cases that don't use thinking mode.
         if self.reasoner is None:
+            if request.structured_output_request is not None:
+                setattr(request.structured_output_request, "_so_advance_from", 0)
             return True
 
         # if the model needs structured in reasoning, we should advance
         if self.enable_in_reasoning:
+            if request.structured_output_request is not None:
+                setattr(request.structured_output_request, "_so_advance_from", 0)
             return True
 
         structured_req = request.structured_output_request
         if structured_req.reasoning_ended:
+            setattr(structured_req, "_so_advance_from", 0)
             return True
 
         # Check if reasoning ends in *this* step
         delta_from = request.num_computed_tokens - request.num_output_placeholders
         all_token_ids = request.all_token_ids
-        if self.reasoner.is_reasoning_end_streaming(
-            all_token_ids, all_token_ids[delta_from:]
-        ):
-            # Reasoning just ended, so we shouldn't advance til
-            # next pass
+        delta_token_ids = all_token_ids[delta_from:]
+        if self.reasoner.is_reasoning_end_streaming(all_token_ids, delta_token_ids):
             structured_req.reasoning_ended = True
+            # stream_interval can return many tokens per step. If </think>
+            # appears mid-step, constrain the suffix tokens in this same step.
+            advance_from = self._find_reasoning_end_in_delta(request, delta_token_ids)
+            if advance_from is None:
+                advance_from = len(delta_token_ids)
+            setattr(structured_req, "_so_advance_from", advance_from)
+            logger.info(
+                "so_reasoning_end request_id=%s delta_len=%d advance_from=%d",
+                request.request_id,
+                len(delta_token_ids),
+                advance_from,
+            )
+            return advance_from < len(delta_token_ids)
 
+        setattr(structured_req, "_so_advance_from", None)
         return False
+
+    def _find_reasoning_end_in_delta(
+        self, request: "Request", delta_token_ids: Sequence[int]
+    ) -> int | None:
+        """Return the delta index immediately after a detected reasoning end marker.
+
+        If the marker cannot be localized in token ids, return None.
+        """
+        if self.reasoner is None or not delta_token_ids:
+            return None
+
+        all_token_ids = list(request.all_token_ids)
+        delta_len = len(delta_token_ids)
+        total_len = len(all_token_ids)
+        prefix_len = max(0, total_len - delta_len)
+        output_start = max(0, request.num_prompt_tokens)
+
+        end_token_ids = getattr(self.reasoner, "end_token_ids", None)
+        if isinstance(end_token_ids, Sequence) and end_token_ids:
+            try:
+                marker = [int(t) for t in end_token_ids]
+            except Exception:
+                marker = []
+
+            if marker:
+                marker_len = len(marker)
+                search_start = max(output_start, prefix_len - marker_len + 1, 0)
+                search_end = total_len - marker_len + 1
+                for i in range(search_start, max(search_start, search_end)):
+                    if all_token_ids[i : i + marker_len] == marker:
+                        return max(0, i + marker_len - prefix_len)
+
+        end_token_id = getattr(self.reasoner, "end_token_id", None)
+        if isinstance(end_token_id, int):
+            for i, tok in enumerate(delta_token_ids):
+                if tok == end_token_id:
+                    return i + 1
+
+        return None
 
     def clear_backend(self) -> None:
         if self.backend is not None:

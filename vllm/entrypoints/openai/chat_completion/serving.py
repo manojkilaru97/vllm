@@ -405,6 +405,25 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        # Streaming response
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
+        reasoning_parser: ReasoningParser | None = None
+        try:
+            if self.reasoning_parser_cls:
+                # Pass the same chat template kwargs as used in tokenization
+                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                    request.chat_template_kwargs,
+                    self.default_chat_template_kwargs,
+                )
+                reasoning_parser = self.reasoning_parser_cls(
+                    tokenizer,
+                    chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                )
+        except RuntimeError as e:
+            logger.exception("Error in reasoning parser creation.")
+            return self.create_error_response(str(e))
+
         result = await self.render_chat_request(request, raw_request)
         if isinstance(result, ErrorResponse):
             return result
@@ -965,6 +984,11 @@ class OpenAIServingChat(OpenAIServing):
         previous_reasoning_texts = [""] * num_choices
         previous_content_texts = [""] * num_choices
         previous_tool_calls: list[list[DeltaToolCall]] = [[] for _ in range(num_choices)]
+        # Some tool parsers can produce sparse/raw tool indices (e.g. 0,2,...)
+        # due to internal boundary bookkeeping. Normalize to dense indices before
+        # emitting streaming chunks.
+        tool_index_dense_maps: list[dict[int, int]] = [dict() for _ in range(num_choices)]
+        tool_index_dense_next: list[int] = [0] * num_choices
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -1324,30 +1348,103 @@ class OpenAIServingChat(OpenAIServing):
                                     else:
                                         delta_message = None
                                 else:
-                                    # Original behavior for non-Kimi models
-                                    if function_name_returned[i]:
-                                        delta_tool_call = DeltaToolCall(
-                                            function=DeltaFunctionCall(arguments=delta_text),
-                                            index=i,
-                                        )
+                                    # For named tool_choice, parse once at finish for all
+                                    # non-Kimi outputs. Incremental deltas are fragile and can
+                                    # yield malformed JSON arguments under larger stream intervals.
+                                    if output.finish_reason is None:
+                                        delta_message = None
                                     else:
-                                        delta_tool_call = DeltaToolCall(
-                                            id=make_tool_call_id(),
-                                            type="function",
-                                            function=DeltaFunctionCall(
-                                                name=tool_choice_function_name,
-                                                arguments=delta_text,
-                                            ),
-                                            index=i,
-                                        )
-                                        function_name_returned[i] = True
+                                        try:
+                                            parsed_calls, _ = self._parse_tool_calls_from_content(
+                                                request=request,
+                                                tokenizer=tokenizer,
+                                                content=accumulated_text,
+                                                enable_auto_tools=self.enable_auto_tools,
+                                                tool_parser_cls=self.tool_parser,
+                                            )
+                                        except Exception:
+                                            logger.exception(
+                                                "named streaming: final parse failed "
+                                                "(rid=%s, fn=%s, len=%d)",
+                                                rid_hint,
+                                                tool_choice_function_name,
+                                                len(accumulated_text),
+                                            )
+                                            parsed_calls = None
 
-                                    delta_message = DeltaMessage(
-                                        tool_calls=[
-                                            delta_tool_call,
-                                        ]
-                                    )
-                                    tools_streamed[i] = True
+                                        matched_call = None
+                                        if parsed_calls:
+                                            matched_call = next(
+                                                (
+                                                    fc
+                                                    for fc in parsed_calls
+                                                    if fc.name == tool_choice_function_name
+                                                ),
+                                                parsed_calls[0],
+                                            )
+                                        extracted_args = (
+                                            matched_call.arguments
+                                            if matched_call and matched_call.arguments is not None
+                                            else accumulated_text.strip()
+                                        )
+                                        if extracted_args:
+                                            try:
+                                                json.loads(extracted_args)
+                                            except json.JSONDecodeError:
+                                                logger.warning(
+                                                    "named streaming: invalid JSON args at finish; "
+                                                    "emitting empty args (rid=%s, fn=%s, len=%d, "
+                                                    "finish_reason=%s)",
+                                                    rid_hint,
+                                                    tool_choice_function_name,
+                                                    len(extracted_args),
+                                                    output.finish_reason,
+                                                )
+                                                extracted_args = ""
+                                        previous_args = named_tool_previous_args[i]
+                                        if extracted_args.startswith(previous_args):
+                                            arguments_delta = extracted_args[len(previous_args) :]
+                                        else:
+                                            arguments_delta = extracted_args
+                                        named_tool_previous_args[i] = extracted_args
+
+                                        if arguments_delta or not function_name_returned[i]:
+                                            if function_name_returned[i]:
+                                                delta_tool_call = DeltaToolCall(
+                                                    function=DeltaFunctionCall(
+                                                        arguments=arguments_delta
+                                                    ),
+                                                    index=i,
+                                                )
+                                            else:
+                                                emitted_tool_call_id = make_tool_call_id()
+                                                delta_tool_call = DeltaToolCall(
+                                                    id=emitted_tool_call_id,
+                                                    type="function",
+                                                    function=DeltaFunctionCall(
+                                                        name=tool_choice_function_name,
+                                                        arguments=arguments_delta,
+                                                    ),
+                                                    index=i,
+                                                )
+                                                logger.info(
+                                                    "named streaming emit request_id=%s "
+                                                    "choice=%d tool=%s tool_call_id=%s "
+                                                    "args_delta_len=%d parsed=%s",
+                                                    rid_hint,
+                                                    i,
+                                                    tool_choice_function_name,
+                                                    emitted_tool_call_id,
+                                                    len(arguments_delta),
+                                                    bool(parsed_calls),
+                                                )
+                                                function_name_returned[i] = True
+                                            delta_message = DeltaMessage(
+                                                tool_calls=[delta_tool_call]
+                                            )
+                                            tools_streamed[i] = True
+                                        else:
+                                            delta_message = None
 
                     elif request.tool_choice == "required":
                         assert previous_texts is not None
@@ -1395,89 +1492,63 @@ class OpenAIServingChat(OpenAIServing):
                             # between token boundaries.
                             if output.finish_reason is None:
                                 delta_message = None
-                            elif OpenAIServingChat._has_kimi_k2_markers(content):
-                                # Best-effort: only support single-call marker format.
-                                extracted_args = OpenAIServingChat._extract_kimi_k2_arguments(
-                                    content, partial_ok=False
-                                )
-                                if extracted_args is not None and extracted_args.strip():
-                                    func_name = None
-                                    import re as re_std
-
-                                    name_match = re_std.search(
-                                        r"<\|tool_call_begin\|>\s*(?:functions\.)?(\w+):\d+",
-                                        content,
-                                    )
-                                    if name_match:
-                                        func_name = name_match.group(1)
-                                    if func_name:
-                                        tool_call_id = make_tool_call_id(
-                                            id_type=self.tool_call_id_type,
-                                            func_name=func_name,
-                                            idx=history_tool_call_cnt,
-                                        )
-                                        delta_message = DeltaMessage(
-                                            tool_calls=[
-                                                DeltaToolCall(
-                                                    id=tool_call_id,
-                                                    type="function",
-                                                    function=DeltaFunctionCall(
-                                                        name=func_name,
-                                                        arguments=extracted_args,
-                                                    ),
-                                                    index=0,
-                                                )
-                                            ]
-                                        )
-                                        function_name_returned[i] = True
-                                    else:
-                                        delta_message = None
-                                else:
-                                    delta_message = None
                             else:
-                                # Standard JSON format (OpenAI-style array)
-                                tool_calls_obj = None
                                 try:
-                                    tool_calls_obj = json.loads(content)
-                                except json.JSONDecodeError:
-                                    try:
-                                        tool_calls_obj, _ = partial_json_loads(
-                                            content, Allow.ALL
-                                        )
-                                    except (
-                                        partial_json_parser.core.exceptions.MalformedJSON,
-                                        json.JSONDecodeError,
-                                    ):
-                                        tool_calls_obj = None
+                                    parsed_calls, _ = self._parse_tool_calls_from_content(
+                                        request=request,
+                                        tokenizer=tokenizer,
+                                        content=content,
+                                        enable_auto_tools=self.enable_auto_tools,
+                                        tool_parser_cls=self.tool_parser,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "required streaming: final parse failed "
+                                        "(rid=%s, len=%d)",
+                                        rid_hint,
+                                        len(content),
+                                    )
+                                    parsed_calls = None
 
+                                if parsed_calls:
+                                    logger.info(
+                                        "required streaming: parsed %d tool call(s) "
+                                        "at finish (rid=%s)",
+                                        len(parsed_calls),
+                                        rid_hint,
+                                    )
                                 delta_tool_calls: list[DeltaToolCall] = []
-                                if isinstance(tool_calls_obj, list):
-                                    for j, tc in enumerate(tool_calls_obj):
-                                        if not isinstance(tc, dict):
-                                            continue
-                                        name = tc.get("name")
-                                        params = tc.get("parameters")
-                                        if not isinstance(name, str):
-                                            continue
-                                        if params is None:
-                                            params = {}
-                                        args = json.dumps(params, ensure_ascii=False)
+                                for j, call in enumerate(parsed_calls or []):
+                                    if not call.name:
+                                        continue
+                                    args = call.arguments if call.arguments is not None else "{}"
+                                    tool_call_id = call.id
+                                    if tool_call_id is None:
                                         tool_call_id = make_tool_call_id(
                                             id_type=self.tool_call_id_type,
-                                            func_name=name,
+                                            func_name=call.name,
                                             idx=history_tool_call_cnt + j,
                                         )
-                                        delta_tool_calls.append(
-                                            DeltaToolCall(
-                                                id=tool_call_id,
-                                                type="function",
-                                                function=DeltaFunctionCall(
-                                                    name=name,
-                                                    arguments=args,
-                                                ),
-                                                index=j,
-                                            )
+                                    logger.info(
+                                        "required streaming emit request_id=%s choice=%d "
+                                        "tool=%s tool_call_id=%s args_len=%d",
+                                        rid_hint,
+                                        i,
+                                        call.name,
+                                        tool_call_id,
+                                        len(args),
+                                    )
+                                    delta_tool_calls.append(
+                                        DeltaToolCall(
+                                            id=tool_call_id,
+                                            type="function",
+                                            function=DeltaFunctionCall(
+                                                name=call.name,
+                                                arguments=args,
+                                            ),
+                                            index=j,
                                         )
+                                    )
 
                                 if delta_tool_calls:
                                     delta_message = DeltaMessage(tool_calls=delta_tool_calls)
@@ -1489,7 +1560,7 @@ class OpenAIServingChat(OpenAIServing):
                                 and delta_message.tool_calls
                                 and delta_message.tool_calls[0].id is not None
                             ):
-                                history_tool_call_cnt += 1
+                                history_tool_call_cnt += len(delta_message.tool_calls)
                                 tools_streamed[i] = True
 
                     # handle streaming deltas for tools with "auto" tool choice
@@ -1559,6 +1630,44 @@ class OpenAIServingChat(OpenAIServing):
                                 request=request,
                             )
                             if delta_message and delta_message.tool_calls:
+                                logger.info(
+                                    "auto streaming parse request_id=%s choice=%d "
+                                    "stage=reasoning_end prev_len=%d curr_len=%d "
+                                    "delta_len=%d tool_calls=%d",
+                                    rid_hint,
+                                    i,
+                                    len(previous_text),
+                                    len(current_text),
+                                    len(delta_text),
+                                    len(delta_message.tool_calls),
+                                )
+                                for delta_tc in delta_message.tool_calls:
+                                    fn = delta_tc.function
+                                    if isinstance(fn, dict):
+                                        fn_name = fn.get("name")
+                                        fn_args = fn.get("arguments")
+                                    else:
+                                        fn_name = fn.name if fn else None
+                                        fn_args = fn.arguments if fn else None
+                                    args_len = len(fn_args) if isinstance(fn_args, str) else -1
+                                    args_tail = (
+                                        fn_args[-64:].replace("\n", "\\n")
+                                        if isinstance(fn_args, str)
+                                        else ""
+                                    )
+                                    logger.info(
+                                        "auto streaming delta request_id=%s choice=%d "
+                                        "stage=reasoning_end tc_index=%s tc_id=%s "
+                                        "tc_type=%s name=%s args_len=%d args_tail=%r",
+                                        rid_hint,
+                                        i,
+                                        delta_tc.index,
+                                        delta_tc.id,
+                                        delta_tc.type,
+                                        fn_name,
+                                        args_len,
+                                        args_tail,
+                                    )
                                 tools_streamed[i] = True
                     # when only tool calls
                     elif tool_choice_auto:
@@ -1573,6 +1682,44 @@ class OpenAIServingChat(OpenAIServing):
                             request=request,
                         )
                         if delta_message and delta_message.tool_calls:
+                            logger.info(
+                                "auto streaming parse request_id=%s choice=%d "
+                                "stage=auto prev_len=%d curr_len=%d "
+                                "delta_len=%d tool_calls=%d",
+                                rid_hint,
+                                i,
+                                len(previous_text),
+                                len(current_text),
+                                len(delta_text),
+                                len(delta_message.tool_calls),
+                            )
+                            for delta_tc in delta_message.tool_calls:
+                                fn = delta_tc.function
+                                if isinstance(fn, dict):
+                                    fn_name = fn.get("name")
+                                    fn_args = fn.get("arguments")
+                                else:
+                                    fn_name = fn.name if fn else None
+                                    fn_args = fn.arguments if fn else None
+                                args_len = len(fn_args) if isinstance(fn_args, str) else -1
+                                args_tail = (
+                                    fn_args[-64:].replace("\n", "\\n")
+                                    if isinstance(fn_args, str)
+                                    else ""
+                                )
+                                logger.info(
+                                    "auto streaming delta request_id=%s choice=%d "
+                                    "stage=auto tc_index=%s tc_id=%s tc_type=%s "
+                                    "name=%s args_len=%d args_tail=%r",
+                                    rid_hint,
+                                    i,
+                                    delta_tc.index,
+                                    delta_tc.id,
+                                    delta_tc.type,
+                                    fn_name,
+                                    args_len,
+                                    args_tail,
+                                )
                             tools_streamed[i] = True
 
                     # when only reasoning
@@ -1590,8 +1737,72 @@ class OpenAIServingChat(OpenAIServing):
                         delta_message = DeltaMessage(content=delta_text)
 
                     # update the previous values for the next iteration
+                    # Some tool parsers may emit boundary/control deltas with no
+                    # function name and empty arguments. These should not be
+                    # surfaced to clients as standalone tool calls.
+                    if tool_choice_auto and delta_message and delta_message.tool_calls:
+                        kept_tool_calls: list[DeltaToolCall] = []
+                        dropped_empty = 0
+                        for delta_tc in delta_message.tool_calls:
+                            fn = delta_tc.function
+                            if isinstance(fn, dict):
+                                fn_name = fn.get("name")
+                                fn_args = fn.get("arguments")
+                            else:
+                                fn_name = fn.name if fn else None
+                                fn_args = fn.arguments if fn else None
+
+                            is_empty_boundary = (
+                                (fn_name is None or fn_name == "")
+                                and (fn_args is None or fn_args == "")
+                            )
+                            if is_empty_boundary:
+                                dropped_empty += 1
+                                logger.info(
+                                    "auto streaming drop empty tool delta request_id=%s "
+                                    "choice=%d tc_index=%s tc_id=%s tc_type=%s",
+                                    rid_hint,
+                                    i,
+                                    delta_tc.index,
+                                    delta_tc.id,
+                                    delta_tc.type,
+                                )
+                                continue
+
+                            if delta_tc.index is not None:
+                                raw_idx = delta_tc.index
+                                dense_map = tool_index_dense_maps[i]
+                                if raw_idx not in dense_map:
+                                    dense_map[raw_idx] = tool_index_dense_next[i]
+                                    tool_index_dense_next[i] += 1
+                                dense_idx = dense_map[raw_idx]
+                                if dense_idx != raw_idx:
+                                    logger.info(
+                                        "auto streaming remap tool index request_id=%s "
+                                        "choice=%d raw_index=%d dense_index=%d tc_id=%s",
+                                        rid_hint,
+                                        i,
+                                        raw_idx,
+                                        dense_idx,
+                                        delta_tc.id,
+                                    )
+                                delta_tc.index = dense_idx
+                            kept_tool_calls.append(delta_tc)
+
+                        if dropped_empty:
+                            delta_kwargs: dict[str, object] = {}
+                            if delta_message.content is not None:
+                                delta_kwargs["content"] = delta_message.content
+                            if delta_message.reasoning is not None:
+                                delta_kwargs["reasoning"] = delta_message.reasoning
+                            if kept_tool_calls:
+                                delta_kwargs["tool_calls"] = kept_tool_calls
+                            delta_message = (
+                                DeltaMessage(**delta_kwargs) if delta_kwargs else None
+                            )
+
                     if (
-                        tool_choice_auto or self.reasoning_parser or tool_choice_function_name
+                        tool_choice_auto or reasoning_parser or tool_choice_function_name
                     ) and not self.use_harmony:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
@@ -1781,14 +1992,24 @@ class OpenAIServingChat(OpenAIServing):
                             assert previous_texts is not None
                             finish_accumulated_text = previous_texts[i]
                             if finish_accumulated_text.strip():
+                                finish_tool_call_id = make_tool_call_id()
                                 finish_tool_call = DeltaToolCall(
-                                    id=make_tool_call_id(),
+                                    id=finish_tool_call_id,
                                     type="function",
                                     function=DeltaFunctionCall(
                                         name=tool_choice_function_name,
                                         arguments=finish_accumulated_text.strip(),
                                     ),
                                     index=i,
+                                )
+                                logger.info(
+                                    "named finish emit request_id=%s choice=%d "
+                                    "tool=%s tool_call_id=%s args_len=%d",
+                                    rid_hint,
+                                    i,
+                                    tool_choice_function_name,
+                                    finish_tool_call_id,
+                                    len(finish_accumulated_text.strip()),
                                 )
                                 delta_message = DeltaMessage(tool_calls=[finish_tool_call])
                                 function_name_returned[i] = True
@@ -1830,6 +2051,22 @@ class OpenAIServingChat(OpenAIServing):
                             and output.finish_reason is not None
                         ):
                             should_check_unstreamed = True
+                        # Qwen3 XML parser already streams its own argument
+                        # closure chunks; forcing "remaining" emission here can
+                        # inject duplicate trailing braces and id/name-less deltas.
+                        if (
+                            should_check_unstreamed
+                            and tool_parser
+                            and tool_parser.__class__.__name__ == "Qwen3XMLToolParser"
+                        ):
+                            logger.info(
+                                "auto streaming: skip remaining-args reconciliation "
+                                "for parser=%s request_id=%s choice=%d",
+                                tool_parser.__class__.__name__,
+                                rid_hint,
+                                i,
+                            )
+                            should_check_unstreamed = False
 
                         if should_check_unstreamed:
                             latest_delta_len = 0
@@ -1866,8 +2103,27 @@ class OpenAIServingChat(OpenAIServing):
                             if latest_delta_len > 0:
                                 actual_call = actual_call[:-latest_delta_len]
 
-                            # check to see if there's anything left to stream
-                            remaining_call = expected_call.replace(actual_call, "", 1)
+                            # check to see if there's anything left to stream.
+                            # Only stream a suffix if what we've already streamed
+                            # is a strict prefix of the expected arguments.
+                            if expected_call.startswith(actual_call):
+                                remaining_call = expected_call[len(actual_call) :]
+                                prefix_ok = True
+                            else:
+                                remaining_call = ""
+                                prefix_ok = False
+                                logger.info(
+                                    "auto streaming remaining mismatch request_id=%s "
+                                    "choice=%d tool_index=%d expected_len=%d "
+                                    "actual_len=%d expected_tail=%r actual_tail=%r",
+                                    rid_hint,
+                                    i,
+                                    index,
+                                    len(expected_call),
+                                    len(actual_call),
+                                    expected_call[-80:],
+                                    actual_call[-80:],
+                                )
 
                             # CRITICAL: Check if name was sent for this tool. If not, include it!
                             # This handles the race condition in parallel tool calls where
@@ -1886,20 +2142,40 @@ class OpenAIServingChat(OpenAIServing):
                                     tool_id = tool_info.get("id")
                                     tool_type = "function"
 
-                            # set that as a delta message
-                            delta_message = DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        index=index,
-                                        id=tool_id,
-                                        type=tool_type,
-                                        function=DeltaFunctionCall(
-                                            name=tool_name,
-                                            arguments=remaining_call
-                                        ).model_dump(exclude_none=True),
-                                    )
-                                ]
+                            should_emit_remaining = bool(
+                                remaining_call or tool_name or tool_id or tool_type
                             )
+                            logger.info(
+                                "auto streaming remaining request_id=%s choice=%d "
+                                "tool_index=%d prefix_ok=%s expected_len=%d "
+                                "actual_len=%d remaining_len=%d emit=%s name=%s id=%s",
+                                rid_hint,
+                                i,
+                                index,
+                                prefix_ok,
+                                len(expected_call),
+                                len(actual_call),
+                                len(remaining_call),
+                                should_emit_remaining,
+                                tool_name,
+                                tool_id,
+                            )
+
+                            if should_emit_remaining:
+                                # set that as a delta message
+                                delta_message = DeltaMessage(
+                                    tool_calls=[
+                                        DeltaToolCall(
+                                            index=index,
+                                            id=tool_id,
+                                            type=tool_type,
+                                            function=DeltaFunctionCall(
+                                                name=tool_name,
+                                                arguments=remaining_call
+                                            ).model_dump(exclude_none=True),
+                                        )
+                                    ]
+                                )
 
                         # CRITICAL: Before sending finish, check if any parallel tools
                         # didn't have their name sent during streaming. If so, send them now.
@@ -1915,6 +2191,16 @@ class OpenAIServingChat(OpenAIServing):
                                 )
                                 if not name_was_sent and tool_info.get("name"):
                                     # This tool's name was never sent - send it now!
+                                    logger.info(
+                                        "auto streaming missed name emit request_id=%s "
+                                        "choice=%d tool_index=%d tool=%s id=%s args_len=%d",
+                                        rid_hint,
+                                        i,
+                                        tidx,
+                                        tool_info.get("name"),
+                                        tool_info.get("id"),
+                                        len(str(tool_info.get("arguments", ""))),
+                                    )
                                     missed_tool_delta = DeltaMessage(
                                         tool_calls=[
                                             DeltaToolCall(

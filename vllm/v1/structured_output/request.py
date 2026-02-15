@@ -18,19 +18,21 @@ from vllm.v1.structured_output.backend_types import (
 @dataclasses.dataclass
 class StructuredOutputRequest:
     params: StructuredOutputsParams
+    request_id: str | None = None
     _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
     reasoning_ended: bool | None = None
 
     @staticmethod
     def from_sampling_params(
         sampling_params: SamplingParams | None,
+        request_id: str | None = None,
     ) -> "StructuredOutputRequest | None":
         if sampling_params is None:
             return None
         params = sampling_params.structured_outputs
         if not params or params.all_constraints_none():
             return None
-        return StructuredOutputRequest(params=params)
+        return StructuredOutputRequest(params=params, request_id=request_id)
 
     def _check_grammar_completion(self) -> bool:
         # NOTE: We have to lazy import to gate circular imports
@@ -43,6 +45,17 @@ class StructuredOutputRequest:
                 self.status = RequestStatus.WAITING
             except TimeoutError:
                 return False
+            except Exception:
+                # Keep this visible in logs with request correlation.
+                from vllm.logger import init_logger
+                logger = init_logger(__name__)
+                logger.exception(
+                    "Structured output grammar future failed "
+                    "(request_id=%s, backend=%s)",
+                    self.request_id,
+                    self.params._backend,
+                )
+                raise
         return True
 
     @property

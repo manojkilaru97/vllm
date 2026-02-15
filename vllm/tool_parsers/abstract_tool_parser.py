@@ -58,12 +58,30 @@ class ToolParser:
         Static method that used to adjust the request parameters.
         """
         if not request.tools:
+            logger.info("tool_adjust: no tools present; skipping structured outputs")
             return request
+        logger.info(
+            "tool_adjust: tool_choice=%s tools=%d existing_structured_outputs=%s",
+            request.tool_choice,
+            len(request.tools),
+            request.structured_outputs is not None,
+        )
         json_schema_from_tool = get_json_schema_from_tools(
             tool_choice=request.tool_choice, tools=request.tools
         )
         # Set structured output params for tool calling
         if json_schema_from_tool is not None:
+            schema_kind = (
+                "array"
+                if isinstance(json_schema_from_tool, dict)
+                and json_schema_from_tool.get("type") == "array"
+                else "object"
+            )
+            logger.info(
+                "tool_adjust: applying structured outputs from tools "
+                "(schema_kind=%s)",
+                schema_kind,
+            )
             if isinstance(request, ChatCompletionRequest):
                 # tool_choice: "Forced Function" or "required" will override
                 # structured output json settings to make tool calling work correctly
@@ -80,6 +98,11 @@ class ToolParser:
                     description="Response format for tool calling",
                     strict=True,
                 )
+        else:
+            logger.info(
+                "tool_adjust: no schema applied for tool_choice=%s",
+                request.tool_choice,
+            )
 
         return request
 
