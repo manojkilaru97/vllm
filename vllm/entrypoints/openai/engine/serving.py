@@ -123,6 +123,7 @@ from vllm.utils import random_uuid
 from vllm.utils.async_utils import (
     collect_from_async_generator,
     merge_async_iterators,
+    tokenizer_lock,
 )
 
 
@@ -455,7 +456,8 @@ class OpenAIServing:
                 tokens = beam.tokens[tokenized_length:-1]
             else:
                 tokens = beam.tokens[tokenized_length:]
-            beam.text = tokenizer.decode(tokens)
+            with tokenizer_lock(tokenizer):
+                beam.text = tokenizer.decode(tokens)
 
         yield RequestOutput(
             request_id=request_id,
@@ -1628,7 +1630,8 @@ class OpenAIServing:
                 "Unable to get tokenizer because `skip_tokenizer_init=True`"
             )
 
-        return tokenizer.decode([token_id])
+        with tokenizer_lock(tokenizer):
+            return tokenizer.decode([token_id])
 
     def _is_model_supported(self, model_name: str | None) -> bool:
         if not model_name:

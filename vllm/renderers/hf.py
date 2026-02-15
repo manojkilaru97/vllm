@@ -30,6 +30,7 @@ from vllm.tokenizers import cached_get_tokenizer
 from vllm.tokenizers.hf import CachedHfTokenizer, HfTokenizer
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
 from vllm.transformers_utils.processor import cached_get_processor
+from vllm.utils.async_utils import tokenizer_lock
 from vllm.utils.func_utils import supports_kw
 
 from .inputs import DictPrompt
@@ -449,33 +450,34 @@ def safe_apply_chat_template(
     tokenize: bool = True,
     **kwargs,
 ) -> str | list[int]:
-    chat_template = resolve_chat_template(
-        tokenizer,
-        chat_template=chat_template,
-        tools=tools,
-        model_config=model_config,
-    )
-    if chat_template is None:
-        raise ChatTemplateResolutionError(
-            "As of transformers v4.44, default chat template is no longer "
-            "allowed, so you must provide a chat template if the tokenizer "
-            "does not define one."
-        )
-
-    resolved_kwargs = resolve_chat_template_kwargs(
-        tokenizer=tokenizer,
-        chat_template=chat_template,
-        chat_template_kwargs=kwargs,
-    )
-
     try:
-        return tokenizer.apply_chat_template(
-            conversation=conversation,  # type: ignore[arg-type]
-            tools=tools,  # type: ignore[arg-type]
-            chat_template=chat_template,
-            tokenize=tokenize,
-            **resolved_kwargs,
-        )
+        with tokenizer_lock(tokenizer):
+            chat_template = resolve_chat_template(
+                tokenizer,
+                chat_template=chat_template,
+                tools=tools,
+                model_config=model_config,
+            )
+            if chat_template is None:
+                raise ChatTemplateResolutionError(
+                    "As of transformers v4.44, default chat template is no longer "
+                    "allowed, so you must provide a chat template if the tokenizer "
+                    "does not define one."
+                )
+
+            resolved_kwargs = resolve_chat_template_kwargs(
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                chat_template_kwargs=kwargs,
+            )
+
+            return tokenizer.apply_chat_template(
+                conversation=conversation,  # type: ignore[arg-type]
+                tools=tools,  # type: ignore[arg-type]
+                chat_template=chat_template,
+                tokenize=tokenize,
+                **resolved_kwargs,
+            )
     # External library exceptions can sometimes occur despite the framework's
     # internal exception management capabilities.
     except Exception as e:

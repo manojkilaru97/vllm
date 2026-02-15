@@ -90,6 +90,7 @@ from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.tool_parsers.utils import partial_json_loads
 from vllm.request_context import reset_request_id, set_request_id
+from vllm.utils.async_utils import tokenizer_lock
 from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
@@ -3035,7 +3036,8 @@ class OpenAIServingChat(OpenAIServing):
                             "Unable to get tokenizer because `skip_tokenizer_init=True`"
                         )
 
-                    token = tokenizer.decode(token_id)
+                    with tokenizer_lock(tokenizer):
+                        token = tokenizer.decode(token_id)
 
                 logprobs_content.append(
                     ChatCompletionLogProbsContent(

@@ -12,6 +12,7 @@ from vllm.entrypoints.chat_utils import (
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_get_tokenizer
 from vllm.tokenizers.grok2 import Grok2Tokenizer
+from vllm.utils.async_utils import tokenizer_lock
 
 from .inputs import DictPrompt
 from .inputs.preprocess import parse_dec_only_prompt
@@ -70,11 +71,12 @@ class Grok2Renderer(BaseRenderer):
             content_format="string",
         )
 
-        prompt_raw = tokenizer.apply_chat_template(
-            conversation=conversation,
-            messages=messages,
-            **params.get_apply_chat_template_kwargs(),
-        )
+        with tokenizer_lock(tokenizer):
+            prompt_raw = tokenizer.apply_chat_template(
+                conversation=conversation,
+                messages=messages,
+                **params.get_apply_chat_template_kwargs(),
+            )
 
         prompt = parse_dec_only_prompt(prompt_raw)
         if mm_data is not None:
@@ -96,11 +98,12 @@ class Grok2Renderer(BaseRenderer):
             content_format="string",
         )
 
-        prompt_raw = tokenizer.apply_chat_template(
-            conversation=conversation,
-            messages=messages,
-            **params.get_apply_chat_template_kwargs(),
-        )
+        with tokenizer_lock(tokenizer):
+            prompt_raw = tokenizer.apply_chat_template(
+                conversation=conversation,
+                messages=messages,
+                **params.get_apply_chat_template_kwargs(),
+            )
 
         prompt = parse_dec_only_prompt(prompt_raw)
         if mm_data is not None:

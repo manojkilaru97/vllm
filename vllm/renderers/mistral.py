@@ -13,7 +13,7 @@ from vllm.entrypoints.chat_utils import (
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_get_tokenizer
 from vllm.tokenizers.mistral import MistralTokenizer
-from vllm.utils.async_utils import make_async
+from vllm.utils.async_utils import make_async, tokenizer_lock
 
 from .inputs import DictPrompt
 from .inputs.preprocess import parse_dec_only_prompt
@@ -31,7 +31,8 @@ def safe_apply_chat_template(
     from mistral_common.exceptions import MistralCommonException
 
     try:
-        return tokenizer.apply_chat_template(messages, **kwargs)
+        with tokenizer_lock(tokenizer):
+            return tokenizer.apply_chat_template(messages, **kwargs)
     # mistral-common uses assert statements to stop processing of input
     # if input does not comply with the expected format.
     # We convert those assertion errors to ValueErrors so they can be

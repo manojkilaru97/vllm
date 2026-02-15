@@ -561,12 +561,41 @@ class Scheduler(SchedulerInterface):
                 # for FSM compilation.
                 if request.status == RequestStatus.WAITING_FOR_FSM:
                     structured_output_req = request.structured_output_request
-                    if structured_output_req and structured_output_req.grammar:
+                    if structured_output_req is None:
                         request.status = RequestStatus.WAITING
                     else:
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
-                        continue
+                        try:
+                            grammar_error = structured_output_req.grammar_error
+                            grammar = structured_output_req.grammar
+                        except Exception:
+                            logger.exception(
+                                "Structured output grammar compilation failed; "
+                                "finishing request (request_id=%s)",
+                                request_id,
+                            )
+                            self.finish_requests(
+                                request_id, RequestStatus.FINISHED_ERROR
+                            )
+                            continue
+
+                        if grammar_error is not None:
+                            logger.error(
+                                "Structured output grammar compilation failed for "
+                                "request_id=%s: %s",
+                                request_id,
+                                grammar_error,
+                            )
+                            self.finish_requests(
+                                request_id, RequestStatus.FINISHED_ERROR
+                            )
+                            continue
+
+                        if grammar is not None:
+                            request.status = RequestStatus.WAITING
+                        else:
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.prepend_request(request)
+                            continue
 
                 # Streaming: skip request if still waiting for next streaming req.
                 if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
