@@ -108,6 +108,50 @@ class Qwen3CoderToolParser(ToolParser):
         # Store accumulated parameters for type conversion
         self.accumulated_params = {}
         self.streaming_request = None
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool = []
+        self.tool_calls_emitted = False
+
+    def _ensure_stream_tracking(self, tool_index: int) -> None:
+        while len(self.prev_tool_call_arr) <= tool_index:
+            self.prev_tool_call_arr.append({"name": "", "arguments": "{}"})
+        while len(self.streamed_args_for_tool) <= tool_index:
+            self.streamed_args_for_tool.append("")
+
+    def _record_streamed_args(self, tool_index: int, args_fragment: str) -> None:
+        if not args_fragment:
+            return
+        self._ensure_stream_tracking(tool_index)
+        self.streamed_args_for_tool[tool_index] += args_fragment
+
+    def _emit_tool_delta(self, delta: DeltaMessage | None) -> DeltaMessage | None:
+        sanitized = self._sanitize_streaming_delta(delta)
+        if sanitized is not None and sanitized.tool_calls:
+            self.tool_calls_emitted = True
+        return sanitized
+
+    @staticmethod
+    def _sanitize_streaming_delta(delta: DeltaMessage | None) -> DeltaMessage | None:
+        if delta is None or not delta.tool_calls:
+            return delta
+
+        filtered_tool_calls: list[DeltaToolCall] = []
+        for tool_call in delta.tool_calls:
+            fn = tool_call.function
+            if fn is not None and fn.name in (None, "") and fn.arguments in (None, ""):
+                continue
+            filtered_tool_calls.append(tool_call)
+
+        if len(filtered_tool_calls) == len(delta.tool_calls):
+            return delta
+
+        if not filtered_tool_calls and delta.content is None:
+            return None
+
+        return DeltaMessage(
+            content=delta.content,
+            tool_calls=filtered_tool_calls if filtered_tool_calls else None,
+        )
 
     def _get_arguments_config(
         self, func_name: str, tools: list[ChatCompletionToolsParam] | None
@@ -313,6 +357,7 @@ class Qwen3CoderToolParser(ToolParser):
 
             # Populate prev_tool_call_arr for serving layer to set finish_reason
             self.prev_tool_call_arr.clear()  # Clear previous calls
+            self.streamed_args_for_tool = []
             for tool_call in tool_calls:
                 if tool_call:
                     self.prev_tool_call_arr.append(
@@ -321,6 +366,7 @@ class Qwen3CoderToolParser(ToolParser):
                             "arguments": tool_call.function.arguments,
                         }
                     )
+                    self.streamed_args_for_tool.append(tool_call.function.arguments)
 
             # Extract content before tool calls
             content_index = model_output.find(self.tool_call_start_token)
@@ -384,25 +430,26 @@ class Qwen3CoderToolParser(ToolParser):
         # Update accumulated text
         self.accumulated_text = current_text
 
-        # Check if we need to advance to next tool
-        if self.json_closed and not self.in_function:
-            # Check if this tool call has ended
+        # Check if we need to advance to next tool. A single stream window may
+        # contain the end of one tool and the start of the next, so keep
+        # advancing until we are aligned with the current in-progress tool.
+        while self.json_closed and not self.in_function:
             tool_ends = current_text.count(self.tool_call_end_token)
-            if tool_ends > self.current_tool_index:
-                # This tool has ended, advance to next
-                self.current_tool_index += 1
-                self.header_sent = False
-                self.param_count = 0
-                self.json_started = False
-                self.json_closed = False
-                self.accumulated_params = {}
+            if tool_ends <= self.current_tool_index:
+                break
 
-                # Check if there are more tool calls
-                tool_starts = current_text.count(self.tool_call_start_token)
-                if self.current_tool_index >= tool_starts:
-                    # No more tool calls
-                    self.is_tool_call_started = False
-                # Continue processing next tool
+            # This tool has ended, advance to next.
+            self.current_tool_index += 1
+            self.header_sent = False
+            self.param_count = 0
+            self.json_started = False
+            self.json_closed = False
+            self.accumulated_params = {}
+
+            tool_starts = current_text.count(self.tool_call_start_token)
+            if self.current_tool_index >= tool_starts:
+                # No more tool calls to process from the current text.
+                self.is_tool_call_started = False
                 return None
 
         # Handle normal content before tool calls
@@ -482,66 +529,94 @@ class Qwen3CoderToolParser(ToolParser):
                     # IMPORTANT: Add to prev_tool_call_arr immediately when
                     # we detect a tool call. This ensures
                     # finish_reason="tool_calls" even if parsing isn't complete
-                    already_added = any(
-                        tool.get("name") == self.current_function_name
-                        for tool in self.prev_tool_call_arr
+                    self._ensure_stream_tracking(self.current_tool_index)
+                    self.prev_tool_call_arr[self.current_tool_index]["name"] = (
+                        self.current_function_name
                     )
-                    if not already_added:
-                        self.prev_tool_call_arr.append(
-                            {
-                                "name": self.current_function_name,
-                                "arguments": "{}",  # Placeholder, will be updated later
-                            }
+                    self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+                        "{}"
+                    )
+
+                    # If the complete function call is already in the current
+                    # stream window, emit arguments immediately with the header.
+                    if self.function_end_token in tool_text:
+                        full_arguments = "{}"
+                        func_content_end = tool_text.find(
+                            self.function_end_token, func_start
+                        )
+                        if func_content_end != -1:
+                            func_content = tool_text[func_start:func_content_end]
+                            try:
+                                parsed_tool = self._parse_xml_function_call(
+                                    func_content,
+                                    self.streaming_request.tools
+                                    if self.streaming_request
+                                    else None,
+                                )
+                                if parsed_tool:
+                                    self.prev_tool_call_arr[self.current_tool_index][
+                                        "name"
+                                    ] = parsed_tool.function.name
+                                    self.prev_tool_call_arr[self.current_tool_index][
+                                        "arguments"
+                                    ] = parsed_tool.function.arguments
+                                    full_arguments = parsed_tool.function.arguments
+                            except Exception:
+                                pass
+
+                        self._record_streamed_args(
+                            self.current_tool_index, full_arguments
+                        )
+                        self.in_function = False
+                        self.json_closed = True
+                        self.accumulated_params = {}
+
+                        return self._emit_tool_delta(
+                            DeltaMessage(
+                                tool_calls=[
+                                    DeltaToolCall(
+                                        index=self.current_tool_index,
+                                        id=self.current_tool_id,
+                                        function=DeltaFunctionCall(
+                                            name=self.current_function_name,
+                                            arguments=full_arguments,
+                                        ),
+                                        type="function",
+                                    )
+                                ]
+                            )
                         )
 
                     # Send header with function info
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_index,
-                                id=self.current_tool_id,
-                                function=DeltaFunctionCall(
-                                    name=self.current_function_name, arguments=""
-                                ),
-                                type="function",
-                            )
-                        ]
+                    return self._emit_tool_delta(
+                        DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_index,
+                                    id=self.current_tool_id,
+                                    function=DeltaFunctionCall(
+                                        name=self.current_function_name, arguments=""
+                                    ),
+                                    type="function",
+                                )
+                            ]
+                        )
                     )
             return None
 
         # We've sent header, now handle function body
         if self.in_function:
-            # Send opening brace if not sent yet
-            if not self.json_started and self.parameter_prefix not in delta_text:
-                self.json_started = True
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(arguments="{"),
-                        )
-                    ]
-                )
-
-            # Make sure json_started is set if we're processing parameters
-            if not self.json_started:
-                self.json_started = True
-
-            # Check for function end in accumulated text
+            # If the full function body is already available in accumulated text,
+            # emit whatever JSON suffix is still missing in one go. This avoids
+            # losing arguments when </function> arrives in the same stream window.
             if not self.json_closed and self.function_end_token in tool_text:
-                # Close JSON
-                self.json_closed = True
-
-                # Extract complete tool call to update
-                # prev_tool_call_arr with final arguments
-                # Find the function content
+                parsed_tool = None
                 func_start = tool_text.find(self.tool_call_prefix) + len(
                     self.tool_call_prefix
                 )
                 func_content_end = tool_text.find(self.function_end_token, func_start)
                 if func_content_end != -1:
                     func_content = tool_text[func_start:func_content_end]
-                    # Parse to get the complete arguments
                     try:
                         parsed_tool = self._parse_xml_function_call(
                             func_content,
@@ -549,32 +624,60 @@ class Qwen3CoderToolParser(ToolParser):
                             if self.streaming_request
                             else None,
                         )
-                        if parsed_tool:
-                            # Update existing entry in
-                            # prev_tool_call_arr with complete args
-                            for i, tool in enumerate(self.prev_tool_call_arr):
-                                if tool.get("name") == parsed_tool.function.name:
-                                    args = parsed_tool.function.arguments
-                                    self.prev_tool_call_arr[i]["arguments"] = args
-                                    break
                     except Exception:
-                        pass  # Ignore parsing errors during streaming
+                        parsed_tool = None
 
-                result = DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(arguments="}"),
-                        )
-                    ]
-                )
+                remaining_args = "}"
+                if parsed_tool:
+                    self._ensure_stream_tracking(self.current_tool_index)
+                    self.prev_tool_call_arr[self.current_tool_index]["name"] = (
+                        parsed_tool.function.name
+                    )
+                    self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+                        parsed_tool.function.arguments
+                    )
 
-                # Reset state for next tool
+                    expected_args = parsed_tool.function.arguments
+                    actual_args = self.streamed_args_for_tool[self.current_tool_index]
+                    if expected_args.startswith(actual_args):
+                        remaining_args = expected_args[len(actual_args) :]
+                    else:
+                        # If state drifted, resend full arguments for this tool.
+                        self.streamed_args_for_tool[self.current_tool_index] = ""
+                        remaining_args = expected_args
+
                 self.in_function = False
                 self.json_closed = True
                 self.accumulated_params = {}
 
-                return result
+                if remaining_args:
+                    self._record_streamed_args(self.current_tool_index, remaining_args)
+                    return self._emit_tool_delta(
+                        DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_index,
+                                    function=DeltaFunctionCall(arguments=remaining_args),
+                                )
+                            ]
+                        )
+                    )
+                return None
+
+            # Send opening brace before streaming any parameter body.
+            if not self.json_started:
+                self.json_started = True
+                self._record_streamed_args(self.current_tool_index, "{")
+                return self._emit_tool_delta(
+                    DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.current_tool_index,
+                                function=DeltaFunctionCall(arguments="{"),
+                            )
+                        ]
+                    )
+                )
 
             # Look for parameters
             # Find all parameter starts
@@ -675,14 +778,21 @@ class Qwen3CoderToolParser(ToolParser):
                             )
 
                         self.param_count += 1
+                        self._record_streamed_args(
+                            self.current_tool_index, json_fragment
+                        )
 
-                        return DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_index,
-                                    function=DeltaFunctionCall(arguments=json_fragment),
-                                )
-                            ]
+                        return self._emit_tool_delta(
+                            DeltaMessage(
+                                tool_calls=[
+                                    DeltaToolCall(
+                                        index=self.current_tool_index,
+                                        function=DeltaFunctionCall(
+                                            arguments=json_fragment
+                                        ),
+                                    )
+                                ]
+                            )
                         )
 
             # Continue parameter value - Not used in the current implementation
@@ -731,15 +841,18 @@ class Qwen3CoderToolParser(ToolParser):
                     self.current_param_value = ""
 
                     # Just close the current parameter string
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_index,
-                                function=DeltaFunctionCall(
-                                    arguments='"'
-                                ),  # Close the string quote
-                            )
-                        ]
+                    self._record_streamed_args(self.current_tool_index, '"')
+                    return self._emit_tool_delta(
+                        DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_index,
+                                    function=DeltaFunctionCall(
+                                        arguments='"'
+                                    ),  # Close the string quote
+                                )
+                            ]
+                        )
                     )
                 else:
                     # Continue accumulating value
@@ -769,15 +882,20 @@ class Qwen3CoderToolParser(ToolParser):
                         delta_escaped = full_escaped[len(prev_escaped) :]
 
                         if delta_escaped:
-                            return DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        index=self.current_tool_index,
-                                        function=DeltaFunctionCall(
-                                            arguments=delta_escaped
-                                        ),
-                                    )
-                                ]
+                            self._record_streamed_args(
+                                self.current_tool_index, delta_escaped
+                            )
+                            return self._emit_tool_delta(
+                                DeltaMessage(
+                                    tool_calls=[
+                                        DeltaToolCall(
+                                            index=self.current_tool_index,
+                                            function=DeltaFunctionCall(
+                                                arguments=delta_escaped
+                                            ),
+                                        )
+                                    ]
+                                )
                             )
 
         return None
