@@ -259,8 +259,22 @@ class DeltaMessage(OpenAIBaseModel):
     role: str | None = None
     content: str | None = None
     reasoning: str | None = None
+    reasoning_content: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def sync_reasoning_fields(self):
+        if self.reasoning is None and self.reasoning_content is not None:
+            self.reasoning = self.reasoning_content
+        elif self.reasoning is not None and self.reasoning_content is None:
+            self.reasoning_content = self.reasoning
+        elif (
+            self.reasoning is not None
+            and self.reasoning_content is not None
+            and self.reasoning != self.reasoning_content
+        ):
+            self.reasoning_content = self.reasoning
+        return self
 
 ####### Tokens IN <> Tokens OUT #######
 class GenerateRequest(BaseModel):
