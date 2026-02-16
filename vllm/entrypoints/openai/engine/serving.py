@@ -921,6 +921,77 @@ class OpenAIServing:
         return None
 
     @staticmethod
+    def _looks_like_xml_tool_call(text: str) -> bool:
+        """Best-effort detection for XML-style tool-call envelopes."""
+        markers = ("<tool_call>", "</tool_call>", "<function=", "<parameter=")
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _strip_non_json_prefix(content: str, prefer_array: bool = False) -> str:
+        """Best-effort removal of natural-language prefixes before JSON payload."""
+        stripped = content.lstrip()
+        if not stripped:
+            return stripped
+
+        if prefer_array:
+            idx = stripped.find("[")
+            if idx != -1:
+                return stripped[idx:]
+        else:
+            idx = stripped.find("{")
+            if idx != -1:
+                return stripped[idx:]
+
+        first_obj = stripped.find("{")
+        first_arr = stripped.find("[")
+        starts = [i for i in (first_obj, first_arr) if i != -1]
+        if not starts:
+            return stripped
+        return stripped[min(starts):]
+
+    @staticmethod
+    def _extract_tool_calls_with_parser(
+        request: ResponsesRequest | ChatCompletionRequest,
+        tokenizer: TokenizerLike | None,
+        tool_parser_cls: Callable[[TokenizerLike], ToolParser] | None,
+        content: str,
+        log_context: str,
+    ) -> list[FunctionCall] | None:
+        """Try extracting tool calls via configured parser as a fallback path."""
+        if tool_parser_cls is None:
+            return None
+        if tokenizer is None:
+            return None
+        if not isinstance(request, ChatCompletionRequest):
+            return None
+
+        try:
+            tool_parser = tool_parser_cls(tokenizer)
+        except Exception:
+            return None
+
+        try:
+            tool_call_info = tool_parser.extract_tool_calls(content, request=request)
+        except Exception:
+            return None
+
+        if not tool_call_info or not tool_call_info.tools_called:
+            return None
+
+        parsed_calls: list[FunctionCall] = []
+        for tool_call in tool_call_info.tool_calls:
+            if tool_call.function and tool_call.function.name:
+                parsed_calls.append(
+                    FunctionCall(
+                        id=tool_call.id,
+                        name=tool_call.function.name,
+                        arguments=tool_call.function.arguments,
+                    )
+                )
+
+        return parsed_calls if parsed_calls else None
+    
+    @staticmethod
     def _parse_tool_calls_from_content(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
@@ -937,7 +1008,41 @@ class OpenAIServing:
                 if arguments is None:
                     arguments = ""
             else:
+                stripped_content = content.strip()
+                json_candidate = OpenAIServing._strip_non_json_prefix(
+                    stripped_content, prefer_array=False
+                )
                 arguments = content
+                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                        log_context=(
+                            f"forced_function:{request.tool_choice.name}"
+                        ),
+                    )
+                    if parsed_calls:
+                        matched = next(
+                            (
+                                fc
+                                for fc in parsed_calls
+                                if fc.name == request.tool_choice.name
+                            ),
+                            parsed_calls[0],
+                        )
+                        arguments = matched.arguments
+                else:
+                    # Normalize direct JSON object arguments when present.
+                    try:
+                        parsed_obj = json.loads(json_candidate)
+                        if isinstance(parsed_obj, dict):
+                            arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                        else:
+                            arguments = json_candidate
+                    except json.JSONDecodeError:
+                        arguments = json_candidate
             function_calls.append(
                 FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
@@ -952,7 +1057,41 @@ class OpenAIServing:
                 if arguments is None:
                     arguments = ""
             else:
+                stripped_content = content.strip()
+                json_candidate = OpenAIServing._strip_non_json_prefix(
+                    stripped_content, prefer_array=False
+                )
                 arguments = content
+                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                        log_context=(
+                            f"named_function:{request.tool_choice.function.name}"
+                        ),
+                    )
+                    if parsed_calls:
+                        matched = next(
+                            (
+                                fc
+                                for fc in parsed_calls
+                                if fc.name == request.tool_choice.function.name
+                            ),
+                            parsed_calls[0],
+                        )
+                        arguments = matched.arguments
+                else:
+                    # Normalize direct JSON object arguments when present.
+                    try:
+                        parsed_obj = json.loads(json_candidate)
+                        if isinstance(parsed_obj, dict):
+                            arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                        else:
+                            arguments = json_candidate
+                    except json.JSONDecodeError:
+                        arguments = json_candidate
             function_calls.append(
                 FunctionCall(name=request.tool_choice.function.name, arguments=arguments)
             )
@@ -965,11 +1104,27 @@ class OpenAIServing:
                 for func_name, args in extracted_calls:
                     function_calls.append(FunctionCall(name=func_name, arguments=args))
             else:
-                tool_calls = []
-                with contextlib.suppress(ValidationError):
+                # Standard JSON format, with parser fallback for XML-like model outputs.
+                stripped_content = OpenAIServing._strip_non_json_prefix(
+                    content, prefer_array=True
+                )
+                try:
                     tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                        content
+                        stripped_content
                     )
+                except Exception:
+                    parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
+                        request=request,
+                        tokenizer=tokenizer,
+                        tool_parser_cls=tool_parser_cls,
+                        content=content,
+                        log_context="required",
+                    )
+                    if parsed_calls:
+                        function_calls.extend(parsed_calls)
+                        content = None
+                        return function_calls, content
+                    raise
                 for tool_call in tool_calls:
                     function_calls.append(
                         FunctionCall(

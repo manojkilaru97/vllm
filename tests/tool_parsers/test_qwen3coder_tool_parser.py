@@ -153,6 +153,31 @@ def stream_delta_message_generator(
         read_offset = new_read_offset
 
 
+def stream_delta_message_generator_from_chunks(
+    qwen3_tool_parser,
+    chunks: list[str],
+    request: ChatCompletionRequest | None = None,
+) -> Generator[DeltaMessage, None, None]:
+    previous_text = ""
+    current_text = ""
+    previous_token_ids: list[int] = []
+    current_token_ids: list[int] = []
+    for chunk in chunks:
+        current_text += chunk
+        delta_message = qwen3_tool_parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            previous_token_ids,
+            current_token_ids,
+            [],
+            request=request,
+        )
+        if delta_message:
+            yield delta_message
+        previous_text = current_text
+
+
 def test_extract_tool_calls_no_tools(qwen3_tool_parser_parametrized):
     model_output = "This is a test response without any tool calls"
     extracted_tool_calls = qwen3_tool_parser_parametrized.extract_tool_calls(
@@ -856,6 +881,95 @@ TX
     parsed_args = json.loads(full_args)
     assert parsed_args["city"] == "Dallas"
     assert parsed_args["state"] == "TX"
+
+
+def test_qwen3coder_streaming_tracks_streamed_args(
+    qwen3_tool_parser, qwen3_tokenizer, sample_tools
+):
+    """Qwen3Coder parser must track streamed args for serving fallback logic."""
+    model_output = """<tool_call>
+<function=get_current_weather>
+<parameter=city>
+Dallas
+</parameter>
+<parameter=state>
+TX
+</parameter>
+</function>
+</tool_call>"""
+
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=sample_tools)
+
+    for _ in stream_delta_message_generator(
+        qwen3_tool_parser, qwen3_tokenizer, model_output, request
+    ):
+        pass
+
+    assert len(qwen3_tool_parser.prev_tool_call_arr) == 1
+    assert len(qwen3_tool_parser.streamed_args_for_tool) == 1
+    assert (
+        json.loads(qwen3_tool_parser.streamed_args_for_tool[0])
+        == {"city": "Dallas", "state": "TX"}
+    )
+
+
+def test_qwen3coder_streaming_multi_tool_chunk_alignment(
+    qwen3_tool_parser, sample_tools
+):
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=sample_tools)
+    chunks = [
+        """<tool_call>
+<function=get_current_weather>
+<parameter=city>
+Dallas
+</parameter>
+<parameter=state>
+TX
+</parameter>
+</function>
+</tool_call>""",
+        """<tool_call>
+<function=calculate_area>
+<parameter=shape>
+circle
+</parameter>
+<parameter=precision>
+2
+</parameter>
+</function>
+</tool_call>""",
+    ]
+
+    assembled: dict[int, dict[str, str | None]] = {}
+    for delta in stream_delta_message_generator_from_chunks(
+        qwen3_tool_parser, chunks, request
+    ):
+        if not delta.tool_calls:
+            continue
+        for tool_call in delta.tool_calls:
+            idx = tool_call.index if tool_call.index is not None else 0
+            if idx not in assembled:
+                assembled[idx] = {"name": None, "arguments": ""}
+            fn = tool_call.function
+            if fn and fn.name:
+                assembled[idx]["name"] = fn.name
+            if fn and isinstance(fn.arguments, str):
+                assembled[idx]["arguments"] += fn.arguments
+
+    assert len(assembled) == 2
+    assert assembled[0]["name"] == "get_current_weather"
+    assert assembled[1]["name"] == "calculate_area"
+    assert json.loads(assembled[0]["arguments"]) == {"city": "Dallas", "state": "TX"}
+    assert json.loads(assembled[1]["arguments"]) == {"shape": "circle", "precision": 2}
+    assert len(qwen3_tool_parser.streamed_args_for_tool) == 2
+    assert json.loads(qwen3_tool_parser.streamed_args_for_tool[0]) == {
+        "city": "Dallas",
+        "state": "TX",
+    }
+    assert json.loads(qwen3_tool_parser.streamed_args_for_tool[1]) == {
+        "shape": "circle",
+        "precision": 2,
+    }
 
 
 def test_extract_tool_calls_complex_type_with_single_quote(
