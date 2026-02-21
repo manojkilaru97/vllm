@@ -192,6 +192,149 @@ class OpenAIServingChat(OpenAIServing):
             )
         )
 
+    def _compute_newline_token_ids(
+        self,
+        tokenizer: TokenizerLike,
+        strings: list[str] | None = None,
+    ) -> list[int]:
+        cached = getattr(tokenizer, "_vllm_newline_token_ids", None)
+        if isinstance(cached, list):
+            return cached
+
+        if strings is None:
+            strings = ["\n", "\r\n", "\n\n"]
+
+        newline_ids: set[int] = set()
+
+        for s in strings:
+            try:
+                encoded = tokenizer.encode(s, add_special_tokens=False)
+            except TypeError:
+                encoded = tokenizer.encode(s)  # type: ignore[call-arg]
+            except Exception:
+                continue
+            for token_id in encoded:
+                try:
+                    newline_ids.add(int(token_id))
+                except Exception:
+                    continue
+
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if isinstance(vocab_size, int) and 0 < vocab_size <= 300000:
+            for token_id in range(vocab_size):
+                try:
+                    token_text = tokenizer.decode([token_id])
+                except Exception:
+                    continue
+                if any(token_text.endswith(s) for s in strings):
+                    newline_ids.add(token_id)
+
+        ids_list = sorted(newline_ids)
+        setattr(tokenizer, "_vllm_newline_token_ids", ids_list)
+        return ids_list
+
+    def _inject_think_end_token_id(
+        self,
+        sampling_params: SamplingParams,
+        request: ChatCompletionRequest,
+        tokenizer: TokenizerLike,
+        reasoning_parser: ReasoningParser | None,
+    ) -> None:
+        if reasoning_parser is None:
+            return
+
+        chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+            request.chat_template_kwargs,
+            self.default_chat_template_kwargs,
+        )
+        reasoning_budget = chat_template_kwargs.get("reasoning_budget")
+        if reasoning_budget is None:
+            return
+
+        try:
+            budget_int = int(reasoning_budget)
+        except Exception:
+            logger.warning("Invalid reasoning_budget=%r; skipping", reasoning_budget)
+            return
+
+        if budget_int == -1:
+            return
+
+        if sampling_params.extra_args is None:
+            sampling_params.extra_args = {}
+        extra = sampling_params.extra_args
+
+        extra.setdefault("reasoning_budget", budget_int)
+
+        grace = chat_template_kwargs.get("reasoning_budget_grace_period", 0)
+        try:
+            grace_int = int(grace)
+        except Exception:
+            grace_int = 0
+        extra.setdefault("reasoning_budget_grace_period", grace_int)
+
+        if "enable_thinking" in chat_template_kwargs:
+            extra.setdefault("enable_thinking", chat_template_kwargs["enable_thinking"])
+
+        end_token_ids = getattr(reasoning_parser, "end_token_ids", None)
+        parsed_end_token_ids: list[int] = []
+        if isinstance(end_token_ids, list):
+            try:
+                parsed_end_token_ids = [int(tid) for tid in end_token_ids]
+            except Exception:
+                parsed_end_token_ids = []
+
+        if not parsed_end_token_ids:
+            end_token_id = getattr(reasoning_parser, "end_token_id", None)
+            if end_token_id is not None:
+                try:
+                    parsed_end_token_ids = [int(end_token_id)]
+                except Exception:
+                    parsed_end_token_ids = []
+
+        if not parsed_end_token_ids:
+            end_token = getattr(reasoning_parser, "end_token", None)
+            if isinstance(end_token, str) and end_token:
+                try:
+                    parsed_end_token_ids = [
+                        int(tid)
+                        for tid in tokenizer.encode(end_token, add_special_tokens=False)
+                    ]
+                except TypeError:
+                    try:
+                        parsed_end_token_ids = [
+                            int(tid) for tid in tokenizer.encode(end_token)
+                        ]
+                    except Exception:
+                        parsed_end_token_ids = []
+                except Exception:
+                    parsed_end_token_ids = []
+                if not parsed_end_token_ids:
+                    vocab = getattr(tokenizer, "get_vocab", lambda: {})()
+                    token_id = vocab.get(end_token)
+                    if token_id is not None:
+                        try:
+                            parsed_end_token_ids = [int(token_id)]
+                        except Exception:
+                            parsed_end_token_ids = []
+
+        if not parsed_end_token_ids:
+            logger.warning(
+                "Could not determine end-of-think token ids for reasoning budget"
+            )
+            return
+
+        extra.setdefault("think_end_token_id", parsed_end_token_ids[0])
+        extra.setdefault("end_token_ids", parsed_end_token_ids)
+
+        if "newline_token_ids" not in extra:
+            try:
+                newline_ids = self._compute_newline_token_ids(tokenizer)
+            except Exception:
+                newline_ids = []
+            if newline_ids:
+                extra["newline_token_ids"] = newline_ids
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -384,6 +527,12 @@ class OpenAIServingChat(OpenAIServing):
                 sampling_params = request.to_sampling_params(
                     max_tokens,
                     self.default_sampling_params,
+                )
+                self._inject_think_end_token_id(
+                    sampling_params=sampling_params,
+                    request=request,
+                    tokenizer=tokenizer,
+                    reasoning_parser=reasoning_parser,
                 )
 
             self._log_inputs(
