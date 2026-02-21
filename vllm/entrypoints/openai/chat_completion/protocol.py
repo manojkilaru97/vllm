@@ -195,6 +195,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | None
     ) = "none"
     reasoning_effort: Literal["low", "medium", "high"] | None = None
+    reasoning_budget: Annotated[int, Field(ge=-1, le=_LONG_INFO.max)] | None = Field(
+        default=None,
+        description=(
+            "Reasoning token budget. Set to -1 to disable budget enforcement."
+        ),
+    )
+    reasoning_budget_grace_period: Annotated[int, Field(ge=0, le=_LONG_INFO.max)] | None = Field(
+        default=None,
+        description=(
+            "Extra token allowance after the budget is reached before forcing "
+            "reasoning termination."
+        ),
+    )
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 

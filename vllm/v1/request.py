@@ -82,7 +82,8 @@ class Request:
         self.pooling_params = pooling_params
         self.lora_request = lora_request
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
-            sampling_params
+            sampling_params,
+            request_id=request_id,
         )
         if self.structured_output_request is not None:
             self.structured_output_request.reasoning_ended = reasoning_ended
