@@ -1101,6 +1101,29 @@ class OpenAIServing:
             return None
 
     @staticmethod
+    def _strip_non_json_prefix(content: str, prefer_array: bool = False) -> str:
+        """Best-effort removal of natural-language prefixes before JSON payload."""
+        stripped = content.lstrip()
+        if not stripped:
+            return stripped
+
+        if prefer_array:
+            idx = stripped.find("[")
+            if idx != -1:
+                return stripped[idx:]
+        else:
+            idx = stripped.find("{")
+            if idx != -1:
+                return stripped[idx:]
+
+        first_obj = stripped.find("{")
+        first_arr = stripped.find("[")
+        starts = [i for i in (first_obj, first_arr) if i != -1]
+        if not starts:
+            return stripped
+        return stripped[min(starts):]
+
+    @staticmethod
     def _parse_tool_calls_from_content(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
@@ -1112,8 +1135,20 @@ class OpenAIServing:
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
             # Forced Function Call
+            stripped_content = OpenAIServing._strip_non_json_prefix(
+                content.strip(), prefer_array=False
+            )
+            arguments = content
+            try:
+                parsed_obj = json.loads(stripped_content)
+                if isinstance(parsed_obj, dict):
+                    arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                else:
+                    arguments = stripped_content
+            except json.JSONDecodeError:
+                arguments = stripped_content
             function_calls.append(
-                FunctionCall(name=request.tool_choice.name, arguments=content)
+                FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice and isinstance(
@@ -1121,24 +1156,42 @@ class OpenAIServing:
         ):
             assert content is not None
             # Forced Function Call
+            stripped_content = OpenAIServing._strip_non_json_prefix(
+                content.strip(), prefer_array=False
+            )
+            arguments = content
+            try:
+                parsed_obj = json.loads(stripped_content)
+                if isinstance(parsed_obj, dict):
+                    arguments = json.dumps(parsed_obj, ensure_ascii=False)
+                else:
+                    arguments = stripped_content
+            except json.JSONDecodeError:
+                arguments = stripped_content
             function_calls.append(
-                FunctionCall(name=request.tool_choice.function.name, arguments=content)
+                FunctionCall(
+                    name=request.tool_choice.function.name,
+                    arguments=arguments,
+                )
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice == "required":
-            tool_calls = []
-            with contextlib.suppress(ValidationError):
-                content = content or ""
-                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                    content
-                )
-            for tool_call in tool_calls:
-                function_calls.append(
+            assert content is not None
+            stripped_content = OpenAIServing._strip_non_json_prefix(
+                content, prefer_array=True
+            )
+            tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
+                stripped_content
+            )
+            function_calls.extend(
+                [
                     FunctionCall(
                         name=tool_call.name,
                         arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
                     )
-                )
+                    for tool_call in tool_calls
+                ]
+            )
             content = None  # Clear content since tool is called.
         elif (
             tool_parser_cls

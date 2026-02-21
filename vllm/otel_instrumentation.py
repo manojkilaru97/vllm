@@ -640,8 +640,10 @@ def init_otel(resource_attributes: Optional[dict] = None
             logger.warning("Failed to initialize OTEL logs: %s", e)
             logging_handler = None
     else:
-        # Default to stdout handler if OTEL logs endpoint is not set
-        logging_handler = logging.StreamHandler(sys.stdout)
+        # Do not attach a fallback stdout handler. vLLM already has its
+        # standard logger configured; adding another stream handler duplicates
+        # every log line and inflates downstream log ingestion costs.
+        logging_handler = None
 
     # Traces
     traces_endpoint = os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
@@ -820,6 +822,5 @@ def start_prom_to_otel_bridge(scrape_url: str, interval_seconds: float = 10.0) -
 
     _PROM_BRIDGE_THREAD = threading.Thread(target=_run, name="vllm-prom-bridge", daemon=True)
     _PROM_BRIDGE_THREAD.start()
-
 
 

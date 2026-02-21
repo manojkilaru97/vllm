@@ -577,6 +577,54 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                # Skip request if the structured output request is still waiting
+                # for FSM compilation.
+                if request.status == RequestStatus.WAITING_FOR_FSM:
+                    structured_output_req = request.structured_output_request
+                    if structured_output_req is None:
+                        request.status = RequestStatus.WAITING
+                    else:
+                        request_id = request.request_id
+                        try:
+                            grammar_error = structured_output_req.grammar_error
+                            grammar = structured_output_req.grammar
+                        except Exception:
+                            logger.exception(
+                                "Structured output grammar compilation failed; "
+                                "finishing request (request_id=%s)",
+                                request_id,
+                            )
+                            self.finish_requests(
+                                request_id, RequestStatus.FINISHED_ERROR
+                            )
+                            continue
+
+                        if grammar_error is not None:
+                            logger.error(
+                                "Structured output grammar compilation failed for "
+                                "request_id=%s: %s",
+                                request_id,
+                                grammar_error,
+                            )
+                            self.finish_requests(
+                                request_id, RequestStatus.FINISHED_ERROR
+                            )
+                            continue
+
+                        if grammar is not None:
+                            request.status = RequestStatus.WAITING
+                        else:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+
+                # Streaming: skip request if still waiting for next streaming req.
+                if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    assert not request.streaming_queue
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # Check that adding the request still respects the max_loras
                 # constraint.
                 if (
@@ -1405,15 +1453,28 @@ class Scheduler(SchedulerInterface):
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
-                assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                ok = struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
-                if not ok:
+                grammar = (
+                    None
+                    if struct_output_request is None
+                    else struct_output_request.grammar
+                )
+                # Do not crash the engine if grammar failed to initialize.
+                # Fallback to unconstrained decoding for this request.
+                if grammar is None:
                     logger.warning(
-                        "Unexpected: grammar rejected tokens %s for request %s.",
-                        new_token_ids,
+                        "Structured outputs grammar missing for request %s; "
+                        "disabling structured outputs for this request.",
                         req_id,
                     )
+                    request.structured_output_request = None
+                else:
+                    ok = grammar.accept_tokens(req_id, new_token_ids)
+                    if not ok:
+                        logger.warning(
+                            "Unexpected: grammar rejected tokens %s for request %s.",
+                            new_token_ids,
+                            req_id,
+                        )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]

@@ -106,7 +106,8 @@ class OpenAIServingChat(OpenAIServing):
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
-        enable_log_deltas: bool = True,
+        enable_log_deltas: bool = False,
+        log_error_stack: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
@@ -239,7 +240,17 @@ class OpenAIServingChat(OpenAIServing):
             request.chat_template_kwargs,
             self.default_chat_template_kwargs,
         )
-        reasoning_budget = chat_template_kwargs.get("reasoning_budget")
+        parser_chat_template_kwargs = dict(chat_template_kwargs)
+
+        # Reasoning budget is a request-level knob. Keep backwards
+        # compatibility with older clients that sent it via chat_template_kwargs.
+        request_reasoning_budget = getattr(request, "reasoning_budget", None)
+        reasoning_budget = request_reasoning_budget
+        if reasoning_budget is None:
+            reasoning_budget = chat_template_kwargs.get("reasoning_budget")
+
+        if request_reasoning_budget is not None:
+            parser_chat_template_kwargs["reasoning_budget"] = request_reasoning_budget
         if reasoning_budget is None:
             return
 
@@ -252,21 +263,29 @@ class OpenAIServingChat(OpenAIServing):
         if budget_int == -1:
             return
 
+        request_grace = getattr(request, "reasoning_budget_grace_period", None)
+        grace = request_grace
+        if grace is None:
+            grace = chat_template_kwargs.get("reasoning_budget_grace_period", 0)
+
+        if request_grace is not None:
+            parser_chat_template_kwargs["reasoning_budget_grace_period"] = request_grace
         if sampling_params.extra_args is None:
             sampling_params.extra_args = {}
         extra = sampling_params.extra_args
 
         extra.setdefault("reasoning_budget", budget_int)
 
-        grace = chat_template_kwargs.get("reasoning_budget_grace_period", 0)
         try:
             grace_int = int(grace)
         except Exception:
             grace_int = 0
         extra.setdefault("reasoning_budget_grace_period", grace_int)
 
-        if "enable_thinking" in chat_template_kwargs:
-            extra.setdefault("enable_thinking", chat_template_kwargs["enable_thinking"])
+        if "enable_thinking" in parser_chat_template_kwargs:
+            extra.setdefault(
+                "enable_thinking", parser_chat_template_kwargs["enable_thinking"]
+            )
 
         end_token_ids = getattr(reasoning_parser, "end_token_ids", None)
         parsed_end_token_ids: list[int] = []
@@ -440,6 +459,7 @@ class OpenAIServingChat(OpenAIServing):
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+        tokenizer = self.renderer.tokenizer
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
@@ -734,13 +754,19 @@ class OpenAIServingChat(OpenAIServing):
 
         all_previous_token_ids: list[list[int]] | None
         function_name_returned = [False] * num_choices
+        named_tool_previous_args = [""] * num_choices
         if self.tool_call_id_type == "kimi_k2":
             history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
         else:
             history_tool_call_cnt = 0
 
-        # Always track previous_texts for comprehensive output logging
+        # Always track previous text and structured deltas for output logging.
         previous_texts = [""] * num_choices
+        previous_reasoning_texts = [""] * num_choices
+        previous_content_texts = [""] * num_choices
+        previous_tool_calls: list[list[dict[str, Any]]] = [
+            [] for _ in range(num_choices)
+        ]
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -1003,8 +1029,93 @@ class OpenAIServingChat(OpenAIServing):
                                     # This need to be added to next `delta_text`
                                     current_text = delta_message.content
                                     delta_message.content = None
+                                elif (
+                                    delta_message
+                                    and delta_message.reasoning
+                                    and delta_message.reasoning.lstrip().startswith(
+                                        ("{", "[")
+                                    )
+                                ):
+                                    # Some models emit raw JSON in reasoning channel
+                                    # (without explicit </think>). Preserve it for
+                                    # tool-argument parsing instead of dropping it.
+                                    current_text = delta_message.reasoning
+                                    delta_message.reasoning = None
+                                    delta_message.reasoning_content = None
                                 else:
                                     current_text = ""
+                            elif output.finish_reason is not None:
+                                # Fallback: thinking was enabled but model never emitted
+                                # an explicit reasoning-end marker. Parse final accumulated
+                                # content and stream only the tool-argument delta.
+                                accumulated_text = previous_text + delta_text
+                                current_text = accumulated_text
+                                try:
+                                    parsed_calls, _ = self._parse_tool_calls_from_content(
+                                        request=request,
+                                        tokenizer=tokenizer,
+                                        content=accumulated_text,
+                                        enable_auto_tools=self.enable_auto_tools,
+                                        tool_parser_cls=self.tool_parser,
+                                    )
+                                except Exception:
+                                    parsed_calls = None
+
+                                matched_call = None
+                                if parsed_calls:
+                                    matched_call = next(
+                                        (
+                                            fc
+                                            for fc in parsed_calls
+                                            if fc.name == tool_choice_function_name
+                                        ),
+                                        parsed_calls[0],
+                                    )
+                                extracted_args = (
+                                    matched_call.arguments
+                                    if matched_call
+                                    and matched_call.arguments is not None
+                                    else accumulated_text.strip()
+                                )
+                                if extracted_args:
+                                    try:
+                                        json.loads(extracted_args)
+                                    except json.JSONDecodeError:
+                                        extracted_args = ""
+
+                                previous_args = named_tool_previous_args[i]
+                                if extracted_args.startswith(previous_args):
+                                    arguments_delta = extracted_args[len(previous_args) :]
+                                else:
+                                    arguments_delta = extracted_args
+                                named_tool_previous_args[i] = extracted_args
+
+                                if arguments_delta or not function_name_returned[i]:
+                                    if function_name_returned[i]:
+                                        delta_tool_call = DeltaToolCall(
+                                            function=DeltaFunctionCall(
+                                                arguments=arguments_delta
+                                            ),
+                                            index=i,
+                                        )
+                                    else:
+                                        delta_tool_call = DeltaToolCall(
+                                            id=make_tool_call_id(),
+                                            type="function",
+                                            function=DeltaFunctionCall(
+                                                name=tool_choice_function_name,
+                                                arguments=arguments_delta,
+                                            ),
+                                            index=i,
+                                        )
+                                        function_name_returned[i] = True
+                                    delta_message = DeltaMessage(
+                                        tool_calls=[delta_tool_call]
+                                    )
+                                    tools_streamed[i] = True
+                                else:
+                                    delta_message = None
+                                reasoning_end_arr[i] = True
                         else:
                             # Just to add remaining `content`
                             if reasoning_parser:
@@ -1235,6 +1346,57 @@ class OpenAIServingChat(OpenAIServing):
                             continue
                         delta_message = DeltaMessage()
 
+                    # Accumulate complete output for a single end-of-stream log.
+                    if delta_message is not None:
+                        reasoning_delta = (
+                            delta_message.reasoning_content
+                            if delta_message.reasoning_content is not None
+                            else delta_message.reasoning
+                        )
+                        if reasoning_delta:
+                            previous_reasoning_texts[i] += reasoning_delta
+                        if delta_message.content:
+                            previous_content_texts[i] += delta_message.content
+                        if delta_message.tool_calls:
+                            for delta_tc in delta_message.tool_calls:
+                                tc_idx = (
+                                    delta_tc.index
+                                    if delta_tc.index is not None
+                                    else 0
+                                )
+                                while len(previous_tool_calls[i]) <= tc_idx:
+                                    previous_tool_calls[i].append(
+                                        {
+                                            "id": None,
+                                            "type": "function",
+                                            "function": {
+                                                "name": None,
+                                                "arguments": "",
+                                            },
+                                        }
+                                    )
+
+                                tool_state = previous_tool_calls[i][tc_idx]
+                                if delta_tc.id:
+                                    tool_state["id"] = delta_tc.id
+                                if delta_tc.type:
+                                    tool_state["type"] = delta_tc.type
+
+                                fn_name: str | None = None
+                                fn_args: str | None = None
+                                if isinstance(delta_tc.function, dict):
+                                    fn_name = delta_tc.function.get("name")
+                                    fn_args = delta_tc.function.get("arguments")
+                                elif delta_tc.function is not None:
+                                    fn_name = delta_tc.function.name
+                                    fn_args = delta_tc.function.arguments
+
+                                function_state = tool_state["function"]
+                                if fn_name:
+                                    function_state["name"] = fn_name
+                                if fn_args:
+                                    function_state["arguments"] += fn_args
+
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
                         delta_content_parts = []
@@ -1435,19 +1597,107 @@ class OpenAIServingChat(OpenAIServing):
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
 
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                try:
+                    usage_dict = (
+                        request_metadata.final_usage_info.model_dump()
+                        if request_metadata.final_usage_info
+                        else None
+                    )
+                except Exception:
+                    usage_dict = None
+
+                choices_list = []
+                for i in range(num_choices):
+                    choice_data: dict[str, Any] = {
+                        "index": i,
+                        "message": {
+                            "role": "assistant",
+                            "content": previous_content_texts[i]
+                            if previous_content_texts[i]
+                            else None,
+                        },
+                        "finish_reason": "stop",
+                    }
+                    if previous_reasoning_texts[i]:
+                        choice_data["message"]["reasoning_content"] = (
+                            previous_reasoning_texts[i]
+                        )
+
+                    if previous_tool_calls[i]:
+                        filtered_tool_calls = []
+                        for tool_state in previous_tool_calls[i]:
+                            fn = tool_state.get("function") or {}
+                            if (
+                                tool_state.get("id")
+                                or fn.get("name")
+                                or fn.get("arguments")
+                            ):
+                                filtered_tool_calls.append(tool_state)
+                        if filtered_tool_calls:
+                            choice_data["message"]["tool_calls"] = filtered_tool_calls
+                            choice_data["finish_reason"] = "tool_calls"
+                    choices_list.append(choice_data)
+
+                resp_summary = {
+                    "id": request_id,
+                    "object": "chat.completion",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": choices_list,
+                    "usage": usage_dict,
+                    "stream": True,
+                }
+                rid_hint = (
+                    request_id[len("chatcmpl-") :]
+                    if request_id.startswith("chatcmpl-")
+                    else request_id
+                )
+                try:
+                    payload_logger.info(
+                        "openai.response",
+                        extra={
+                            "rid": rid_hint,
+                            "endpoint": self.__class__.__name__,
+                            "payload": resp_summary,
+                        },
+                    )
+                except Exception:
+                    pass
+
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
-                # Log the complete response for each choice
                 for i in range(num_choices):
-                    full_text = (
-                        previous_texts[i]
-                        if previous_texts and i < len(previous_texts)
-                        else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
-                    )
+                    summary_payload: dict[str, Any] = {"choice_index": i}
+                    if previous_reasoning_texts[i]:
+                        summary_payload["reasoning"] = previous_reasoning_texts[i]
+                    if previous_content_texts[i]:
+                        summary_payload["content"] = previous_content_texts[i]
+
+                    if previous_tool_calls[i]:
+                        filtered_tool_calls = []
+                        for tool_state in previous_tool_calls[i]:
+                            fn = tool_state.get("function") or {}
+                            if (
+                                tool_state.get("id")
+                                or fn.get("name")
+                                or fn.get("arguments")
+                            ):
+                                filtered_tool_calls.append(tool_state)
+                        if filtered_tool_calls:
+                            summary_payload["tool_calls"] = filtered_tool_calls
+
+                    if len(summary_payload) == 1:
+                        summary_payload["content"] = (
+                            previous_texts[i]
+                            if previous_texts and i < len(previous_texts)
+                            else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
+                        )
+
                     self.request_logger.log_outputs(
                         request_id=request_id,
-                        outputs=full_text,
-                        output_token_ids=None,  # Consider also logging all token IDs
+                        outputs=json.dumps(summary_payload, ensure_ascii=False),
+                        output_token_ids=None,
                         finish_reason="streaming_complete",
                         is_streaming=True,
                         delta=False,
@@ -1816,24 +2066,60 @@ class OpenAIServingChat(OpenAIServing):
             kv_transfer_params=final_res.kv_transfer_params,
         )
 
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            rid_hint = (
+                request_id[len("chatcmpl-") :]
+                if request_id.startswith("chatcmpl-")
+                else request_id
+            )
+            try:
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": rid_hint,
+                        "endpoint": self.__class__.__name__,
+                        "payload": response.model_dump(),
+                    },
+                )
+            except Exception:
+                pass
+
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
             for choice in choices:
                 output_text = ""
+                payload: dict[str, Any] = {"choice_index": choice.index}
+                reasoning_text = (
+                    choice.message.reasoning_content or choice.message.reasoning
+                )
+                if reasoning_text:
+                    payload["reasoning"] = reasoning_text
                 if choice.message.content:
-                    output_text = choice.message.content
-                elif choice.message.tool_calls:
-                    # For tool calls, log the function name and arguments
-                    tool_call_descriptions = []
-                    for tc in choice.message.tool_calls:  # type: ignore
-                        function_call: FunctionCall = tc.function  # type: ignore
-                        tool_call_descriptions.append(
-                            f"{function_call.name}({function_call.arguments})"
+                    payload["content"] = choice.message.content
+                if choice.message.tool_calls:
+                    tool_calls_payload = []
+                    for tc in choice.message.tool_calls:
+                        fn_name = None
+                        fn_args = None
+                        if hasattr(tc.function, "name"):
+                            fn_name = tc.function.name
+                        if hasattr(tc.function, "arguments"):
+                            fn_args = tc.function.arguments
+                        tool_calls_payload.append(
+                            {
+                                "id": tc.id,
+                                "type": tc.type,
+                                "function": {
+                                    "name": fn_name,
+                                    "arguments": fn_args or "",
+                                },
+                            }
                         )
-                    tool_calls_str = ", ".join(tool_call_descriptions)
-                    output_text = f"[tool_calls: {tool_calls_str}]"
+                    if tool_calls_payload:
+                        payload["tool_calls"] = tool_calls_payload
 
-                if output_text:
+                if len(payload) > 1:
+                    output_text = json.dumps(payload, ensure_ascii=False)
                     # Get the corresponding output token IDs
                     output_token_ids = None
                     if choice.index < len(final_res.outputs):
