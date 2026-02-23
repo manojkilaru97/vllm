@@ -84,6 +84,8 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.utils.mistral import mt as _mt
 
+from vllm.entrypoints.openai.request_metrics import classify_chat_request
+
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
 
@@ -546,6 +548,8 @@ class OpenAIServingChat(OpenAIServing):
         result = await self.render_chat_request(request, raw_request=raw_request)
         if isinstance(result, ErrorResponse):
             return result
+
+        classify_chat_request(request)
 
         conversation, engine_prompts = result
 
