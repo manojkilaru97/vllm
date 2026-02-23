@@ -270,6 +270,22 @@ class FrontendArgs(BaseFrontendArgs):
     """If specified, API server will add X-Request-Id header to responses."""
     disable_fastapi_docs: bool = False
     """Disable FastAPI's OpenAPI schema, Swagger UI, and ReDoc endpoint."""
+    enable_prompt_tokens_details: bool = False
+    """If set to True, enable prompt_tokens_details in usage."""
+    enable_server_load_tracking: bool = False
+    """If set to True, enable tracking server_load_metrics in the app state."""
+    enable_force_include_usage: bool = False
+    """If set to True, including usage on every request."""
+    enable_tokenizer_info_endpoint: bool = False
+    """Enable the `/tokenizer_info` endpoint. May expose chat
+    templates and other tokenizer configuration."""
+    enable_log_outputs: bool = False
+    """If set to True, log model outputs (generations).
+    Requires --enable-log-requests."""
+    enable_log_deltas: bool = False
+    """If set to True, output deltas will be logged token-by-token.
+    Relevant only if --enable-log-outputs is set.
+    """
     h11_max_incomplete_event_size: int = H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT
     """Maximum size (bytes) of an incomplete HTTP event (header or body) for
     h11 parser. Helps mitigate header abuse. Default: 4194304 (4 MB)."""

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import json
+import re
 from collections.abc import Sequence
 
 import torch
@@ -60,11 +62,81 @@ class RequestLogger:
                 prompt_embeds.shape if prompt_embeds is not None else None,
             )
 
+        params_for_log: SamplingParams | PoolingParams | BeamSearchParams | str | None = (
+            params
+        )
+        if isinstance(params, SamplingParams):
+            params_for_log = self._summarize_sampling_params_for_log(params)
+
         logger.info(
             "Received request %s: params: %s, lora_request: %s.",
             request_id,
-            params,
+            params_for_log,
             lora_request,
+        )
+
+    def _summarize_sampling_params_for_log(self, params: SamplingParams) -> str:
+        params_text = str(params)
+        extra_args = params.extra_args
+        if not isinstance(extra_args, dict):
+            return params_text
+
+        newline_token_ids = extra_args.get("newline_token_ids")
+        if not (
+            isinstance(newline_token_ids, Sequence)
+            and not isinstance(newline_token_ids, (str, bytes, bytearray))
+        ):
+            return params_text
+
+        try:
+            count = len(newline_token_ids)
+        except Exception:
+            return params_text
+
+        preview = []
+        if hasattr(newline_token_ids, "__getitem__"):
+            try:
+                preview = list(newline_token_ids[:8])  # type: ignore[index]
+            except Exception:
+                preview = []
+        summary = f"<{count} token_ids; preview={preview}>"
+
+        return re.sub(
+            r"'newline_token_ids': \[[^\]]*\]",
+            f"'newline_token_ids': '{summary}'",
+            params_text,
+            count=1,
+        )
+
+    def log_http_request(
+        self,
+        request_id: str,
+        *,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None,
+        body: bytes | str | None,
+    ) -> None:
+        body_text: str | None
+        if isinstance(body, bytes):
+            body_text = body.decode("utf-8", errors="replace")
+        else:
+            body_text = body
+
+        max_log_len = self.max_log_len
+        if max_log_len is not None and body_text is not None:
+            body_text = body_text[:max_log_len]
+
+        payload = {
+            "method": method,
+            "path": path,
+            "headers": headers or {},
+            "body": body_text,
+        }
+        logger.info(
+            "Received raw HTTP request %s: %s",
+            request_id,
+            json.dumps(payload, ensure_ascii=False),
         )
 
     def log_outputs(

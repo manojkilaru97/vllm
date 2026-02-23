@@ -64,6 +64,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     has_custom_tools,
     render_for_completion,
 )
+from vllm.entrypoints.openai.request_metrics import classify_responses_request
 from vllm.entrypoints.openai.responses.context import (
     ConversationContext,
     HarmonyContext,
@@ -336,6 +337,8 @@ class OpenAIServingResponses(OpenAIServing):
         maybe_validation_error = self._validate_create_responses_input(request)
         if maybe_validation_error is not None:
             return maybe_validation_error
+
+        classify_responses_request(request)
 
         # If the engine is dead, raise the engine's DEAD_ERROR.
         # This is required for the streaming case, where we return a
@@ -873,6 +876,19 @@ class OpenAIServingResponses(OpenAIServing):
         final_output: CompletionOutput,
         tokenizer: TokenizerLike,
     ) -> list[ResponseOutputItem]:
+        if self.parser and self.parser.reasoning_parser_cls is not None:
+            try:
+                reasoning_parser = self.parser.reasoning_parser_cls(tokenizer)
+            except RuntimeError as e:
+                logger.exception("Error in reasoning parser creation.")
+                raise e
+            reasoning, content = reasoning_parser.extract_reasoning(
+                final_output.text, request=request
+            )
+        else:
+            reasoning = None
+            content = final_output.text
+
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
             self.request_logger.log_outputs(

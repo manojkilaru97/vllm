@@ -235,6 +235,7 @@ class FinishedRequestStats:
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
     num_cached_tokens: int = 0
+    num_preemptions: int = 0
 
 
 @dataclass
@@ -414,6 +415,7 @@ class IterationStats:
         max_tokens_param: int | None,
         req_stats: RequestStateStats,
         num_cached_tokens: int = 0,
+        num_preemptions: int = 0,
     ):
         e2e_latency = self._time_since(req_stats.arrival_time)
 
@@ -452,6 +454,7 @@ class IterationStats:
             mean_time_per_output_token=mean_time_per_output_token,
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
+            num_preemptions=num_preemptions,
         )
         self.finished_requests.append(finished_req)
 
