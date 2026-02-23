@@ -86,6 +86,8 @@ from vllm.utils.mistral import is_mistral_tokenizer
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
+from vllm.entrypoints.openai.request_metrics import classify_chat_request
+
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
 
@@ -301,6 +303,8 @@ class OpenAIServingChat(OpenAIServing):
         if isinstance(result, ErrorResponse):
             return result
 
+        conversation, engine_inputs = result
+        classify_chat_request(request)
         conversation, engine_inputs = result
 
         request_id = (

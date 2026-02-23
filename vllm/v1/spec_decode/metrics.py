@@ -131,12 +131,12 @@ class SpecDecodingProm:
 
       1 + (
       rate(vllm:spec_decode_num_accepted_tokens_total[$interval]) /
-      rate(vllm:spec_decode_num_drafts[$interval]))
+      rate(vllm:spec_decode_num_drafts_total[$interval]))
 
     A per-position acceptance rate vector can be computed using
 
-      vllm:spec_decode_num_accepted_tokens_per_pos[$interval] /
-      vllm:spec_decode_num_drafts[$interval]
+      vllm:spec_decode_num_accepted_tokens_per_pos_total[$interval] /
+      vllm:spec_decode_num_drafts_total[$interval]
     """
 
     _counter_cls = prometheus_client.Counter
@@ -153,7 +153,7 @@ class SpecDecodingProm:
             return
 
         counter_drafts = self._counter_cls(
-            name="spec_decode_num_drafts",
+            name="spec_decode_num_drafts_total",
             documentation="Number of spec decoding drafts.",
             labelnames=labelnames,
         )
@@ -162,7 +162,7 @@ class SpecDecodingProm:
         )
 
         counter_draft_tokens = self._counter_cls(
-            name="spec_decode_num_draft_tokens",
+            name="spec_decode_num_draft_tokens_total",
             documentation="Number of draft tokens.",
             labelnames=labelnames,
         )
@@ -171,7 +171,7 @@ class SpecDecodingProm:
         )
 
         counter_accepted_tokens = self._counter_cls(
-            name="spec_decode_num_accepted_tokens",
+            name="spec_decode_num_accepted_tokens_total",
             documentation="Number of accepted tokens.",
             labelnames=labelnames,
         )
@@ -187,7 +187,7 @@ class SpecDecodingProm:
         )
         pos_labelnames = labelnames + ["position"]
         base_counter = self._counter_cls(
-            name="spec_decode_num_accepted_tokens_per_pos",
+            name="spec_decode_num_accepted_tokens_per_pos_total",
             documentation="Accepted tokens per draft position.",
             labelnames=pos_labelnames,
         )
