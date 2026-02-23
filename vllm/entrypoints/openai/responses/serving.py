@@ -914,6 +914,19 @@ class OpenAIServingResponses(OpenAIServing):
         final_output: CompletionOutput,
         tokenizer: TokenizerLike,
     ) -> list[ResponseOutputItem]:
+        if self.parser and self.parser.reasoning_parser_cls is not None:
+            try:
+                reasoning_parser = self.parser.reasoning_parser_cls(tokenizer)
+            except RuntimeError as e:
+                logger.exception("Error in reasoning parser creation.")
+                raise e
+            reasoning, content = reasoning_parser.extract_reasoning(
+                final_output.text, request=request
+            )
+        else:
+            reasoning = None
+            content = final_output.text
+
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
             if reasoning:

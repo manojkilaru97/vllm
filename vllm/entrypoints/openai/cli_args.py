@@ -193,9 +193,9 @@ class FrontendArgs:
     enable_log_outputs: bool = False
     """If set to True, log model outputs (generations).
     Requires --enable-log-requests."""
-    enable_log_deltas: bool = True
-    """If set to False, output deltas will not be logged. Relevant only if 
-    --enable-log-outputs is set.
+    enable_log_deltas: bool = False
+    """If set to True, output deltas will be logged token-by-token.
+    Relevant only if --enable-log-outputs is set.
     """
     h11_max_incomplete_event_size: int = H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT
     """Maximum size (bytes) of an incomplete HTTP event (header or body) for
