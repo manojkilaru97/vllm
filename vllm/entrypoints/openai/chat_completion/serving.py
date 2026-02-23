@@ -94,6 +94,8 @@ from vllm.utils.async_utils import tokenizer_lock
 from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
+from vllm.entrypoints.openai.request_metrics import classify_chat_request
+
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
 
@@ -428,6 +430,8 @@ class OpenAIServingChat(OpenAIServing):
         result = await self.render_chat_request(request, raw_request)
         if isinstance(result, ErrorResponse):
             return result
+
+        classify_chat_request(request)
 
         conversation, engine_prompts = result
 
