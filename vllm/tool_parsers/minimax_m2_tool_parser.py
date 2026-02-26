@@ -47,6 +47,8 @@ class MinimaxM2ToolParser(ToolParser):
         # Override base class type - we use string IDs for tool calls
         self.current_tool_id: str | None = None  # type: ignore
         self.streamed_args_for_tool: list[str] = []
+        self.tool_name_sent_arr: list[bool] = []
+        self.tool_calls_emitted: bool = False
         self.is_tool_call_started: bool = False
         self.failed_count: int = 0
 
@@ -74,10 +76,10 @@ class MinimaxM2ToolParser(ToolParser):
             r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
         )
         self.invoke_complete_regex = re.compile(
-            r"<invoke name=(.*?)</invoke>", re.DOTALL
+            r"<invoke\s+name\s*=(.*?)</invoke>", re.DOTALL
         )
         self.parameter_complete_regex = re.compile(
-            r"<parameter name=(.*?)</parameter>", re.DOTALL
+            r"<parameter\s+name\s*=(.*?)</parameter>", re.DOTALL
         )
 
         if not self.model_tokenizer:
@@ -95,13 +97,16 @@ class MinimaxM2ToolParser(ToolParser):
                 "tokens in the tokenizer!"
             )
 
-        logger.debug(
-            "vLLM Successfully import tool parser %s !", self.__class__.__name__
-        )
-
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
+
+    def adjust_request(self, request):
+        request = super().adjust_request(request)
+        if request.tools and request.tool_choice != "none":
+            # Ensure MiniMax tool-call tags are preserved in decoded text.
+            request.skip_special_tokens = False
+        return request
 
     def _reset_streaming_state(self):
         """Reset all streaming state."""
@@ -126,6 +131,13 @@ class MinimaxM2ToolParser(ToolParser):
         self.prev_tool_call_arr.clear()
         # Reset streamed args tracking
         self.streamed_args_for_tool.clear()
+        self.tool_name_sent_arr.clear()
+        self.tool_calls_emitted = False
+
+    def _emit_tool_delta(self, delta: DeltaMessage | None) -> DeltaMessage | None:
+        if delta is not None and delta.tool_calls:
+            self.tool_calls_emitted = True
+        return delta
 
     def _extract_name(self, name_str: str) -> str:
         """Extract name from quoted string."""
@@ -542,19 +554,29 @@ class MinimaxM2ToolParser(ToolParser):
                     # Add to prev_tool_call_arr immediately when we detect a tool call
                     # Each tool call should be recorded regardless of function name
                     # Ensure we don't add the same tool call index multiple times
-                    if len(self.prev_tool_call_arr) <= self.current_tool_index:
+                    while len(self.prev_tool_call_arr) <= self.current_tool_index:
                         self.prev_tool_call_arr.append(
                             {
                                 "name": self.current_function_name,
+                                "id": self.current_tool_id,
                                 "arguments": {},  # Placeholder, will be updated later
                             }
                         )
-                        # Initialize streamed_args_for_tool for this tool call
-                        if len(self.streamed_args_for_tool) <= self.current_tool_index:
-                            self.streamed_args_for_tool.append("")
+                    while len(self.streamed_args_for_tool) <= self.current_tool_index:
+                        self.streamed_args_for_tool.append("")
+                    while len(self.tool_name_sent_arr) <= self.current_tool_index:
+                        self.tool_name_sent_arr.append(False)
+
+                    self.prev_tool_call_arr[self.current_tool_index]["name"] = (
+                        self.current_function_name
+                    )
+                    self.prev_tool_call_arr[self.current_tool_index]["id"] = (
+                        self.current_tool_id
+                    )
+                    self.tool_name_sent_arr[self.current_tool_index] = True
 
                     # Send header with function info
-                    return DeltaMessage(
+                    return self._emit_tool_delta(DeltaMessage(
                         tool_calls=[
                             DeltaToolCall(
                                 index=self.current_tool_index,
@@ -565,34 +587,17 @@ class MinimaxM2ToolParser(ToolParser):
                                 type="function",
                             )
                         ]
-                    )
+                    ))
             return None
 
         # We've sent header, now handle function body
         if self.in_function:
-            # Send opening brace if not sent yet
-            if self.in_function and not self.json_started:
-                self.json_started = True
-                # Update streamed_args_for_tool for opening brace
-                if self.current_tool_index < len(self.streamed_args_for_tool):
-                    self.streamed_args_for_tool[self.current_tool_index] += "{"
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(arguments="{"),
-                        )
-                    ]
-                )
-
-            # Make sure json_started is set if we're processing parameters
-            if not self.json_started:
-                self.json_started = True
-
             # Check for function end in accumulated text
             if not self.json_closed and self.invoke_end_token in tool_text:
                 # Count total parameters in the tool text
                 total_param_count = tool_text.count(self.parameter_prefix)
+                emit_fragment = ""
+                parsed_args = "{}"
 
                 # Only close JSON if all parameters have been processed
                 if self.param_count >= total_param_count:
@@ -621,32 +626,50 @@ class MinimaxM2ToolParser(ToolParser):
                                 self.prev_tool_call_arr
                             ):
                                 # Update existing entry in prev_tool_call_arr
-                                args = parsed_tool.function.arguments
+                                parsed_args = parsed_tool.function.arguments
                                 self.prev_tool_call_arr[self.current_tool_index][
                                     "arguments"
-                                ] = json.loads(args)
+                                ] = parsed_args
                         except Exception:
                             pass  # Ignore parsing errors during streaming
 
-                    result = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_index,
-                                function=DeltaFunctionCall(arguments="}"),
-                            )
-                        ]
-                    )
-                    # Update streamed_args_for_tool for closing brace
                     if self.current_tool_index < len(self.streamed_args_for_tool):
-                        self.streamed_args_for_tool[self.current_tool_index] += "}"
+                        streamed_so_far = self.streamed_args_for_tool[
+                            self.current_tool_index
+                        ]
+                    else:
+                        streamed_so_far = ""
+
+                    if not streamed_so_far:
+                        emit_fragment = parsed_args
+                    elif parsed_args.startswith(streamed_so_far):
+                        emit_fragment = parsed_args[len(streamed_so_far) :]
+                    elif streamed_so_far == "{" and parsed_args.startswith("{"):
+                        emit_fragment = parsed_args[1:]
+                    else:
+                        emit_fragment = ""
+
+                    if emit_fragment:
+                        if self.current_tool_index < len(self.streamed_args_for_tool):
+                            self.streamed_args_for_tool[self.current_tool_index] += (
+                                emit_fragment
+                            )
+                        result = DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_index,
+                                    function=DeltaFunctionCall(arguments=emit_fragment),
+                                )
+                            ]
+                        )
+                    else:
+                        result = None
                     # Reset state for next tool
                     self.json_closed = True
                     self.in_function = False
                     self.accumulated_params = {}
 
-                    logger.debug("[M2_STREAMING] Tool call completed")
-
-                    return result
+                    return self._emit_tool_delta(result)
                 else:
                     # Don't close JSON yet, continue processing parameters
                     return None
@@ -749,9 +772,11 @@ class MinimaxM2ToolParser(ToolParser):
                         )
 
                         if self.param_count == 0:
+                            prefix = "{" if not self.json_started else ""
                             json_fragment = (
-                                f'"{self.current_param_name}": {serialized_value}'
+                                f'{prefix}"{self.current_param_name}": {serialized_value}'
                             )
+                            self.json_started = True
                         else:
                             json_fragment = (
                                 f', "{self.current_param_name}": {serialized_value}'
@@ -763,13 +788,13 @@ class MinimaxM2ToolParser(ToolParser):
                             self.streamed_args_for_tool[self.current_tool_index] += (
                                 json_fragment
                             )
-                        return DeltaMessage(
+                        return self._emit_tool_delta(DeltaMessage(
                             tool_calls=[
                                 DeltaToolCall(
                                     index=self.current_tool_index,
                                     function=DeltaFunctionCall(arguments=json_fragment),
                                 )
                             ]
-                        )
+                        ))
 
         return None

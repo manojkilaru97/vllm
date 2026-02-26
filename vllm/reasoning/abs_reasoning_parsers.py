@@ -44,6 +44,17 @@ class ReasoningParser:
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         self.model_tokenizer = tokenizer
 
+    @property
+    def supports_prompt_reasoning_end_check(self) -> bool:
+        """
+        Whether callers may use prompt tokens to infer reasoning has ended.
+
+        Most parsers support this optimization. Parsers for models that emit
+        reasoning as plain content (and only close it with a generated marker)
+        should override this to False.
+        """
+        return True
+
     @cached_property
     def vocab(self) -> dict[str, int]:
         # NOTE: Only PreTrainedTokenizerFast is guaranteed to have .vocab

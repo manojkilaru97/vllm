@@ -88,6 +88,12 @@ class MiniMaxM2AppendThinkReasoningParser(ReasoningParser):
         super().__init__(tokenizer, *args, **kwargs)
         self.end_token_id = self.vocab.get("</think>")
 
+    @property
+    def supports_prompt_reasoning_end_check(self) -> bool:
+        # This parser injects reasoning into `content` and relies on a
+        # generated </think> marker. Prompt-side checks can fire too early.
+        return False
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         end_token_id = self.end_token_id
         return any(input_id == end_token_id for input_id in reversed(input_ids))
