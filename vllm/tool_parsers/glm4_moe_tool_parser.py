@@ -229,6 +229,10 @@ class Glm4MoeModelToolParser(ToolParser):
 
         self._buffer += delta_text
 
+        # Accumulate deltas to handle MTP batching where entire tool call
+        # arrives in 1-2 chunks. Process entire buffer before returning.
+        accumulated_delta: DeltaMessage | None = None
+
         while True:
             if not self._in_tool_call:
                 start_idx = self._buffer.find(self.tool_call_start_token)
@@ -259,7 +263,7 @@ class Glm4MoeModelToolParser(ToolParser):
                 end = self._buffer.find(self.tool_call_end_token)
                 candidates = [i for i in [nl, ak, end] if i != -1]
                 if not candidates:
-                    return None
+                    return accumulated_delta
                 cut = min(candidates)
                 tool_name = self._buffer[:cut].strip()
                 if tool_name == "" and cut == end:
@@ -277,7 +281,10 @@ class Glm4MoeModelToolParser(ToolParser):
 
                 self._current_tool_name = tool_name
                 self.current_tool_name_sent = True
-                return self._emit_tool_name_delta(tool_name)
+                # Don't return immediately - accumulate and continue processing
+                # to handle MTP batching where args arrive in same chunk
+                accumulated_delta = self._emit_tool_name_delta(tool_name)
+                continue
 
             assert self._current_tool_name is not None
 
@@ -293,7 +300,9 @@ class Glm4MoeModelToolParser(ToolParser):
                     escaped = self._json_escape_string_content(raw_content)
                     frag = escaped + '"'
                     self.streamed_args_for_tool[self.current_tool_id] += frag
-                    return self._emit_tool_args_delta(frag)
+                    # Merge with accumulated delta and continue processing
+                    accumulated_delta = self._merge_args_into_delta(accumulated_delta, frag)
+                    continue
                 else:
                     # Check for partial </arg_value> at end
                     safe_len = len(self._buffer)
@@ -308,14 +317,14 @@ class Glm4MoeModelToolParser(ToolParser):
                         escaped = self._json_escape_string_content(to_emit)
                         if escaped:
                             self.streamed_args_for_tool[self.current_tool_id] += escaped
-                            return self._emit_tool_args_delta(escaped)
-                    return None
+                            accumulated_delta = self._merge_args_into_delta(accumulated_delta, escaped)
+                    return accumulated_delta
 
             # If we have a pending key, parse its value
             if self._pending_key is not None:
                 val_pos = self._buffer.find(self.arg_val_start)
                 if val_pos == -1:
-                    return None
+                    return accumulated_delta
                 if val_pos > 0:
                     self._buffer = self._buffer[val_pos:]
 
@@ -344,12 +353,14 @@ class Glm4MoeModelToolParser(ToolParser):
 
                     self.streamed_args_for_tool[self.current_tool_id] += frag
                     self._streaming_string_value = True
-                    return self._emit_tool_args_delta(frag)
+                    # Don't return yet - continue to stream the value
+                    accumulated_delta = self._merge_args_into_delta(accumulated_delta, frag)
+                    continue
                 else:
                     # Non-string type: wait for complete value
                     val_end = self._buffer.find(self.arg_val_end)
                     if val_end == -1:
-                        return None
+                        return accumulated_delta
 
                     raw_val = self._buffer[len(self.arg_val_start) : val_end].strip()
                     self._buffer = self._buffer[val_end + len(self.arg_val_end) :]
@@ -360,7 +371,7 @@ class Glm4MoeModelToolParser(ToolParser):
                         raw_val=raw_val,
                     )
                     if frag:
-                        return self._emit_tool_args_delta(frag)
+                        accumulated_delta = self._merge_args_into_delta(accumulated_delta, frag)
                     continue
 
             # Parse next arg or close
@@ -387,15 +398,18 @@ class Glm4MoeModelToolParser(ToolParser):
                             e,
                         )
                 self._finish_tool_call()
-                return self._emit_tool_args_delta(frag) if frag else None
+                # Merge closing args with accumulated delta
+                if frag:
+                    accumulated_delta = self._merge_args_into_delta(accumulated_delta, frag)
+                return accumulated_delta
 
             if key_pos == -1:
-                return None
+                return accumulated_delta
             if key_pos > 0:
                 self._buffer = self._buffer[key_pos:]
             key_end = self._buffer.find(self.arg_key_end)
             if key_end == -1:
-                return None
+                return accumulated_delta
             key = self._buffer[len(self.arg_key_start) : key_end]
             self._buffer = self._buffer[key_end + len(self.arg_key_end) :]
             self._pending_key = key
@@ -473,6 +487,21 @@ class Glm4MoeModelToolParser(ToolParser):
                 )
             ]
         )
+
+    def _merge_args_into_delta(
+        self, accumulated: DeltaMessage | None, fragment: str
+    ) -> DeltaMessage:
+        """Merge argument fragment into accumulated delta or create new one."""
+        if accumulated is None:
+            return self._emit_tool_args_delta(fragment)
+        # Append arguments to existing tool call delta
+        if accumulated.tool_calls and len(accumulated.tool_calls) > 0:
+            tc = accumulated.tool_calls[0]
+            if isinstance(tc.function, dict):
+                tc.function["arguments"] = tc.function.get("arguments", "") + fragment
+            elif hasattr(tc.function, "arguments"):
+                tc.function.arguments = (tc.function.arguments or "") + fragment
+        return accumulated
 
     def _append_arg_fragment(
         self,
