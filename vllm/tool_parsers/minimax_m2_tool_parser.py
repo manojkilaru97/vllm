@@ -39,7 +39,13 @@ class MinimaxM2ToolParser(ToolParser):
         self.tool_call_start_token: str = "<minimax:tool_call>"
         self.tool_call_end_token: str = "</minimax:tool_call>"
 
-        # Streaming state
+        # Streaming state variables
+        self.current_tool_name_sent: bool = False
+        # Override base class type - we use string IDs for tool calls
+        self.current_tool_id: str | None = None  # type: ignore
+        self.streamed_args_for_tool: list[str] = []
+        self.tool_name_sent_arr: list[bool] = []
+        self.tool_calls_emitted: bool = False
         self.is_tool_call_started: bool = False
         self.current_tool_index: int = 0
 
@@ -48,10 +54,10 @@ class MinimaxM2ToolParser(ToolParser):
             r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
         )
         self.invoke_complete_regex = re.compile(
-            r"<invoke name=(.*?)</invoke>", re.DOTALL
+            r"<invoke\s+name\s*=(.*?)</invoke>", re.DOTALL
         )
         self.parameter_complete_regex = re.compile(
-            r"<parameter name=(.*?)</parameter>", re.DOTALL
+            r"<parameter\s+name\s*=(.*?)</parameter>", re.DOTALL
         )
 
         if not self.model_tokenizer:
@@ -69,14 +75,16 @@ class MinimaxM2ToolParser(ToolParser):
                 "tokens in the tokenizer!"
             )
 
-        logger.debug(
-            "vLLM Successfully import tool parser %s !", self.__class__.__name__
-        )
-
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
 
+    def adjust_request(self, request):
+        request = super().adjust_request(request)
+        if request.tools and request.tool_choice != "none":
+            # Ensure MiniMax tool-call tags are preserved in decoded text.
+            request.skip_special_tokens = False
+        return request
     def _extract_name(self, name_str: str) -> str:
         """Extract name from quoted string."""
         name_str = name_str.strip()
@@ -418,6 +426,8 @@ class MinimaxM2ToolParser(ToolParser):
             self.current_tool_index = 0
             self.prev_tool_call_arr.clear()
             self.streamed_args_for_tool.clear()
+            self.tool_name_sent_arr.clear()
+            self.tool_calls_emitted = False
             self.is_tool_call_started = tool_call_starting
 
         # Pass through content before any tool call.

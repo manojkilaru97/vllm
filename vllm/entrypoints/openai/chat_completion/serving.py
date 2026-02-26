@@ -969,11 +969,18 @@ class OpenAIServingChat(OpenAIServing):
                         and res.prompt_token_ids
                         and prompt_is_reasoning_end_arr[i] is None
                     ):
-                        # only check once per choice, because prompt_token_ids
-                        # are the same for all deltas in that choice
-                        prompt_is_reasoning_end_arr[i] = (
-                            reasoning_parser.is_reasoning_end(res.prompt_token_ids)
-                        )
+                        # Only check once per choice, because prompt_token_ids
+                        # are the same for all deltas in that choice.
+                        # Some parsers (e.g. append-think) must wait for a
+                        # generated end marker and cannot infer from prompt.
+                        if reasoning_parser.supports_prompt_reasoning_end_check:
+                            prompt_is_reasoning_end_arr[i] = (
+                                reasoning_parser.is_reasoning_end(
+                                    res.prompt_token_ids
+                                )
+                            )
+                        else:
+                            prompt_is_reasoning_end_arr[i] = False
                     if finish_reason_sent[i]:
                         continue
 
@@ -1803,6 +1810,154 @@ class OpenAIServingChat(OpenAIServing):
                                 function_name_returned[i] = True
                                 tools_streamed[i] = True
 
+                        minimax_reconciled = False
+                        if (
+                            tool_choice_auto
+                            and tool_parser is not None
+                            and tool_parser.__class__.__name__ == "MinimaxM2ToolParser"
+                        ):
+                            try:
+                                parsed_info = tool_parser.extract_tool_calls(
+                                    current_text, request
+                                )
+                            except Exception:
+                                parsed_info = None
+
+                            parsed_calls = (
+                                parsed_info.tool_calls
+                                if parsed_info and parsed_info.tools_called
+                                else []
+                            )
+                            if parsed_calls:
+                                # Normalize parser cache to the final parsed view
+                                # so downstream finish handling uses complete args.
+                                tool_parser.prev_tool_call_arr = []
+                                for tc in parsed_calls:
+                                    fn = tc.function
+                                    tool_parser.prev_tool_call_arr.append(
+                                        {
+                                            "id": make_tool_call_id(
+                                                id_type=self.tool_call_id_type,
+                                                func_name=fn.name,
+                                                idx=len(tool_parser.prev_tool_call_arr),
+                                            ),
+                                            "name": fn.name,
+                                            "arguments": fn.arguments or "{}",
+                                        }
+                                    )
+
+                                while len(tool_parser.streamed_args_for_tool) < len(
+                                    parsed_calls
+                                ):
+                                    tool_parser.streamed_args_for_tool.append("")
+
+                                if hasattr(tool_parser, "tool_name_sent_arr"):
+                                    while len(tool_parser.tool_name_sent_arr) < len(
+                                        parsed_calls
+                                    ):
+                                        tool_parser.tool_name_sent_arr.append(False)
+
+                                reconcile_tool_calls: list[DeltaToolCall] = []
+                                for idx, tc in enumerate(parsed_calls):
+                                    fn = tc.function
+                                    expected_name = fn.name
+                                    expected_args = fn.arguments or "{}"
+
+                                    existing_tc = (
+                                        previous_tool_calls[i][idx]
+                                        if idx < len(previous_tool_calls[i])
+                                        else None
+                                    )
+                                    existing_fn = (
+                                        existing_tc.function
+                                        if existing_tc is not None
+                                        else None
+                                    )
+                                    existing_name = (
+                                        existing_fn.name
+                                        if isinstance(existing_fn, DeltaFunctionCall)
+                                        else None
+                                    )
+                                    existing_args = (
+                                        existing_fn.arguments
+                                        if isinstance(existing_fn, DeltaFunctionCall)
+                                        and isinstance(existing_fn.arguments, str)
+                                        else ""
+                                    )
+
+                                    if (
+                                        existing_args
+                                        and expected_args.startswith(existing_args)
+                                    ):
+                                        remaining_args = expected_args[len(existing_args) :]
+                                    elif existing_args == expected_args:
+                                        remaining_args = ""
+                                    else:
+                                        remaining_args = expected_args
+
+                                    needs_name = not existing_name
+                                    needs_emit = (
+                                        idx >= len(previous_tool_calls[i])
+                                        or needs_name
+                                        or bool(remaining_args)
+                                    )
+                                    if not needs_emit:
+                                        continue
+
+                                    reconcile_tool_calls.append(
+                                        DeltaToolCall(
+                                            index=idx,
+                                            id=tool_parser.prev_tool_call_arr[idx].get(
+                                                "id"
+                                            ),
+                                            type="function",
+                                            function=DeltaFunctionCall(
+                                                name=expected_name if needs_name else None,
+                                                arguments=remaining_args,
+                                            ).model_dump(exclude_none=True),
+                                        )
+                                    )
+
+                                    while len(previous_tool_calls[i]) <= idx:
+                                        previous_tool_calls[i].append(
+                                            DeltaToolCall(index=len(previous_tool_calls[i]))
+                                        )
+                                    merged_tc = previous_tool_calls[i][idx]
+                                    if merged_tc.function is None:
+                                        merged_tc.function = DeltaFunctionCall()
+                                    if expected_name:
+                                        merged_tc.function.name = expected_name
+                                    merged_tc.function.arguments = expected_args
+                                    merged_tc.id = tool_parser.prev_tool_call_arr[idx].get(
+                                        "id"
+                                    )
+
+                                    tool_parser.streamed_args_for_tool[idx] = expected_args
+                                    if (
+                                        hasattr(tool_parser, "tool_name_sent_arr")
+                                        and idx < len(tool_parser.tool_name_sent_arr)
+                                    ):
+                                        tool_parser.tool_name_sent_arr[idx] = True
+
+                                if reconcile_tool_calls:
+                                    reconcile_delta = DeltaMessage(
+                                        tool_calls=reconcile_tool_calls
+                                    )
+                                    reconcile_choice = ChatCompletionResponseStreamChoice(
+                                        index=i,
+                                        delta=reconcile_delta,
+                                        logprobs=None,
+                                        finish_reason=None,
+                                    )
+                                    reconcile_chunk = ChatCompletionStreamResponse(
+                                        id=request_id,
+                                        created=created_time,
+                                        model=model_name,
+                                        choices=[reconcile_choice],
+                                    )
+                                    yield f"data: {reconcile_chunk.model_dump_json()}\n\n"
+                                    minimax_reconciled = True
+
                         # check to make sure we haven't "forgotten" to stream
                         #   any tokens that were generated but previously
                         #   matched by partial json parsing
@@ -1840,6 +1995,17 @@ class OpenAIServingChat(OpenAIServing):
                             and output.finish_reason is not None
                         ):
                             should_check_unstreamed = True
+                        # Qwen3 XML parser already streams its own argument
+                        # closure chunks; forcing "remaining" emission here can
+                        # inject duplicate trailing braces and id/name-less deltas.
+                        if (
+                            should_check_unstreamed
+                            and tool_parser
+                            and tool_parser.__class__.__name__ == "Qwen3XMLToolParser"
+                        ):
+                            should_check_unstreamed = False
+                        if minimax_reconciled and tool_parser:
+                            should_check_unstreamed = False
 
                         if should_check_unstreamed and tool_parser and auto_tools_called:
                             latest_delta_len = 0

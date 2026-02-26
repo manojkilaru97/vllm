@@ -290,14 +290,17 @@ class StructuredOutputManager:
                 return True
             assert request.structured_output_request is not None
             if request.structured_output_request.reasoning_ended is None:
-                # This should be removed here, but since `openai_gptoss`
-                # is an independent code path, it is kept for now.
-                # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
-                # it can be removed.
-                request.structured_output_request.reasoning_ended = (
-                    self.reasoner.is_reasoning_end(request.prompt_token_ids or [])
-                )
-            return request.structured_output_request.reasoning_ended
+                if self.reasoner.supports_prompt_reasoning_end_check:
+                    # Legacy behavior for parsers that can safely infer
+                    # reasoning end from prompt tokens.
+                    request.structured_output_request.reasoning_ended = (
+                        self.reasoner.is_reasoning_end(request.prompt_token_ids or [])
+                    )
+                else:
+                    # For append-think style parsers, wait for a generated
+                    # </think> marker before enabling grammar constraints.
+                    request.structured_output_request.reasoning_ended = False
+            return bool(request.structured_output_request.reasoning_ended)
         return True
 
     def should_advance(self, request: "Request") -> bool:
