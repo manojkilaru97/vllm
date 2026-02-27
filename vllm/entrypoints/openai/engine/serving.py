@@ -1322,7 +1322,11 @@ class OpenAIServing:
     ) -> tuple[list[FunctionCall] | None, str | None]:
         function_calls = list[FunctionCall]()
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
-            assert content is not None
+            if content is None:
+                raise ValueError(
+                    "Forced tool call requested, but no post-reasoning content was "
+                    "generated for tool arguments."
+                )
             target_name = request.tool_choice.name
             # Forced Function Call - handle Kimi K2 marker format
             if OpenAIServing._has_kimi_k2_markers(content):
@@ -1366,7 +1370,11 @@ class OpenAIServing:
         elif request.tool_choice and isinstance(
             request.tool_choice, ChatCompletionNamedToolChoiceParam
         ):
-            assert content is not None
+            if content is None:
+                raise ValueError(
+                    "Named tool choice requested, but no post-reasoning content was "
+                    "generated for tool arguments."
+                )
             target_name = request.tool_choice.function.name
             # Forced Function Call - handle Kimi K2 marker format
             if OpenAIServing._has_kimi_k2_markers(content):
@@ -1408,7 +1416,11 @@ class OpenAIServing:
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice == "required":
-            assert content is not None
+            if content is None:
+                raise ValueError(
+                    "tool_choice='required' requested tool calls, but no "
+                    "post-reasoning content was generated."
+                )
             # Handle Kimi K2 marker format for tool_choice=required
             if OpenAIServing._has_kimi_k2_markers(content):
                 extracted_calls = OpenAIServing._extract_kimi_k2_tool_calls(content)
@@ -1436,7 +1448,8 @@ class OpenAIServing:
                             for tool_call in tool_calls
                         ]
                     )
-                except Exception:
+                except Exception as parse_err:
+                    content_preview = content.replace("\n", "\\n")[:240]
                     parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
                         request=request,
                         tokenizer=tokenizer,

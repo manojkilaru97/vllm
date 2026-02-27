@@ -296,7 +296,27 @@ class StructuredOutputManager:
                 request.structured_output_request.reasoning_ended = (
                     self.reasoner.is_reasoning_end(request.prompt_token_ids or [])
                 )
-            return bool(request.structured_output_request.reasoning_ended)
+            # Late catch-up: if the streaming transition missed setting
+            # reasoning_ended (e.g., marker split/tokenization mismatch),
+            # check full decoded token history before sampling and enable
+            # constraints immediately once reasoning has already ended.
+            if (
+                request.structured_output_request.reasoning_ended is False
+                and self.reasoner.is_reasoning_end(request.all_token_ids)
+            ):
+                request.structured_output_request.reasoning_ended = True
+            apply = bool(request.structured_output_request.reasoning_ended)
+            if not apply and not getattr(
+                request.structured_output_request,
+                "_so_logged_waiting_reasoning",
+                False,
+            ):
+                setattr(
+                    request.structured_output_request,
+                    "_so_logged_waiting_reasoning",
+                    True,
+                )
+            return apply
         return True
 
     def should_advance(self, request: "Request") -> bool:
@@ -324,6 +344,8 @@ class StructuredOutputManager:
         structured_req = request.structured_output_request
         if structured_req.reasoning_ended:
             setattr(structured_req, "_so_advance_from", 0)
+            if not getattr(structured_req, "_so_logged_reasoning_done", False):
+                setattr(structured_req, "_so_logged_reasoning_done", True)
             return True
 
         # Check if reasoning ends in *this* step
@@ -344,6 +366,8 @@ class StructuredOutputManager:
             return advance_from < len(delta_token_ids)
 
         setattr(structured_req, "_so_advance_from", None)
+        if not getattr(structured_req, "_so_logged_no_advance", False):
+            setattr(structured_req, "_so_logged_no_advance", True)
         return False
 
     def _find_reasoning_end_in_delta(
@@ -382,7 +406,6 @@ class StructuredOutputManager:
             for i, tok in enumerate(delta_token_ids):
                 if tok == end_token_id:
                     return i + 1
-
         return None
 
     def clear_backend(self) -> None:

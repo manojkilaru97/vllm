@@ -582,6 +582,45 @@ class OpenAIServingChat(OpenAIServing):
         return level
 
     @staticmethod
+    def _recover_post_reasoning_content_from_token_ids(
+        tokenizer: TokenizerLike,
+        reasoning_parser: ReasoningParser,
+        token_ids: list[int],
+        rid_hint: str,
+    ) -> str | None:
+        """Recover post-</think> content from token ids for non-streaming paths."""
+        if not token_ids:
+            return None
+
+        # Some parsers (e.g. DeepSeekV3 wrapper used by GLM configs) delegate
+        # to an inner parser that owns think token metadata.
+        parser_for_metadata: Any = getattr(reasoning_parser, "_parser", reasoning_parser)
+
+        content_ids = parser_for_metadata.extract_content_ids(token_ids)
+        if content_ids:
+            try:
+                recovered = tokenizer.decode(content_ids, skip_special_tokens=False)
+            except TypeError:
+                recovered = tokenizer.decode(content_ids)
+            return recovered if recovered != "" else None
+
+        end_token = getattr(parser_for_metadata, "end_token", None)
+        if not isinstance(end_token, str) or not end_token:
+            return None
+
+        try:
+            decoded_full = tokenizer.decode(token_ids, skip_special_tokens=False)
+        except TypeError:
+            decoded_full = tokenizer.decode(token_ids)
+
+        end_idx = decoded_full.rfind(end_token)
+        if end_idx < 0:
+            return None
+
+        recovered = decoded_full[end_idx + len(end_token) :]
+        return recovered if recovered != "" else None
+
+    @staticmethod
     def _has_kimi_k2_markers(text: str) -> bool:
         """Check if text contains Kimi K2 tool call markers."""
         markers = [
@@ -952,7 +991,6 @@ class OpenAIServingChat(OpenAIServing):
             not tool_choice_function_name
             and self._should_stream_with_auto_tool_parsing(request)
         )
-
         all_previous_token_ids: list[list[int]] | None
         function_name_returned = [False] * num_choices
         # Track previously sent arguments for named tool_choice streaming (delta computation)
@@ -1942,6 +1980,28 @@ class OpenAIServingChat(OpenAIServing):
                         # finish_reason='error' indicates a retryable error
                         self._raise_if_error(output.finish_reason, request_id)
 
+                        # Structured-decoding fallback in streaming mode:
+                        # when thinking is enabled, some models place the entire
+                        # constrained payload under reasoning and never emit
+                        # content before stop. Emit recovered content on finish.
+                        requires_structured_content = (
+                            (request.tool_choice in (None, "none"))
+                            and (
+                                request.structured_outputs is not None
+                                or request.response_format is not None
+                            )
+                        )
+                        if (
+                            reasoning_parser
+                            and requires_structured_content
+                            and (delta_message is None or not delta_message.content)
+                            and not previous_content_texts[i]
+                            and previous_reasoning_texts[i].strip()
+                        ):
+                            recovered_content = previous_reasoning_texts[i].strip()
+                            delta_message = DeltaMessage(content=recovered_content)
+                            previous_content_texts[i] = recovered_content
+
                         # CRITICAL FIX: If the parser returned a delta_message with tool_calls
                         # in this final iteration, we need to yield the NAME/ID for any tools
                         # that haven't had their name sent yet. We must NOT include arguments
@@ -2524,22 +2584,79 @@ class OpenAIServingChat(OpenAIServing):
                 reasoning, content = reasoning_parser.extract_reasoning(
                     output.text, request=request
                 )
+                raw_reasoning = reasoning
                 if not request.include_reasoning:
                     reasoning = None
             else:
                 reasoning = None
+                raw_reasoning = None
                 content = output.text
+
+            requires_forced_tool_payload = (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+            )
+            if (
+                reasoning_parser
+                and requires_forced_tool_payload
+                and content is None
+                and token_ids
+            ):
+                recovered_content = self._recover_post_reasoning_content_from_token_ids(
+                    tokenizer=tokenizer,
+                    reasoning_parser=reasoning_parser,
+                    token_ids=as_list(token_ids),
+                    rid_hint=rid_hint,
+                )
+                if recovered_content is not None:
+                    content = recovered_content
+
+            # GLM fallback: some runs in thinking mode do not emit </think> even
+            # when tool JSON is generated. In that case `extract_reasoning()`
+            # can place the JSON payload in `reasoning` and leave content None.
+            if (
+                requires_forced_tool_payload
+                and content is None
+                and isinstance(raw_reasoning, str)
+                and raw_reasoning.strip()
+            ):
+                candidate = raw_reasoning.strip()
+                content = candidate
+
+            # Structured-decoding fallback for thinking mode: with some models
+            # the parser can put the constrained payload into `reasoning` and
+            # leave `content` empty when </think> is not emitted. Preserve the
+            # generated payload as assistant content for non-tool requests.
+            requires_structured_content = (
+                (request.tool_choice in (None, "none"))
+                and (
+                    request.structured_outputs is not None
+                    or request.response_format is not None
+                )
+            )
+            if (
+                reasoning_parser
+                and requires_structured_content
+                and content is None
+                and isinstance(raw_reasoning, str)
+                and raw_reasoning.strip()
+            ):
+                candidate = raw_reasoning.strip()
+                content = candidate
 
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
-            tool_calls, content = self._parse_tool_calls_from_content(
-                request=request,
-                tokenizer=tokenizer,
-                content=content,
-                enable_auto_tools=self.enable_auto_tools,
-                tool_parser_cls=self.tool_parser,
-            )
+            try:
+                tool_calls, content = self._parse_tool_calls_from_content(
+                    request=request,
+                    tokenizer=tokenizer,
+                    content=content,
+                    enable_auto_tools=self.enable_auto_tools,
+                    tool_parser_cls=self.tool_parser,
+                )
+            except Exception:
+                raise
             tool_call_class = (
                 MistralToolCall if is_mistral_tokenizer(tokenizer) else ToolCall
             )
@@ -2563,7 +2680,11 @@ class OpenAIServingChat(OpenAIServing):
                 request.tool_choice
                 and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam
             ):
-                assert tool_calls is not None and len(tool_calls) > 0
+                if not tool_calls:
+                    raise ValueError(
+                        "Named tool choice requested, but the model did not "
+                        "produce a valid tool call payload."
+                    )
                 tool_call_class_items = []
                 for idx, tc in enumerate(tool_calls):
                     # Use native ID if available (e.g., Kimi K2),
@@ -2597,7 +2718,11 @@ class OpenAIServingChat(OpenAIServing):
 
             elif request.tool_choice and request.tool_choice == "required":
                 tool_call_class_items = []
-                assert tool_calls is not None and len(tool_calls) > 0
+                if not tool_calls:
+                    raise ValueError(
+                        "tool_choice='required' requested tool calls, but the model "
+                        "did not produce a valid tool-call payload."
+                    )
                 for idx, tool_call in enumerate(tool_calls):
                     # Use native ID if available,
                     # otherwise generate ID with correct id_type
