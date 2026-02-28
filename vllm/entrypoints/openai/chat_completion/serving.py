@@ -1140,13 +1140,16 @@ class OpenAIServingChat(OpenAIServing):
 
                     delta_message: DeltaMessage | None
 
+                    # Named tool_choice streaming also needs accumulated text even
+                    # when auto tool parsing and reasoning parser are both disabled.
+                    previous_text = previous_texts[i]
+                    current_text = previous_text + delta_text
+
                     # just update previous_texts and previous_token_ids
                     if tool_choice_auto or reasoning_parser:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
-                        previous_text = previous_texts[i]
                         previous_token_ids = all_previous_token_ids[i]
-                        current_text = previous_text + delta_text
                         # avoid the None + list error.
                         if previous_token_ids:
                             current_token_ids = previous_token_ids + as_list(
@@ -1781,9 +1784,11 @@ class OpenAIServingChat(OpenAIServing):
                         tool_choice_auto or reasoning_parser or tool_choice_function_name
                     ) and not self.use_harmony:
                         assert previous_texts is not None
-                        assert all_previous_token_ids is not None
                         previous_texts[i] = current_text
-                        all_previous_token_ids[i] = current_token_ids
+                        # Token-id history is tracked only for auto tool parsing
+                        # and/or reasoning parser paths.
+                        if all_previous_token_ids is not None:
+                            all_previous_token_ids[i] = current_token_ids
                         
                         # Track reasoning, content, and tool calls separately for logging
                         if delta_message:
@@ -1982,6 +1987,66 @@ class OpenAIServingChat(OpenAIServing):
                                 function_name_returned[i] = True
                                 tools_streamed[i] = True
 
+                        # AUTO TOOL_CHOICE FINISH HANDLING:
+                        # If no tool_call delta was streamed but final accumulated
+                        # text still contains parseable tool calls (e.g. Kimi markers
+                        # or auto+structured_outputs JSON args), recover them now.
+                        if (
+                            tool_choice_auto
+                            and not tools_streamed[i]
+                            and (delta_message is None or not delta_message.tool_calls)
+                        ):
+                            assert previous_texts is not None
+                            finish_accumulated_text = previous_texts[i]
+                            parsed_calls = None
+                            if finish_accumulated_text.strip():
+                                try:
+                                    parsed_calls, _ = self._parse_tool_calls_from_content(
+                                        request=request,
+                                        tokenizer=tokenizer,
+                                        content=finish_accumulated_text,
+                                        enable_auto_tools=self.enable_auto_tools,
+                                        tool_parser_cls=self.tool_parser,
+                                    )
+                                except Exception:
+                                    parsed_calls = None
+
+                            recovered_tool_calls: list[DeltaToolCall] = []
+                            for j, call in enumerate(parsed_calls or []):
+                                if not call.name:
+                                    continue
+                                args = (
+                                    call.arguments
+                                    if call.arguments is not None
+                                    else "{}"
+                                )
+                                tool_call_id = call.id
+                                if tool_call_id is None:
+                                    tool_call_id = make_tool_call_id(
+                                        id_type=self.tool_call_id_type,
+                                        func_name=call.name,
+                                        idx=history_tool_call_cnt + j,
+                                    )
+                                recovered_tool_calls.append(
+                                    DeltaToolCall(
+                                        id=tool_call_id,
+                                        type="function",
+                                        function=DeltaFunctionCall(
+                                            name=call.name,
+                                            arguments=args,
+                                        ),
+                                        index=j,
+                                    )
+                                )
+
+                            if recovered_tool_calls:
+                                delta_message = DeltaMessage(
+                                    tool_calls=recovered_tool_calls
+                                )
+                                function_name_returned[i] = True
+                                tools_streamed[i] = True
+                                history_tool_call_cnt += len(recovered_tool_calls)
+
                         # check to make sure we haven't "forgotten" to stream
                         #   any tokens that were generated but previously
                         #   matched by partial json parsing
@@ -2046,16 +2111,29 @@ class OpenAIServingChat(OpenAIServing):
                                 )
 
                             # get the expected call based on partial JSON
-                            # parsing which "autocompletes" the JSON
-                            raw_args = tool_parser.prev_tool_call_arr[index].get(
-                                "arguments", {}
+                            # parsing which "autocompletes" the JSON.
+                            # Parser and serving can momentarily diverge at
+                            # stream boundaries; guard against out-of-range.
+                            prev_tool_calls = getattr(
+                                tool_parser, "prev_tool_call_arr", []
                             )
-                            # Some parsers (e.g., kimi) store arguments as a string,
-                            # others store as a dict. Only json.dumps if it's a dict.
-                            if isinstance(raw_args, str):
-                                expected_call = raw_args
+                            if (
+                                isinstance(prev_tool_calls, list)
+                                and 0 <= index < len(prev_tool_calls)
+                            ):
+                                raw_args = prev_tool_calls[index].get(
+                                    "arguments", {}
+                                )
+                                # Some parsers (e.g., kimi) store arguments as
+                                # a string, others store as a dict.
+                                if isinstance(raw_args, str):
+                                    expected_call = raw_args
+                                else:
+                                    expected_call = json.dumps(
+                                        raw_args, ensure_ascii=False
+                                    )
                             else:
-                                expected_call = json.dumps(raw_args, ensure_ascii=False)
+                                expected_call = ""
 
                             # get what we've streamed so far for arguments
                             # for the current tool

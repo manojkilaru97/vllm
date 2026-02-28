@@ -1455,6 +1455,18 @@ class OpenAIServing:
             and enable_auto_tools
             and (request.tool_choice == "auto" or request.tool_choice is None)
         ):
+            assert content is not None
+            # Kimi K2 can emit raw marker-wrapped tool call text in auto mode.
+            # Fall back to marker extraction so we don't leak markers as content.
+            if OpenAIServing._has_kimi_k2_markers(content):
+                extracted_calls = OpenAIServing._extract_kimi_k2_tool_calls(content)
+                if extracted_calls:
+                    for func_name, args in extracted_calls:
+                        function_calls.append(
+                            FunctionCall(name=func_name, arguments=args)
+                        )
+                    return function_calls, None
+
             if tokenizer is None:
                 raise ValueError(
                     "Tokenizer not available when `skip_tokenizer_init=True`"
@@ -1484,6 +1496,44 @@ class OpenAIServing:
                 if content and content.strip() == "":
                     content = None
             else:
+                # No tool calls from parser. For the common single-tool
+                # auto+structured_outputs pattern, models may emit only a JSON
+                # argument object in content; convert that into a tool call.
+                if (
+                    isinstance(request, ChatCompletionRequest)
+                    and request.tools
+                    and len(request.tools) == 1
+                    and request.structured_outputs is not None
+                ):
+                    first_tool = request.tools[0]
+                    if isinstance(first_tool, dict):
+                        first_fn = first_tool.get("function", {})
+                    else:
+                        first_fn = getattr(first_tool, "function", None)
+                    if isinstance(first_fn, dict):
+                        first_name = first_fn.get("name")
+                    else:
+                        first_name = getattr(first_fn, "name", None)
+                    if isinstance(first_name, str) and first_name:
+                        stripped_content = content.strip() if content else ""
+                        json_candidate = OpenAIServing._strip_non_json_prefix(
+                            stripped_content, prefer_array=False
+                        )
+                        try:
+                            parsed_obj = json.loads(json_candidate)
+                            if isinstance(parsed_obj, dict):
+                                function_calls.append(
+                                    FunctionCall(
+                                        name=first_name,
+                                        arguments=json.dumps(
+                                            parsed_obj, ensure_ascii=False
+                                        ),
+                                    )
+                                )
+                                return function_calls, None
+                        except json.JSONDecodeError:
+                            pass
+
                 # No tool calls.
                 return None, content
 
