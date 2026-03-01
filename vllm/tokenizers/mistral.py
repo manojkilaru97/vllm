@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from pathlib import Path
+import hashlib
 from typing import TYPE_CHECKING, Any, cast, overload
 
 from mistral_common.protocol.instruct.request import (
@@ -77,33 +78,46 @@ def maybe_serialize_tool_calls(request: "MistralChatCompletionRequest"):
 
 
 def truncate_tool_call_ids(request: "MistralChatCompletionRequest"):
-    """Truncates tool call IDs for Mistral's ID requirements."""
+    """Normalizes tool call IDs for Mistral's strict ID requirements."""
+
+    def _normalize_tool_call_id(raw_id: Any) -> str:
+        # Mistral requires [a-zA-Z0-9]{9}. Keep alnum chars and deterministically
+        # pad with hash bytes when too short.
+        original = "" if raw_id is None else str(raw_id)
+        cleaned = "".join(ch for ch in original if ch.isalnum())
+        if len(cleaned) >= 9:
+            return cleaned[-9:]
+
+        digest = hashlib.sha1(original.encode("utf-8")).hexdigest()
+        return (cleaned + digest)[:9]
+
     for i, message in enumerate(request.messages):
         if message.get("role") == "assistant":
             tool_calls = message.get("tool_calls", [])
             for tool_call in tool_calls:
-                if len(tool_call["id"]) > 9:
+                original_id = str(tool_call.get("id", ""))
+                normalized_id = _normalize_tool_call_id(original_id)
+                if original_id != normalized_id:
                     logger.warning(
-                        "Truncating tool call ID: %s to %s",
-                        tool_call["id"],
-                        tool_call["id"][-9:],
+                        "Normalizing tool call ID: %s to %s",
+                        original_id,
+                        normalized_id,
                     )
-                    tool_call["id"] = tool_call["id"][-9:]
+                    tool_call["id"] = normalized_id
 
             request.messages[i]["tool_calls"] = tool_calls
 
         elif message.get("role") in {"tool_results", "tool"}:
             if "tool_call_id" in message:
-                tool_call_id = message["tool_call_id"]
-
-                if len(tool_call_id) > 9:
+                tool_call_id = str(message["tool_call_id"])
+                normalized_tool_call_id = _normalize_tool_call_id(tool_call_id)
+                if tool_call_id != normalized_tool_call_id:
                     logger.warning(
-                        "Truncating tool_call_id: %s to %s",
+                        "Normalizing tool_call_id: %s to %s",
                         tool_call_id,
-                        tool_call_id[-9:],
+                        normalized_tool_call_id,
                     )
-                    tool_call_id = tool_call_id[-9:]
-                request.messages[i]["tool_call_id"] = tool_call_id
+                request.messages[i]["tool_call_id"] = normalized_tool_call_id
 
 
 def _prepare_apply_chat_template_tools_and_messages(

@@ -237,7 +237,7 @@ class OpenAIServingChat(OpenAIServing):
         self,
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
-    ) -> tuple[list[ConversationMessage], list[ProcessorInputs]] | ErrorResponse:
+    ) -> tuple[list[ConversationMessage], list[TokPrompt]] | ErrorResponse:
         """
         render chat request by validating and preprocessing inputs.
 
@@ -1196,13 +1196,17 @@ class OpenAIServingChat(OpenAIServing):
 
                     delta_message: DeltaMessage | None
 
-                    # just update previous_texts and previous_token_ids
-                    if tool_choice_auto or reasoning_parser:
+                    # Track text accumulation for tool/reasoning streaming paths.
+                    if tool_choice_auto or reasoning_parser or tool_choice_function_name:
                         assert previous_texts is not None
-                        assert all_previous_token_ids is not None
                         previous_text = previous_texts[i]
-                        previous_token_ids = all_previous_token_ids[i]
                         current_text = previous_text + delta_text
+
+                    # Token-id accumulation is only needed when parsing auto
+                    # tools or reasoning traces.
+                    if tool_choice_auto or reasoning_parser:
+                        assert all_previous_token_ids is not None
+                        previous_token_ids = all_previous_token_ids[i]
                         # avoid the None + list error.
                         if previous_token_ids:
                             current_token_ids = previous_token_ids + as_list(
@@ -1797,9 +1801,9 @@ class OpenAIServingChat(OpenAIServing):
                         tool_choice_auto or reasoning_parser or tool_choice_function_name
                     ) and not self.use_harmony:
                         assert previous_texts is not None
-                        assert all_previous_token_ids is not None
                         previous_texts[i] = current_text
-                        all_previous_token_ids[i] = current_token_ids
+                        if all_previous_token_ids is not None:
+                            all_previous_token_ids[i] = current_token_ids
                         
                         # Track reasoning, content, and tool calls separately for logging
                         if delta_message:

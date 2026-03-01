@@ -12,6 +12,7 @@ import threading
 from asyncio import FIRST_COMPLETED, AbstractEventLoop, Future, Task
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
+from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 
 from transformers.tokenization_utils_base import BatchEncoding
