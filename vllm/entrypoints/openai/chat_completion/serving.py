@@ -233,6 +233,69 @@ class OpenAIServingChat(OpenAIServing):
             # Log but don't fail server startup if warmup fails
             logger.exception("Chat template warmup failed")
 
+    @staticmethod
+    def _mm_logging_enabled() -> bool:
+        return os.getenv("VLLM_LOG_MM_INPUT_METADATA", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    @staticmethod
+    def _redact_mm_payload_for_logging(payload: Any) -> Any:
+        """Redact multimodal media URLs from payload logs unless MM logging is enabled."""
+        if not isinstance(payload, dict):
+            return payload
+
+        redacted_payload = dict(payload)
+        messages = redacted_payload.get("messages")
+        if not isinstance(messages, list):
+            return redacted_payload
+
+        redacted_messages: list[Any] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                redacted_messages.append(msg)
+                continue
+
+            new_msg = dict(msg)
+            content = new_msg.get("content")
+
+            if isinstance(content, list):
+                new_parts: list[Any] = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        new_parts.append(part)
+                        continue
+
+                    new_part = dict(part)
+                    p_type = new_part.get("type")
+                    if p_type in ("image_url", "video_url"):
+                        field = "image_url" if p_type == "image_url" else "video_url"
+                        field_val = new_part.get(field)
+                        if isinstance(field_val, dict):
+                            redacted_val = dict(field_val)
+                            if isinstance(redacted_val.get("url"), str):
+                                redacted_val["url"] = "[REDACTED_MM_URL]"
+                            new_part[field] = redacted_val
+                        elif isinstance(field_val, str):
+                            new_part[field] = {"url": "[REDACTED_MM_URL]"}
+                    new_parts.append(new_part)
+                new_msg["content"] = new_parts
+            elif isinstance(content, str):
+                # Redact inline data/image/video URLs in free-form text.
+                new_msg["content"] = re.sub(
+                    r"data:(?:image|video)/[^\"'\\s>]+",
+                    "[REDACTED_MM_URL]",
+                    content,
+                )
+
+            redacted_messages.append(new_msg)
+
+        redacted_payload["messages"] = redacted_messages
+        return redacted_payload
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -272,6 +335,8 @@ class OpenAIServingChat(OpenAIServing):
                     req_dump = request.model_dump()
                 except Exception:
                     req_dump = None
+                if not self._mm_logging_enabled():
+                    req_dump = self._redact_mm_payload_for_logging(req_dump)
                 try:
                     payload_logger.info(
                         "openai.request",

@@ -468,6 +468,11 @@ def _media_mirror_enabled() -> bool:
     return _is_truthy(os.getenv("VLLM_MEDIA_MIRROR_ENABLE", os.getenv("KRATOS_BULKUPLOAD_ENABLE", "0")))
 
 
+def _mm_logging_enabled() -> bool:
+    # MM logging is explicitly gated for compliance-sensitive media.
+    return _is_truthy(os.getenv("VLLM_LOG_MM_INPUT_METADATA", "0"))
+
+
 def _start_media_mirror_worker() -> None:
     global _MEDIA_MIRROR_QUEUE, _MEDIA_MIRROR_THREAD
     if _MEDIA_MIRROR_THREAD is not None and _MEDIA_MIRROR_QUEUE is not None:
@@ -563,6 +568,8 @@ def enqueue_media_mirror(
     """
     if not rid or not original or not isinstance(data, (bytes, bytearray)):
         return
+    if not _mm_logging_enabled():
+        return
     if not _media_mirror_enabled():
         return
 
@@ -607,6 +614,8 @@ class _KratosOffloadFilter(logging.Filter):
     def _offload_data_uris_in_string(self, text: str, record: logging.LogRecord) -> str:
         if not text or "base64," not in text:
             return text
+        if not _mm_logging_enabled():
+            return text
 
         def _maybe_upload(m: re.Match) -> str:
             full = m.group(0)
@@ -622,6 +631,8 @@ class _KratosOffloadFilter(logging.Filter):
             elif is_image:
                 should_offload = est_bytes >= self.image_threshold_bytes
             else:
+                return full
+            if not should_offload:
                 return full
 
             try:
