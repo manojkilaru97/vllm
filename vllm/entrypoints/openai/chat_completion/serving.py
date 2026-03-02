@@ -1879,25 +1879,31 @@ class OpenAIServingChat(OpenAIServing):
                             if delta_message.tool_calls:
                                 # Track tool calls - merge or add new ones
                                 for delta_tc in delta_message.tool_calls:
-                                    if delta_tc.index is not None:
-                                        # Ensure we have enough slots
-                                        while len(previous_tool_calls[i]) <= delta_tc.index:
-                                            previous_tool_calls[i].append(DeltaToolCall(index=len(previous_tool_calls[i])))
-                                        # Merge with existing tool call at this index
-                                        existing_tc = previous_tool_calls[i][delta_tc.index]
-                                        if delta_tc.id is not None:
-                                            existing_tc.id = delta_tc.id
-                                        if delta_tc.type is not None:
-                                            existing_tc.type = delta_tc.type
-                                        if delta_tc.function is not None:
-                                            if existing_tc.function is None:
-                                                existing_tc.function = DeltaFunctionCall()
-                                            if delta_tc.function.name is not None:
-                                                existing_tc.function.name = delta_tc.function.name
-                                            if delta_tc.function.arguments is not None:
-                                                if existing_tc.function.arguments is None:
-                                                    existing_tc.function.arguments = ""
-                                                existing_tc.function.arguments += delta_tc.function.arguments
+                                    tc_index = (
+                                        delta_tc.index if delta_tc.index is not None else 0
+                                    )
+                                    if not request.parallel_tool_calls and tc_index != 0:
+                                        continue
+                                    # Ensure we have enough slots
+                                    while len(previous_tool_calls[i]) <= tc_index:
+                                        previous_tool_calls[i].append(
+                                            DeltaToolCall(index=len(previous_tool_calls[i]))
+                                        )
+                                    # Merge with existing tool call at this index
+                                    existing_tc = previous_tool_calls[i][tc_index]
+                                    if delta_tc.id is not None:
+                                        existing_tc.id = delta_tc.id
+                                    if delta_tc.type is not None:
+                                        existing_tc.type = delta_tc.type
+                                    if delta_tc.function is not None:
+                                        if existing_tc.function is None:
+                                            existing_tc.function = DeltaFunctionCall()
+                                        if delta_tc.function.name is not None:
+                                            existing_tc.function.name = delta_tc.function.name
+                                        if delta_tc.function.arguments is not None:
+                                            if existing_tc.function.arguments is None:
+                                                existing_tc.function.arguments = ""
+                                            existing_tc.function.arguments += delta_tc.function.arguments
                     else:
                         # Update for comprehensive logging even in simple case
                         assert previous_texts is not None
@@ -1912,25 +1918,31 @@ class OpenAIServingChat(OpenAIServing):
                             if delta_message.tool_calls:
                                 # Track tool calls - merge or add new ones
                                 for delta_tc in delta_message.tool_calls:
-                                    if delta_tc.index is not None:
-                                        # Ensure we have enough slots
-                                        while len(previous_tool_calls[i]) <= delta_tc.index:
-                                            previous_tool_calls[i].append(DeltaToolCall(index=len(previous_tool_calls[i])))
-                                        # Merge with existing tool call at this index
-                                        existing_tc = previous_tool_calls[i][delta_tc.index]
-                                        if delta_tc.id is not None:
-                                            existing_tc.id = delta_tc.id
-                                        if delta_tc.type is not None:
-                                            existing_tc.type = delta_tc.type
-                                        if delta_tc.function is not None:
-                                            if existing_tc.function is None:
-                                                existing_tc.function = DeltaFunctionCall()
-                                            if delta_tc.function.name is not None:
-                                                existing_tc.function.name = delta_tc.function.name
-                                            if delta_tc.function.arguments is not None:
-                                                if existing_tc.function.arguments is None:
-                                                    existing_tc.function.arguments = ""
-                                                existing_tc.function.arguments += delta_tc.function.arguments
+                                    tc_index = (
+                                        delta_tc.index if delta_tc.index is not None else 0
+                                    )
+                                    if not request.parallel_tool_calls and tc_index != 0:
+                                        continue
+                                    # Ensure we have enough slots
+                                    while len(previous_tool_calls[i]) <= tc_index:
+                                        previous_tool_calls[i].append(
+                                            DeltaToolCall(index=len(previous_tool_calls[i]))
+                                        )
+                                    # Merge with existing tool call at this index
+                                    existing_tc = previous_tool_calls[i][tc_index]
+                                    if delta_tc.id is not None:
+                                        existing_tc.id = delta_tc.id
+                                    if delta_tc.type is not None:
+                                        existing_tc.type = delta_tc.type
+                                    if delta_tc.function is not None:
+                                        if existing_tc.function is None:
+                                            existing_tc.function = DeltaFunctionCall()
+                                        if delta_tc.function.name is not None:
+                                            existing_tc.function.name = delta_tc.function.name
+                                        if delta_tc.function.arguments is not None:
+                                            if existing_tc.function.arguments is None:
+                                                existing_tc.function.arguments = ""
+                                            existing_tc.function.arguments += delta_tc.function.arguments
 
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
