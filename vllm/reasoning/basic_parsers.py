@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 from abc import abstractmethod
 from collections.abc import Iterable, Sequence
 from itertools import islice
@@ -101,6 +102,20 @@ class BaseThinkingReasoningParser(ReasoningParser):
         Handles streaming output where previous + delta = current.
         Uses token IDs for faster processing.
         """
+        def _sanitize_content(content: str | None) -> str | None:
+            if not content:
+                return None
+            # Strip duplicated/stray leading end markers that can appear when
+            # reasoning budget enforcement and model output both emit </think>.
+            leading_end_markers = rf"^(?:\s*{re.escape(self.end_token)})+\s*"
+            content = re.sub(leading_end_markers, "", content)
+            # Also remove any residual end markers that may be generated later
+            # in the content stream for truncated-budget edge cases.
+            content = content.replace(self.end_token, "")
+            if content.startswith("\n\n"):
+                content = content[2:]
+            return content or None
+
         # Skip single special tokens
         if len(delta_token_ids) == 1 and (
             delta_token_ids[0] in [self.start_token_id, self.end_token_id]
@@ -117,12 +132,13 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 reasoning = delta_text[:end_index]
                 content = delta_text[end_index + len(self.end_token) :]
                 return DeltaMessage(
-                    reasoning=reasoning, content=content if content else None
+                    reasoning=reasoning,
+                    content=_sanitize_content(content),
                 )
             elif self.end_token_id in previous_token_ids:
                 # start token in previous, end token in previous,
                 # reasoning content continues
-                return DeltaMessage(content=delta_text)
+                return DeltaMessage(content=_sanitize_content(delta_text))
             else:
                 # start token in previous, no end token in previous or delta,
                 # reasoning content continues
@@ -136,7 +152,8 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 reasoning = delta_text[start_index + len(self.start_token) : end_index]
                 content = delta_text[end_index + len(self.end_token) :]
                 return DeltaMessage(
-                    reasoning=reasoning, content=content if content else None
+                    reasoning=reasoning,
+                    content=_sanitize_content(content),
                 )
             else:
                 # start token in delta, no end token in delta,
@@ -144,7 +161,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 return DeltaMessage(reasoning=delta_text)
         else:
             # not find thinking start token
-            return DeltaMessage(content=delta_text)
+            return DeltaMessage(content=_sanitize_content(delta_text))
 
     def extract_reasoning(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
@@ -155,6 +172,16 @@ class BaseThinkingReasoningParser(ReasoningParser):
         This is the base implementation that works for most models.
         Subclasses can override this method for specific behavior.
         """
+        def _sanitize_content(content: str | None) -> str | None:
+            if not content:
+                return None
+            leading_end_markers = rf"^(?:\s*{re.escape(self.end_token)})+\s*"
+            content = re.sub(leading_end_markers, "", content)
+            content = content.replace(self.end_token, "")
+            if content.startswith("\n\n"):
+                content = content[2:]
+            return content or None
+
         # Check if the start token is present in the model output, remove it
         # if it is present.
         model_output_parts = model_output.partition(self.start_token)
@@ -169,7 +196,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
         else:
             reasoning, _, content = model_output.partition(self.end_token)
             # If generation stops right after end-of-think, return null content
-            final_content = content or None
+            final_content = _sanitize_content(content)
             return reasoning, final_content
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
