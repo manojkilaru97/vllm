@@ -436,7 +436,6 @@ class QwenVLProcessingInfo(BaseProcessingInfo):
         config = self.get_hf_config()
         vision_config = config.visual
         image_size = vision_config["image_size"]
-
         return self.ctx.init_processor(
             QwenVLProcessor,
             tokenizer=self.get_tokenizer(),
