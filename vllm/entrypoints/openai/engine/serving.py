@@ -1295,6 +1295,81 @@ class OpenAIServing:
         return simple_calls
 
     @staticmethod
+    def _infer_tool_name_from_arguments(
+        request: ResponsesRequest | ChatCompletionRequest,
+        arguments: str | None,
+    ) -> str | None:
+        """Infer a tool name from JSON args and request tool schemas.
+
+        This is a best-effort fallback for checkpoints that emit arguments
+        without a tool name in auto-tool mode.
+        """
+        if not arguments:
+            return None
+
+        tools = getattr(request, "tools", None) or []
+        if not tools:
+            return None
+
+        try:
+            parsed_args = json.loads(arguments)
+        except Exception:
+            return None
+
+        if not isinstance(parsed_args, dict):
+            return None
+
+        if len(tools) == 1:
+            only_tool = getattr(tools[0], "function", None)
+            return getattr(only_tool, "name", None)
+
+        arg_keys = {k for k in parsed_args.keys() if isinstance(k, str)}
+        if not arg_keys:
+            return None
+
+        scored_candidates: list[tuple[int, str]] = []
+        for tool in tools:
+            function = getattr(tool, "function", None)
+            name = getattr(function, "name", None)
+            schema = getattr(function, "parameters", None) or {}
+            if not name or not isinstance(schema, dict):
+                continue
+
+            properties = schema.get("properties") or {}
+            if not isinstance(properties, dict):
+                properties = {}
+            prop_keys = {k for k in properties.keys() if isinstance(k, str)}
+
+            required = schema.get("required") or []
+            if not isinstance(required, list):
+                required = []
+            required_keys = {k for k in required if isinstance(k, str)}
+
+            if required_keys and not required_keys.issubset(arg_keys):
+                continue
+
+            overlap = len(arg_keys & prop_keys)
+            extra = len(arg_keys - prop_keys) if prop_keys else 0
+            score = (20 if required_keys else 0) + (5 * overlap) - extra
+
+            if score > 0:
+                scored_candidates.append((score, name))
+
+        if not scored_candidates:
+            return None
+
+        scored_candidates.sort(reverse=True)
+        best_score, best_name = scored_candidates[0]
+        if len(scored_candidates) == 1:
+            return best_name
+
+        second_score = scored_candidates[1][0]
+        if best_score > second_score:
+            return best_name
+
+        return None
+
+    @staticmethod
     def _strip_non_json_prefix(content: str, prefer_array: bool = False) -> str:
         """Best-effort removal of natural-language prefixes before JSON payload."""
         stripped = content.lstrip()

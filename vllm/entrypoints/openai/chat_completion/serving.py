@@ -2268,7 +2268,26 @@ class OpenAIServingChat(OpenAIServing):
                                         if tidx >= len(parsed_calls):
                                             continue
                                         recovered = parsed_calls[tidx]
-                                        if not recovered.name:
+                                        recovered_name = recovered.name
+                                        if not recovered_name:
+                                            existing_args = None
+                                            if (
+                                                tidx < len(previous_tool_calls[i])
+                                                and previous_tool_calls[i][tidx].function
+                                            ):
+                                                existing_args = (
+                                                    previous_tool_calls[i][tidx]
+                                                    .function
+                                                    .arguments
+                                                )
+                                            recovered_name = (
+                                                self._infer_tool_name_from_arguments(
+                                                    request=request,
+                                                    arguments=existing_args
+                                                    or recovered.arguments,
+                                                )
+                                            )
+                                        if not recovered_name:
                                             continue
 
                                         recovered_delta = DeltaMessage(
@@ -2278,7 +2297,7 @@ class OpenAIServingChat(OpenAIServing):
                                                     id=recovered.id,
                                                     type="function",
                                                     function=DeltaFunctionCall(
-                                                        name=recovered.name
+                                                        name=recovered_name
                                                     ).model_dump(exclude_none=True),
                                                 )
                                             ]
@@ -2311,7 +2330,7 @@ class OpenAIServingChat(OpenAIServing):
                                                 DeltaFunctionCall()
                                             )
                                         previous_tool_calls[i][tidx].function.name = (
-                                            recovered.name
+                                            recovered_name
                                         )
 
                         # Send the finish response for each request.n only once
