@@ -302,6 +302,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "keyed by modality. Merged with engine-level media_io_kwargs."
         ),
     )
+    guided_json: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Alias for structured_outputs.json, used by some OpenAI-compatible "
+            "clients such as LangChain ChatNVIDIA."
+        ),
+    )
+    guided_choice: list[str] | None = Field(
+        default=None,
+        description=(
+            "Alias for structured_outputs.choice, used by some "
+            "OpenAI-compatible clients such as LangChain ChatNVIDIA."
+        ),
+    )
     mm_processor_kwargs: dict[str, Any] | None = Field(
         default=None,
         description=("Additional kwargs to pass to the HF processor."),
@@ -549,6 +563,39 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
         )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_guided_decoding_aliases(cls, data):
+        if isinstance(data, ValueError):
+            raise data
+        if not isinstance(data, dict):
+            return data
+
+        guided_json = data.get("guided_json")
+        guided_choice = data.get("guided_choice")
+        alias_count = sum(x is not None for x in (guided_json, guided_choice))
+        if alias_count == 0:
+            return data
+        if alias_count > 1:
+            raise VLLMValidationError(
+                "Only one of guided_json or guided_choice may be provided.",
+                parameter="guided_json",
+            )
+
+        structured_outputs = data.get("structured_outputs")
+        if structured_outputs is not None:
+            raise VLLMValidationError(
+                "Cannot specify both structured_outputs and guided_json/"
+                "guided_choice.",
+                parameter="structured_outputs",
+            )
+
+        if guided_json is not None:
+            data["structured_outputs"] = {"json": guided_json}
+        else:
+            data["structured_outputs"] = {"choice": guided_choice}
+        return data
 
     @model_validator(mode="before")
     @classmethod
