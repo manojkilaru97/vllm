@@ -1245,8 +1245,53 @@ class OpenAIServing:
     @staticmethod
     def _looks_like_xml_tool_call(text: str) -> bool:
         """Best-effort detection for XML-style tool-call envelopes."""
-        markers = ("<tool_call>", "</tool_call>", "<function=", "<parameter=")
+        markers = (
+            "<tool_call>",
+            "</tool_call>",
+            "<function=",
+            "<parameter=",
+            "<use_tool>",
+            "</use_tool>",
+            "<tool_name>",
+            "<tool_calls>",
+            "<name>",
+        )
         return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _extract_simple_xml_tool_calls(content: str) -> list[FunctionCall]:
+        """Extract tool calls from lightweight XML envelopes.
+
+        Supports patterns seen from some Kimi checkpoints, for example:
+        - <use_tool><tool_name>calculate</tool_name><parameters>{...}</parameters></use_tool>
+        - <Tool_calls><Tool_call1><name>get_weather</name><parameters>{...}</parameters></Tool_call1>...</Tool_calls>
+        """
+        simple_calls: list[FunctionCall] = []
+
+        single_pattern = re.compile(
+            r"<use_tool>\s*.*?<tool_name>\s*(?P<name>[^<]+?)\s*</tool_name>\s*"
+            r".*?<parameters>\s*(?P<args>\{.*?\})\s*</parameters>\s*.*?</use_tool>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        multi_pattern = re.compile(
+            r"<tool_call\d*>\s*.*?<name>\s*(?P<name>[^<]+?)\s*</name>\s*"
+            r".*?<parameters>\s*(?P<args>\{.*?\})\s*</parameters>\s*.*?</tool_call\d*>",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        for match in single_pattern.finditer(content):
+            name = (match.group("name") or "").strip()
+            args = (match.group("args") or "").strip()
+            if name and args:
+                simple_calls.append(FunctionCall(name=name, arguments=args))
+
+        for match in multi_pattern.finditer(content):
+            name = (match.group("name") or "").strip()
+            args = (match.group("args") or "").strip()
+            if name and args:
+                simple_calls.append(FunctionCall(name=name, arguments=args))
+
+        return simple_calls
 
     @staticmethod
     def _strip_non_json_prefix(content: str, prefer_array: bool = False) -> str:
@@ -1336,7 +1381,16 @@ class OpenAIServing:
                     stripped_content, prefer_array=False
                 )
                 arguments = content
-                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                simple_xml_calls = OpenAIServing._extract_simple_xml_tool_calls(
+                    stripped_content
+                )
+                if simple_xml_calls:
+                    matched = next(
+                        (fc for fc in simple_xml_calls if fc.name == target_name),
+                        simple_xml_calls[0],
+                    )
+                    arguments = matched.arguments
+                elif OpenAIServing._looks_like_xml_tool_call(stripped_content):
                     parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
                         request=request,
                         tokenizer=tokenizer,
@@ -1380,7 +1434,16 @@ class OpenAIServing:
                     stripped_content, prefer_array=False
                 )
                 arguments = content
-                if OpenAIServing._looks_like_xml_tool_call(stripped_content):
+                simple_xml_calls = OpenAIServing._extract_simple_xml_tool_calls(
+                    stripped_content
+                )
+                if simple_xml_calls:
+                    matched = next(
+                        (fc for fc in simple_xml_calls if fc.name == target_name),
+                        simple_xml_calls[0],
+                    )
+                    arguments = matched.arguments
+                elif OpenAIServing._looks_like_xml_tool_call(stripped_content):
                     parsed_calls = OpenAIServing._extract_tool_calls_with_parser(
                         request=request,
                         tokenizer=tokenizer,
@@ -1418,6 +1481,12 @@ class OpenAIServing:
                         FunctionCall(name=func_name, arguments=args)
                     )
             else:
+                simple_xml_calls = OpenAIServing._extract_simple_xml_tool_calls(content)
+                if simple_xml_calls:
+                    function_calls.extend(simple_xml_calls)
+                    content = None
+                    return function_calls, content
+
                 # Standard JSON format, with parser fallback for XML-like model outputs.
                 stripped_content = OpenAIServing._strip_non_json_prefix(
                     content, prefer_array=True
@@ -1466,6 +1535,11 @@ class OpenAIServing:
                             FunctionCall(name=func_name, arguments=args)
                         )
                     return function_calls, None
+
+            simple_xml_calls = OpenAIServing._extract_simple_xml_tool_calls(content)
+            if simple_xml_calls:
+                function_calls.extend(simple_xml_calls)
+                return function_calls, None
 
             if tokenizer is None:
                 raise ValueError(

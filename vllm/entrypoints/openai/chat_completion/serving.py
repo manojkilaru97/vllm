@@ -2236,6 +2236,84 @@ class OpenAIServingChat(OpenAIServing):
                                     # Mark as sent
                                     tool_parser.tool_name_sent_arr[tidx] = True
 
+                        # GENERIC AUTO FINISH RECOVERY:
+                        # Some auto-mode outputs can arrive with argument deltas
+                        # but no name chunk ever emitted. Recover names from the
+                        # accumulated raw text and send a final name-only delta.
+                        if auto_tools_called and previous_texts is not None:
+                            accumulated_finish_text = previous_texts[i]
+                            missing_name_indices = []
+                            for tidx, tc in enumerate(previous_tool_calls[i]):
+                                fn = tc.function
+                                has_args = bool(fn and fn.arguments)
+                                has_name = bool(fn and fn.name)
+                                if has_args and not has_name:
+                                    missing_name_indices.append(tidx)
+
+                            if missing_name_indices and accumulated_finish_text.strip():
+                                parsed_calls = None
+                                try:
+                                    parsed_calls, _ = self._parse_tool_calls_from_content(
+                                        request=request,
+                                        tokenizer=tokenizer,
+                                        content=accumulated_finish_text,
+                                        enable_auto_tools=self.enable_auto_tools,
+                                        tool_parser_cls=self.tool_parser,
+                                    )
+                                except Exception:
+                                    parsed_calls = None
+
+                                if parsed_calls:
+                                    for tidx in missing_name_indices:
+                                        if tidx >= len(parsed_calls):
+                                            continue
+                                        recovered = parsed_calls[tidx]
+                                        if not recovered.name:
+                                            continue
+
+                                        recovered_delta = DeltaMessage(
+                                            tool_calls=[
+                                                DeltaToolCall(
+                                                    index=tidx,
+                                                    id=recovered.id,
+                                                    type="function",
+                                                    function=DeltaFunctionCall(
+                                                        name=recovered.name
+                                                    ).model_dump(exclude_none=True),
+                                                )
+                                            ]
+                                        )
+                                        recovered_choice = (
+                                            ChatCompletionResponseStreamChoice(
+                                                index=i,
+                                                delta=recovered_delta,
+                                                logprobs=None,
+                                                finish_reason=None,
+                                            )
+                                        )
+                                        recovered_chunk = ChatCompletionStreamResponse(
+                                            id=request_id,
+                                            created=created_time,
+                                            model=model_name,
+                                            choices=[recovered_choice],
+                                        )
+                                        yield (
+                                            f"data: "
+                                            f"{recovered_chunk.model_dump_json()}\n\n"
+                                        )
+
+                                        while len(previous_tool_calls[i]) <= tidx:
+                                            previous_tool_calls[i].append(
+                                                DeltaToolCall(index=len(previous_tool_calls[i]))
+                                            )
+                                        if previous_tool_calls[i][tidx].function is None:
+                                            previous_tool_calls[i][tidx].function = (
+                                                DeltaFunctionCall()
+                                            )
+                                        previous_tool_calls[i][tidx].function.name = (
+                                            recovered.name
+                                        )
+
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
                         # finish_reason is:
