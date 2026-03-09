@@ -60,6 +60,7 @@ class OpenAIServingCompletion(OpenAIServing):
         return_tokens_as_token_ids: bool = False,
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
+        override_max_tokens: int | None = None,
     ):
         super().__init__(
             engine_client=engine_client,
@@ -74,11 +75,19 @@ class OpenAIServingCompletion(OpenAIServing):
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
-        self.override_max_tokens = (
+        configured_override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
             if mc.generation_config not in ("auto", "vllm")
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
+        if override_max_tokens is None:
+            self.override_max_tokens = configured_override_max_tokens
+        elif configured_override_max_tokens is None:
+            self.override_max_tokens = override_max_tokens
+        else:
+            self.override_max_tokens = min(
+                configured_override_max_tokens, override_max_tokens
+            )
 
     async def render_completion_request(
         self,
@@ -93,6 +102,7 @@ class OpenAIServingCompletion(OpenAIServing):
         Returns:
             A list of engine_inputs on success, or an ErrorResponse on failure.
         """
+        self._apply_max_output_len_cap(request)
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret

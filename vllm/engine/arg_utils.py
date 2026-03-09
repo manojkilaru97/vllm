@@ -395,6 +395,7 @@ class EngineArgs:
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
+    max_output_len: int | None = None
     cudagraph_capture_sizes: list[int] | None = (
         CompilationConfig.cudagraph_capture_sizes
     )
@@ -712,6 +713,16 @@ class EngineArgs:
             "--tokenizer-revision", **model_kwargs["tokenizer_revision"]
         )
         model_group.add_argument("--max-model-len", **model_kwargs["max_model_len"])
+        model_group.add_argument(
+            "--max-output-len",
+            type=int,
+            default=None,
+            help=(
+                "Maximum generated output tokens allowed per request. "
+                "Requests that ask for more will be silently capped instead "
+                "of rejected."
+            ),
+        )
         model_group.add_argument("--quantization", "-q", **model_kwargs["quantization"])
         model_group.add_argument(
             "--allow-deprecated-quantization",

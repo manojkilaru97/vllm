@@ -206,6 +206,7 @@ class OpenAIServingChat(OpenAIServing):
         enable_log_outputs: bool = False,
         enable_log_deltas: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        override_max_tokens: int | None = None,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -240,11 +241,19 @@ class OpenAIServingChat(OpenAIServing):
         self.enable_force_include_usage = enable_force_include_usage
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
-        self.override_max_tokens = (
+        configured_override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
             if mc.generation_config not in ("auto", "vllm")
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
+        if override_max_tokens is None:
+            self.override_max_tokens = configured_override_max_tokens
+        elif configured_override_max_tokens is None:
+            self.override_max_tokens = override_max_tokens
+        else:
+            self.override_max_tokens = min(
+                configured_override_max_tokens, override_max_tokens
+            )
         # Detect Kimi K2 by model_type, tool_parser name, or reasoning_parser name
         # This is needed because Kimi K2 models may have model_type="deepseek_v3"
         is_kimi_k2 = (
@@ -410,6 +419,7 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        self._apply_max_output_len_cap(request)
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
