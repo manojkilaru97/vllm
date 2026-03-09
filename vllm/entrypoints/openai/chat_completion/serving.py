@@ -2047,6 +2047,64 @@ class OpenAIServingChat(OpenAIServing):
                                 tools_streamed[i] = True
                                 history_tool_call_cnt += len(recovered_tool_calls)
 
+                        # REQUIRED TOOL_CHOICE FINISH HANDLING:
+                        # If nothing was streamed but the accumulated text can
+                        # be recovered into tool calls, emit them now instead
+                        # of ending with an empty completion or a 400 path.
+                        if (
+                            request.tool_choice == "required"
+                            and not tools_streamed[i]
+                            and (delta_message is None or not delta_message.tool_calls)
+                        ):
+                            assert previous_texts is not None
+                            finish_accumulated_text = previous_texts[i]
+                            parsed_calls = None
+                            if finish_accumulated_text.strip():
+                                try:
+                                    parsed_calls, _ = self._parse_tool_calls_from_content(
+                                        request=request,
+                                        tokenizer=tokenizer,
+                                        content=finish_accumulated_text,
+                                        enable_auto_tools=self.enable_auto_tools,
+                                        tool_parser_cls=self.tool_parser,
+                                    )
+                                except Exception:
+                                    parsed_calls = None
+
+                            recovered_tool_calls: list[DeltaToolCall] = []
+                            for j, call in enumerate(parsed_calls or []):
+                                args = (
+                                    call.arguments
+                                    if call.arguments is not None
+                                    else "{}"
+                                )
+                                tool_call_id = call.id
+                                if tool_call_id is None:
+                                    tool_call_id = make_tool_call_id(
+                                        id_type=self.tool_call_id_type,
+                                        func_name=call.name,
+                                        idx=history_tool_call_cnt + j,
+                                    )
+                                recovered_tool_calls.append(
+                                    DeltaToolCall(
+                                        id=tool_call_id,
+                                        type="function",
+                                        function=DeltaFunctionCall(
+                                            name=call.name,
+                                            arguments=args,
+                                        ),
+                                        index=j,
+                                    )
+                                )
+
+                            if recovered_tool_calls:
+                                delta_message = DeltaMessage(
+                                    tool_calls=recovered_tool_calls
+                                )
+                                function_name_returned[i] = True
+                                tools_streamed[i] = True
+                                history_tool_call_cnt += len(recovered_tool_calls)
+
                         # check to make sure we haven't "forgotten" to stream
                         #   any tokens that were generated but previously
                         #   matched by partial json parsing

@@ -1370,6 +1370,78 @@ class OpenAIServing:
         return None
 
     @staticmethod
+    def _extract_balanced_json_objects(text: str) -> list[dict[str, Any]]:
+        """Extract complete top-level JSON objects from malformed text."""
+        objs: list[dict[str, Any]] = []
+        n = len(text)
+        i = 0
+        while i < n:
+            if text[i] != "{":
+                i += 1
+                continue
+
+            start = i
+            depth = 0
+            in_string = False
+            escape = False
+
+            while i < n:
+                ch = text[i]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                else:
+                    if ch == '"':
+                        in_string = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            candidate = text[start : i + 1]
+                            try:
+                                parsed = json.loads(candidate)
+                            except Exception:
+                                break
+                            if isinstance(parsed, dict):
+                                objs.append(parsed)
+                            break
+                i += 1
+
+            i = max(i + 1, start + 1)
+
+        return objs
+
+    @staticmethod
+    def _extract_malformed_required_tool_calls(
+        request: ResponsesRequest | ChatCompletionRequest,
+        content: str,
+    ) -> list[FunctionCall]:
+        """Recover tool calls from malformed required-mode JSON text."""
+        recovered_calls: list[FunctionCall] = []
+        for obj in OpenAIServing._extract_balanced_json_objects(content):
+            name = obj.get("name")
+            parameters = obj.get("parameters")
+            if not name and isinstance(parameters, dict):
+                name = OpenAIServing._infer_tool_name_from_arguments(
+                    request=request,
+                    arguments=json.dumps(parameters, ensure_ascii=False),
+                )
+            if not name or not isinstance(parameters, dict):
+                continue
+            recovered_calls.append(
+                FunctionCall(
+                    name=name,
+                    arguments=json.dumps(parameters, ensure_ascii=False),
+                )
+            )
+        return recovered_calls
+
+    @staticmethod
     def _strip_non_json_prefix(content: str, prefer_array: bool = False) -> str:
         """Best-effort removal of natural-language prefixes before JSON payload."""
         stripped = content.lstrip()
@@ -1593,7 +1665,16 @@ class OpenAIServing:
                     if parsed_calls:
                         function_calls.extend(parsed_calls)
                     else:
-                        raise
+                        malformed_calls = (
+                            OpenAIServing._extract_malformed_required_tool_calls(
+                                request=request,
+                                content=content,
+                            )
+                        )
+                        if malformed_calls:
+                            function_calls.extend(malformed_calls)
+                        else:
+                            raise
             content = None  # Clear content since tool is called.
         elif (
             tool_parser_cls
