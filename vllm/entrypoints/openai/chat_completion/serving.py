@@ -2321,75 +2321,77 @@ class OpenAIServingChat(OpenAIServing):
                                 except Exception:
                                     parsed_calls = None
 
-                                if parsed_calls:
-                                    for tidx in missing_name_indices:
-                                        if tidx >= len(parsed_calls):
-                                            continue
-                                        recovered = parsed_calls[tidx]
-                                        recovered_name = recovered.name
-                                        if not recovered_name:
-                                            existing_args = None
-                                            if (
-                                                tidx < len(previous_tool_calls[i])
-                                                and previous_tool_calls[i][tidx].function
-                                            ):
-                                                existing_args = (
-                                                    previous_tool_calls[i][tidx]
-                                                    .function
-                                                    .arguments
-                                                )
-                                            recovered_name = (
-                                                self._infer_tool_name_from_arguments(
-                                                    request=request,
-                                                    arguments=existing_args
-                                                    or recovered.arguments,
-                                                )
+                                for tidx in missing_name_indices:
+                                    recovered = (
+                                        parsed_calls[tidx]
+                                        if parsed_calls and tidx < len(parsed_calls)
+                                        else None
+                                    )
+                                    recovered_name = recovered.name if recovered else None
+                                    existing_args = None
+                                    if (
+                                        tidx < len(previous_tool_calls[i])
+                                        and previous_tool_calls[i][tidx].function
+                                    ):
+                                        existing_args = (
+                                            previous_tool_calls[i][tidx]
+                                            .function
+                                            .arguments
+                                        )
+                                    if not recovered_name:
+                                        recovered_name = (
+                                            self._infer_tool_name_from_arguments(
+                                                request=request,
+                                                arguments=existing_args
+                                                or (recovered.arguments if recovered else None),
                                             )
-                                        if not recovered_name:
-                                            continue
+                                        )
+                                    if not recovered_name:
+                                        continue
 
-                                        recovered_delta = DeltaMessage(
-                                            tool_calls=[
-                                                DeltaToolCall(
-                                                    index=tidx,
-                                                    id=recovered.id,
-                                                    type="function",
-                                                    function=DeltaFunctionCall(
-                                                        name=recovered_name
-                                                    ).model_dump(exclude_none=True),
-                                                )
-                                            ]
-                                        )
-                                        recovered_choice = (
-                                            ChatCompletionResponseStreamChoice(
-                                                index=i,
-                                                delta=recovered_delta,
-                                                logprobs=None,
-                                                finish_reason=None,
+                                    recovered_delta = DeltaMessage(
+                                        tool_calls=[
+                                            DeltaToolCall(
+                                                index=tidx,
+                                                id=recovered.id if recovered else None,
+                                                type="function",
+                                                function=DeltaFunctionCall(
+                                                    name=recovered_name
+                                                ).model_dump(exclude_none=True),
                                             )
                                         )
-                                        recovered_chunk = ChatCompletionStreamResponse(
-                                            id=request_id,
-                                            created=created_time,
-                                            model=model_name,
-                                            choices=[recovered_choice],
+                                        ]
+                                    )
+                                    recovered_choice = (
+                                        ChatCompletionResponseStreamChoice(
+                                            index=i,
+                                            delta=recovered_delta,
+                                            logprobs=None,
+                                            finish_reason=None,
                                         )
-                                        yield (
-                                            f"data: "
-                                            f"{recovered_chunk.model_dump_json()}\n\n"
-                                        )
+                                    )
+                                    recovered_chunk = ChatCompletionStreamResponse(
+                                        id=request_id,
+                                        created=created_time,
+                                        model=model_name,
+                                        choices=[recovered_choice],
+                                    )
+                                    yield (
+                                        f"data: "
+                                        f"{recovered_chunk.model_dump_json()}\n\n"
+                                    )
 
-                                        while len(previous_tool_calls[i]) <= tidx:
-                                            previous_tool_calls[i].append(
-                                                DeltaToolCall(index=len(previous_tool_calls[i]))
-                                            )
-                                        if previous_tool_calls[i][tidx].function is None:
-                                            previous_tool_calls[i][tidx].function = (
-                                                DeltaFunctionCall()
-                                            )
-                                        previous_tool_calls[i][tidx].function.name = (
-                                            recovered_name
+                                    while len(previous_tool_calls[i]) <= tidx:
+                                        previous_tool_calls[i].append(
+                                            DeltaToolCall(index=len(previous_tool_calls[i]))
                                         )
+                                    if previous_tool_calls[i][tidx].function is None:
+                                        previous_tool_calls[i][tidx].function = (
+                                            DeltaFunctionCall()
+                                        )
+                                    previous_tool_calls[i][tidx].function.name = (
+                                        recovered_name
+                                    )
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
