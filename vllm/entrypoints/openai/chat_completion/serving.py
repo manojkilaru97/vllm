@@ -2359,7 +2359,6 @@ class OpenAIServingChat(OpenAIServing):
                                                     name=recovered_name
                                                 ).model_dump(exclude_none=True),
                                             )
-                                        )
                                         ]
                                     )
                                     recovered_choice = (
