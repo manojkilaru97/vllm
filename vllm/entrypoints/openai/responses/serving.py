@@ -174,6 +174,7 @@ class OpenAIServingResponses(OpenAIServing):
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
+        override_max_tokens: int | None = None,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -199,11 +200,19 @@ class OpenAIServingResponses(OpenAIServing):
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
-        self.override_max_tokens = (
+        configured_override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
             if mc.generation_config not in ("auto", "vllm")
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
+        if override_max_tokens is None:
+            self.override_max_tokens = configured_override_max_tokens
+        elif configured_override_max_tokens is None:
+            self.override_max_tokens = override_max_tokens
+        else:
+            self.override_max_tokens = min(
+                configured_override_max_tokens, override_max_tokens
+            )
 
         # If False (default), the "store" option is (silently) ignored and the
         # response is not stored. If True, the response is stored in memory.
@@ -330,6 +339,7 @@ class OpenAIServingResponses(OpenAIServing):
         | ResponsesResponse
         | ErrorResponse
     ):
+        self._apply_max_output_len_cap(request)
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)

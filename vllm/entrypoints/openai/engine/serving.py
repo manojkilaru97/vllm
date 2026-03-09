@@ -252,6 +252,43 @@ class OpenAIServing:
         self.io_processor = engine_client.io_processor
         self.input_processor = engine_client.input_processor
 
+    def _apply_max_output_len_cap(self, request: AnyRequest) -> None:
+        """Silently cap user-requested output length to server policy."""
+        override_max_tokens = getattr(self, "override_max_tokens", None)
+        if override_max_tokens is None:
+            return
+
+        field_name: str | None = None
+        current_value: int | None = None
+        if isinstance(request, ChatCompletionRequest):
+            if request.max_completion_tokens is not None:
+                field_name = "max_completion_tokens"
+                current_value = request.max_completion_tokens
+            elif request.max_tokens is not None:
+                field_name = "max_tokens"
+                current_value = request.max_tokens
+        elif isinstance(request, CompletionRequest):
+            if request.max_tokens is not None:
+                field_name = "max_tokens"
+                current_value = request.max_tokens
+        elif isinstance(request, ResponsesRequest):
+            if request.max_output_tokens is not None:
+                field_name = "max_output_tokens"
+                current_value = request.max_output_tokens
+
+        if (
+            field_name is not None
+            and current_value is not None
+            and current_value > override_max_tokens
+        ):
+            setattr(request, field_name, override_max_tokens)
+            logger.info(
+                "Capped %s from %d to server max_output_len=%d",
+                field_name,
+                current_value,
+                override_max_tokens,
+            )
+
     async def beam_search(
         self,
         prompt: ProcessorInputs,
