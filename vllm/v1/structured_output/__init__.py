@@ -214,7 +214,7 @@ class StructuredOutputManager:
     ) -> None:
         assert self._grammar_bitmask is not None
         for grammar, index, apply_bitmask in batch:
-            if apply_bitmask and not grammar.is_terminated():
+            if apply_bitmask:
                 grammar.fill_bitmask(self._grammar_bitmask, index)
             else:
                 # Note that for thinking support, we will need to
@@ -366,7 +366,9 @@ class StructuredOutputManager:
             return request.structured_output_request.reasoning_ended
         return True
 
-    def should_advance(self, request: "Request") -> bool:
+    def should_advance(
+        self, request: "Request", new_token_ids: list[int] | None = None
+    ) -> bool:
         if not request.use_structured_output:
             return False
 
@@ -390,18 +392,32 @@ class StructuredOutputManager:
         if structured_req.reasoning_ended:
             return True
 
-        # Check if reasoning ends in *this* step
-        delta_from = request.num_computed_tokens - request.num_output_placeholders
-        all_token_ids = request.all_token_ids
-        start = (
-            delta_from if delta_from >= 0 else max(len(all_token_ids) + delta_from, 0)
-        )
+        # Check if reasoning ends in *this* step.
+        # Prefer the exact accepted tokens from the current scheduler update
+        # when available; reconstructing the delta from num_computed_tokens and
+        # placeholder bookkeeping is fragile under async scheduling.
+        delta_ids: Iterable[int]
+        if new_token_ids is not None:
+            delta_ids = new_token_ids
+        else:
+            delta_from = request.num_computed_tokens - request.num_output_placeholders
+            all_token_ids = request.all_token_ids
+            start = (
+                delta_from
+                if delta_from >= 0
+                else max(len(all_token_ids) + delta_from, 0)
+            )
+            delta_ids = itertools.islice(all_token_ids, start, None)
         if self.reasoner.is_reasoning_end_streaming(
-            all_token_ids, itertools.islice(all_token_ids, start, None)
+            request.all_token_ids, delta_ids
         ):
             # Reasoning just ended, so we shouldn't advance til
             # next pass
             structured_req.reasoning_ended = True
+            logger.warning(
+                "Structured request %s detected reasoning end in current step.",
+                request.request_id,
+            )
 
         return False
 

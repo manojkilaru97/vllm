@@ -453,7 +453,11 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=(
+                            0
+                            if request.use_structured_output
+                            else self.num_lookahead_tokens
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -508,7 +512,13 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Speculative decode related.
-            if request.spec_token_ids:
+            if request.use_structured_output or request.disable_spec_decode:
+                # Structured decoding is still flaky under speculative
+                # acceptance for this endpoint. Keep MTP enabled globally,
+                # but force grammar/contract-sensitive requests down the
+                # non-spec path.
+                request.spec_token_ids = []
+            elif request.spec_token_ids:
                 num_scheduled_spec_tokens = (
                     num_new_tokens
                     + request.num_computed_tokens
@@ -752,7 +762,9 @@ class Scheduler(SchedulerInterface):
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                    0
+                    if request.num_computed_tokens == 0 or request.use_structured_output
+                    else self.num_lookahead_tokens
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -1318,6 +1330,10 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
+        logger.warning(
+            "Computed grammar bitmask for structured requests: %s",
+            structured_output_request_ids,
+        )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
     def update_from_output(
@@ -1382,6 +1398,20 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            if request.use_structured_output and len(generated_token_ids) > 1:
+                logger.warning(
+                    "Structured request %s received %d generated tokens in one "
+                    "update (scheduled_spec=%s, reasoning_ended=%s): %s",
+                    req_id,
+                    len(generated_token_ids),
+                    bool(scheduler_output.scheduled_spec_decode_tokens.get(req_id)),
+                    (
+                        None
+                        if request.structured_output_request is None
+                        else request.structured_output_request.reasoning_ended
+                    ),
+                    generated_token_ids,
+                )
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1429,6 +1459,18 @@ class Scheduler(SchedulerInterface):
             routed_experts = None
             finish_reason = None
             if stopped:
+                if (
+                    request.use_structured_output
+                    and request.structured_output_request is not None
+                    and not request.structured_output_request.reasoning_ended
+                ):
+                    logger.warning(
+                        "Structured request %s stopped before reasoning_ended "
+                        "became true. new_token_ids=%s finish_reason=%s",
+                        req_id,
+                        new_token_ids,
+                        request.get_finished_reason(),
+                    )
                 routed_experts = self._get_routed_experts(request)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
@@ -1451,7 +1493,9 @@ class Scheduler(SchedulerInterface):
             ):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
+            if new_token_ids and self.structured_output_manager.should_advance(
+                request, new_token_ids
+            ):
                 struct_output_request = request.structured_output_request
                 grammar = (
                     None
@@ -1468,6 +1512,11 @@ class Scheduler(SchedulerInterface):
                     )
                     request.structured_output_request = None
                 else:
+                    logger.warning(
+                        "Advancing grammar for request %s with tokens %s",
+                        req_id,
+                        new_token_ids,
+                    )
                     ok = grammar.accept_tokens(req_id, new_token_ids)
                     if not ok:
                         logger.warning(
@@ -1716,6 +1765,11 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            if request.use_structured_output or request.disable_spec_decode:
+                if request.spec_token_ids:
+                    request.spec_token_ids = []
+                continue
+
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
@@ -1735,6 +1789,10 @@ class Scheduler(SchedulerInterface):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request may have been finished. Skip.
+                continue
+
+            if request.use_structured_output or request.disable_spec_decode:
+                sched_spec_tokens.pop(req_id, None)
                 continue
 
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)

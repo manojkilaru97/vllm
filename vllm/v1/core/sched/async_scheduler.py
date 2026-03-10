@@ -26,6 +26,14 @@ class AsyncScheduler(Scheduler):
             scheduler_output.pending_structured_output_tokens |= (
                 request.use_structured_output and request.num_output_placeholders > 0
             )
+            # Structured decoding requests cannot safely consume speculative
+            # placeholders under MTP. Keep them on the single-token async path
+            # even when speculative decoding is enabled globally.
+            if request.use_structured_output:
+                request.num_output_placeholders += 1
+                request.spec_token_ids = []
+                continue
+
             # The request will generate a new token plus num_spec_tokens
             # in this scheduling step.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))

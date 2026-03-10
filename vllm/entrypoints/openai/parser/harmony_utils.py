@@ -66,7 +66,7 @@ def get_encoding():
 
 def get_system_message(
     model_identity: str | None = None,
-    reasoning_effort: Literal["high", "medium", "low"] | None = None,
+    reasoning_effort: Literal["none", "high", "medium", "low"] | None = None,
     start_date: str | None = None,
     browser_description: str | None = None,
     python_description: str | None = None,
@@ -83,7 +83,7 @@ def get_system_message(
             f"{current_identity}\n{instructions}" if current_identity else instructions
         )
         sys_msg_content = sys_msg_content.with_model_identity(new_identity)
-    if reasoning_effort is not None:
+    if reasoning_effort in REASONING_EFFORT:
         sys_msg_content = sys_msg_content.with_reasoning_effort(
             REASONING_EFFORT[reasoning_effort]
         )

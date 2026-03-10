@@ -907,12 +907,12 @@ class OpenAIServing:
             },
         )
 
-        # tool parsing is done only if a tool_parser has been set and if
-        # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
-        # is set, we want to prevent parsing a tool_call hallucinated by the LLM
+        # Tool-parser request adjustment is only for auto tool choice.
+        # Named/required tool choice should rely on grammar-constrained decoding
+        # and final validation, not parser-specific prompt shaping.
         if tool_parser is not None:
             tool_choice = getattr(request, "tool_choice", "none")
-            if tool_choice != "none":
+            if tool_choice in ("auto", None):
                 if not isinstance(request, ChatCompletionRequest | ResponsesRequest):
                     msg = (
                         "Tool usage is only supported for Chat Completions API "
@@ -1132,21 +1132,66 @@ class OpenAIServing:
         content: str | None = None,
     ) -> tuple[list[FunctionCall] | None, str | None]:
         function_calls = list[FunctionCall]()
+        parser_tool_calls: list[FunctionCall] | None = None
+
+        def try_parser_fallback() -> tuple[list[FunctionCall] | None, str | None]:
+            nonlocal parser_tool_calls
+            if parser_tool_calls is not None:
+                return parser_tool_calls, None
+            if content is None or tokenizer is None or tool_parser_cls is None:
+                return None, content
+            try:
+                tool_parser = tool_parser_cls(tokenizer)
+                tool_call_info = tool_parser.extract_tool_calls(
+                    content,
+                    request=request,  # type: ignore[arg-type]
+                )
+            except Exception:
+                logger.exception("Error in tool parser fallback.")
+                return None, content
+
+            if tool_call_info is None or not tool_call_info.tools_called:
+                return None, content
+
+            parser_tool_calls = [
+                FunctionCall(
+                    id=tool_call.id,
+                    name=tool_call.function.name,
+                    arguments=tool_call.function.arguments,
+                )
+                for tool_call in tool_call_info.tool_calls
+            ]
+            return parser_tool_calls, tool_call_info.content
+
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
             # Forced Function Call
             stripped_content = OpenAIServing._strip_non_json_prefix(
                 content.strip(), prefer_array=False
             )
-            arguments = content
+            arguments = None
             try:
                 parsed_obj = json.loads(stripped_content)
                 if isinstance(parsed_obj, dict):
                     arguments = json.dumps(parsed_obj, ensure_ascii=False)
                 else:
-                    arguments = stripped_content
+                    arguments = None
             except json.JSONDecodeError:
-                arguments = stripped_content
+                fallback_calls, _ = try_parser_fallback()
+                if fallback_calls:
+                    matched_call = next(
+                        (
+                            fc
+                            for fc in fallback_calls
+                            if fc.name == request.tool_choice.name
+                        ),
+                        fallback_calls[0],
+                    )
+                    arguments = matched_call.arguments
+            if arguments is None:
+                raise ValueError(
+                    "Forced tool call output did not contain valid JSON arguments."
+                )
             function_calls.append(
                 FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
@@ -1159,15 +1204,29 @@ class OpenAIServing:
             stripped_content = OpenAIServing._strip_non_json_prefix(
                 content.strip(), prefer_array=False
             )
-            arguments = content
+            arguments = None
             try:
                 parsed_obj = json.loads(stripped_content)
                 if isinstance(parsed_obj, dict):
                     arguments = json.dumps(parsed_obj, ensure_ascii=False)
                 else:
-                    arguments = stripped_content
+                    arguments = None
             except json.JSONDecodeError:
-                arguments = stripped_content
+                fallback_calls, _ = try_parser_fallback()
+                if fallback_calls:
+                    matched_call = next(
+                        (
+                            fc
+                            for fc in fallback_calls
+                            if fc.name == request.tool_choice.function.name
+                        ),
+                        fallback_calls[0],
+                    )
+                    arguments = matched_call.arguments
+            if arguments is None:
+                raise ValueError(
+                    "Named tool call output did not contain valid JSON arguments."
+                )
             function_calls.append(
                 FunctionCall(
                     name=request.tool_choice.function.name,
@@ -1180,18 +1239,26 @@ class OpenAIServing:
             stripped_content = OpenAIServing._strip_non_json_prefix(
                 content, prefer_array=True
             )
-            tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                stripped_content
-            )
-            function_calls.extend(
-                [
-                    FunctionCall(
-                        name=tool_call.name,
-                        arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
-                    )
-                    for tool_call in tool_calls
-                ]
-            )
+            try:
+                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
+                    stripped_content
+                )
+                function_calls.extend(
+                    [
+                        FunctionCall(
+                            name=tool_call.name,
+                            arguments=json.dumps(
+                                tool_call.parameters, ensure_ascii=False
+                            ),
+                        )
+                        for tool_call in tool_calls
+                    ]
+                )
+            except Exception:
+                fallback_calls, _ = try_parser_fallback()
+                if not fallback_calls:
+                    raise
+                function_calls.extend(fallback_calls)
             content = None  # Clear content since tool is called.
         elif (
             tool_parser_cls

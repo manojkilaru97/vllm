@@ -721,6 +721,30 @@ class ReasoningBudgetLogitsProcessor(LogitsProcessor):
                 continue
             logits = self._maybe_end_thinking(idx, logits, state)
         return logits
+
+    def apply_with_spec_decode(
+        self,
+        logits: torch.Tensor,
+        num_draft_tokens: list[int],
+    ) -> torch.Tensor:
+        if not self.logit_processor_state:
+            return logits
+
+        row_offset = 0
+        for req_idx, num_rows in enumerate(num_draft_tokens):
+            if num_rows <= 0:
+                continue
+            state = self.logit_processor_state.get(req_idx)
+            if state is None or not state.get("is_thinking", False):
+                row_offset += num_rows
+                continue
+            for row_idx in range(row_offset, row_offset + num_rows):
+                if row_idx >= logits.shape[0]:
+                    break
+                logits = self._maybe_end_thinking(row_idx, logits, state)
+            row_offset += num_rows
+
+        return logits
 def process_dict_updates(
     req_entries: dict[int, T],
     batch_update: BatchUpdate | None,

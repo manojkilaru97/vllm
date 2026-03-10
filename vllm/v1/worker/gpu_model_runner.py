@@ -1930,6 +1930,13 @@ class GPUModelRunner(
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
 
+        if self.speculative_config is not None:
+            self.num_accepted_tokens.np[:num_reqs] = (
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+            )
+            self.num_accepted_tokens.np[num_reqs:].fill(1)
+            self.num_accepted_tokens.copy_to_gpu()
+
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
         def _get_block_table(kv_cache_gid: int):
@@ -2025,7 +2032,7 @@ class GPUModelRunner(
             )
 
             extra_attn_metadata_args = {}
-            if use_spec_decode and isinstance(
+            if self.speculative_config is not None and isinstance(
                 builder, (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder)
             ):
                 assert ubid is None, "UBatching not supported with GDN yet"
