@@ -2055,6 +2055,7 @@ class OpenAIServingChat(OpenAIServing):
                         else:
                             index = 0
 
+                        reparsed_calls = None
                         if (
                             output.finish_reason is not None
                             and self.enable_auto_tools
@@ -2062,6 +2063,97 @@ class OpenAIServingChat(OpenAIServing):
                             and tool_parser
                             and (auto_tools_called or tools_streamed[i])
                         ):
+                            final_tool_text = current_text
+                            if final_tool_text:
+                                try:
+                                    reparsed_calls, _ = (
+                                        self._parse_tool_calls_from_content(
+                                            request=request,
+                                            tokenizer=tokenizer,
+                                            content=final_tool_text,
+                                            enable_auto_tools=self.enable_auto_tools,
+                                            tool_parser_cls=self.tool_parser,
+                                        )
+                                    )
+                                except Exception:
+                                    reparsed_calls = None
+
+                            if (
+                                reparsed_calls
+                                and len(reparsed_calls) > len(previous_tool_calls[i])
+                            ):
+                                missing_tool_calls: list[DeltaToolCall] = []
+                                for missing_idx in range(
+                                    len(previous_tool_calls[i]), len(reparsed_calls)
+                                ):
+                                    missing_call = reparsed_calls[missing_idx]
+                                    missing_args = missing_call.arguments
+                                    if not isinstance(missing_args, str):
+                                        continue
+                                    if (
+                                        missing_args in ("", "{}")
+                                        and not self._tool_allows_empty_arguments(
+                                            request, missing_call.name
+                                        )
+                                    ):
+                                        continue
+
+                                    tool_call_id = make_tool_call_id(
+                                        id_type=self.tool_call_id_type,
+                                        request_id=request_id,
+                                        idx=history_tool_call_cnt + missing_idx,
+                                    )
+                                    missing_tool_calls.append(
+                                        DeltaToolCall(
+                                            index=missing_idx,
+                                            id=tool_call_id,
+                                            type="function",
+                                            function=DeltaFunctionCall(
+                                                name=missing_call.name,
+                                                arguments=missing_args,
+                                            ),
+                                        )
+                                    )
+                                    previous_tool_calls[i].append(
+                                        {
+                                            "id": tool_call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": missing_call.name,
+                                                "arguments": missing_args,
+                                            },
+                                        }
+                                    )
+
+                                if missing_tool_calls:
+                                    existing_tool_calls = (
+                                        list(delta_message.tool_calls)
+                                        if (
+                                            delta_message is not None
+                                            and delta_message.tool_calls
+                                        )
+                                        else []
+                                    )
+                                    delta_message = DeltaMessage(
+                                        content=(
+                                            delta_message.content
+                                            if delta_message is not None
+                                            else None
+                                        ),
+                                        reasoning=(
+                                            delta_message.reasoning
+                                            if delta_message is not None
+                                            else None
+                                        ),
+                                        reasoning_content=(
+                                            delta_message.reasoning_content
+                                            if delta_message is not None
+                                            else None
+                                        ),
+                                        tool_calls=existing_tool_calls
+                                        + missing_tool_calls,
+                                    )
+
                             latest_delta_len = 0
                             if (
                                 delta_message
@@ -2103,30 +2195,13 @@ class OpenAIServingChat(OpenAIServing):
                             # snapshot. When the last tool lands entirely in
                             # the finish window, reparsing previous_texts[i]
                             # misses it and leaves a header-only trailing tool.
-                            final_tool_text = current_text
-                            if final_tool_text:
-                                try:
-                                    reparsed_calls, _ = (
-                                        self._parse_tool_calls_from_content(
-                                            request=request,
-                                            tokenizer=tokenizer,
-                                            content=final_tool_text,
-                                            enable_auto_tools=self.enable_auto_tools,
-                                            tool_parser_cls=self.tool_parser,
-                                        )
-                                    )
-                                except Exception:
-                                    reparsed_calls = None
-
-                                if reparsed_calls:
-                                    reparsed_idx = min(
-                                        index, len(reparsed_calls) - 1
-                                    )
-                                    reparsed_args = reparsed_calls[
-                                        reparsed_idx
-                                    ].arguments
-                                    if isinstance(reparsed_args, str):
-                                        expected_call = reparsed_args
+                            if reparsed_calls:
+                                reparsed_idx = min(index, len(reparsed_calls) - 1)
+                                reparsed_args = reparsed_calls[
+                                    reparsed_idx
+                                ].arguments
+                                if isinstance(reparsed_args, str):
+                                    expected_call = reparsed_args
 
                             # Fall back to parser streaming state if reparsing
                             # did not produce a concrete argument string.
@@ -2204,11 +2279,19 @@ class OpenAIServingChat(OpenAIServing):
                                 else ""
                             )
 
+                            preserve_finish_delta = (
+                                expected_call is not None
+                                and current_finish_args
+                                and current_finish_args == expected_call
+                            )
+
                             # Do not manufacture a header-only trailing tool at
                             # finish time. If there is no argument payload left
                             # to stream and the current finish delta also carries
                             # no argument fragment, suppress the tool delta.
-                            if remaining_call or current_finish_args:
+                            if preserve_finish_delta:
+                                pass
+                            elif remaining_call or current_finish_args:
                                 delta_message = self._create_remaining_args_delta(
                                     delta_message,
                                     remaining_call,
