@@ -1772,7 +1772,7 @@ class GPUModelRunner(
         else:
             max_seq_len = self.seq_lens.np[:num_reqs].max().item()
 
-        if use_spec_decode:
+        if self.speculative_config is not None:
             self.num_accepted_tokens.np[:num_reqs] = (
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs]
             )
@@ -1872,7 +1872,7 @@ class GPUModelRunner(
             )
 
             extra_attn_metadata_args = {}
-            if use_spec_decode and isinstance(
+            if self.speculative_config is not None and isinstance(
                 builder, (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder)
             ):
                 assert ubid is None, "UBatching not supported with GDN yet"

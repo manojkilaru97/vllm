@@ -194,7 +194,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | ChatCompletionNamedToolChoiceParam
         | None
     ) = "none"
-    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
     reasoning_budget: Annotated[int, Field(ge=-1, le=_LONG_INFO.max)] | None = Field(
         default=None,
         description=(
@@ -396,19 +396,47 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_template: str | None,
         default_template_content_format: ChatTemplateContentFormatOption,
     ) -> ChatParams:
+        explicit_reasoning_mode = self._has_explicit_reasoning_chat_template_kwargs()
+        resolved_chat_template_kwargs = self.get_resolved_chat_template_kwargs()
+        compatibility_reasoning_effort = self.reasoning_effort
+        if explicit_reasoning_mode or self.reasoning_effort == "none":
+            compatibility_reasoning_effort = None
+
         return ChatParams(
             chat_template=self.chat_template or default_template,
             chat_template_content_format=default_template_content_format,
             chat_template_kwargs=merge_kwargs(
-                self.chat_template_kwargs,
+                resolved_chat_template_kwargs,
                 dict(
                     add_generation_prompt=self.add_generation_prompt,
                     continue_final_message=self.continue_final_message,
                     documents=self.documents,
-                    reasoning_effort=self.reasoning_effort,
+                    reasoning_effort=compatibility_reasoning_effort,
                 ),
             ),
         )
+
+    def _has_explicit_reasoning_chat_template_kwargs(self) -> bool:
+        request_chat_template_kwargs = self.chat_template_kwargs or {}
+        return (
+            "enable_thinking" in request_chat_template_kwargs
+            or "low_effort" in request_chat_template_kwargs
+        )
+
+    def get_resolved_chat_template_kwargs(self) -> dict[str, Any]:
+        request_chat_template_kwargs = dict(self.chat_template_kwargs or {})
+        if self._has_explicit_reasoning_chat_template_kwargs():
+            return request_chat_template_kwargs
+
+        if self.reasoning_effort == "none":
+            request_chat_template_kwargs.setdefault("enable_thinking", False)
+        elif self.reasoning_effort == "low":
+            request_chat_template_kwargs.setdefault("enable_thinking", True)
+            request_chat_template_kwargs.setdefault("low_effort", True)
+        elif self.reasoning_effort in ("medium", "high"):
+            request_chat_template_kwargs.setdefault("enable_thinking", True)
+
+        return request_chat_template_kwargs
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         if self.max_completion_tokens is not None:
@@ -454,6 +482,55 @@ class ChatCompletionRequest(OpenAIBaseModel):
             length_penalty=self.length_penalty,
             include_stop_str_in_output=self.include_stop_str_in_output,
         )
+
+    def _get_named_tool_schema(self) -> dict[str, Any] | None:
+        if not isinstance(self.tool_choice, ChatCompletionNamedToolChoiceParam):
+            return None
+        if not self.tools:
+            return None
+
+        target_name = self.tool_choice.function.name
+        for tool in self.tools:
+            if tool.type == "function" and tool.function.name == target_name:
+                params = tool.function.parameters
+                if isinstance(params, dict):
+                    return params
+                return {"type": "object", "additionalProperties": True}
+        return None
+
+    def _get_required_tools_schema(self) -> dict[str, Any] | None:
+        if self.tool_choice != "required" or not self.tools:
+            return None
+
+        variants: list[dict[str, Any]] = []
+        for tool in self.tools:
+            if tool.type != "function":
+                continue
+            params = (
+                tool.function.parameters
+                if isinstance(tool.function.parameters, dict)
+                else {"type": "object", "additionalProperties": True}
+            )
+            variants.append(
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "const": tool.function.name},
+                        "parameters": params,
+                    },
+                    "required": ["name", "parameters"],
+                    "additionalProperties": False,
+                }
+            )
+
+        if not variants:
+            return None
+
+        return {
+            "type": "array",
+            "minItems": 1,
+            "items": {"oneOf": variants},
+        }
 
     def to_sampling_params(
         self,
@@ -519,10 +596,35 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     else replace(self.structured_outputs, **structured_outputs_kwargs)
                 )
 
+        if self.structured_outputs is None:
+            named_tool_schema = self._get_named_tool_schema()
+            if named_tool_schema is not None:
+                self.structured_outputs = StructuredOutputsParams(json=named_tool_schema)
+            else:
+                required_tools_schema = self._get_required_tools_schema()
+                if required_tools_schema is not None:
+                    self.structured_outputs = StructuredOutputsParams(
+                        json=required_tools_schema
+                    )
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        if self.tool_choice == "required" or isinstance(
+            self.tool_choice, ChatCompletionNamedToolChoiceParam
+        ):
+            # Forced/required tool requests are contract-sensitive and should
+            # not use speculative decode. Grammar/tool correctness matters
+            # more than speculative throughput for these requests.
+            extra_args["disable_spec_decode"] = True
+        output_kind = RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+        if self.stream and (
+            self.tool_choice == "required"
+            or isinstance(self.tool_choice, ChatCompletionNamedToolChoiceParam)
+        ):
+            output_kind = RequestOutputKind.FINAL_ONLY
+
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -543,9 +645,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
+            output_kind=output_kind,
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
