@@ -1448,7 +1448,6 @@ class Scheduler(SchedulerInterface):
                 and logprobs
             ):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
-
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
