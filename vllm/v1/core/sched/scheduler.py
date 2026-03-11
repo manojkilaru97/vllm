@@ -1411,8 +1411,17 @@ class Scheduler(SchedulerInterface):
                 if not ok:
                     logger.warning(
                         "Unexpected: grammar rejected tokens %s for request %s.",
+                else:
+                    logger.debug(
+                        "Advancing grammar for request %s with tokens %s",
                         new_token_ids,
                         req_id,
+                    )
+                else:
+                    logger.debug(
+                        "Advancing grammar for request %s with tokens %s",
+                        req_id,
+                        new_token_ids,
                     )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
