@@ -1295,10 +1295,6 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
-        logger.warning(
-            "Computed grammar bitmask for structured requests: %s",
-            structured_output_request_ids,
-        )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
     def update_from_output(
@@ -1477,7 +1473,7 @@ class Scheduler(SchedulerInterface):
                     )
                     request.structured_output_request = None
                 else:
-                    logger.warning(
+                    logger.debug(
                         "Advancing grammar for request %s with tokens %s",
                         req_id,
                         new_token_ids,
