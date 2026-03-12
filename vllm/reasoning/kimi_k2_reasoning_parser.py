@@ -51,6 +51,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         self._start_token = "<think>"
         self._end_token = "</think>"
         self._tool_section_start_token = "<|tool_calls_section_begin|>"
+        self._tool_call_start_token = "<|tool_call_begin|>"
 
         # Get token IDs
         self._start_token_id = self.vocab.get(self._start_token)
@@ -58,6 +59,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         self._tool_section_start_token_id = self.vocab.get(
             self._tool_section_start_token
         )
+        self._tool_call_start_token_id = self.vocab.get(self._tool_call_start_token)
 
         if self._start_token_id is None or self._end_token_id is None:
             raise RuntimeError(
@@ -72,6 +74,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         Reasoning ends when we see either:
         1. The end token (</think>)
         2. The tool section start token (<|tool_calls_section_begin|>)
+        3. The first direct tool call token (<|tool_call_begin|>)
         """
         if self._identity_parser is not None:
             return self._identity_parser.is_reasoning_end(input_ids)
@@ -79,6 +82,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         start_token_id = self._start_token_id
         end_token_id = self._end_token_id
         tool_section_start_token_id = self._tool_section_start_token_id
+        tool_call_start_token_id = self._tool_call_start_token_id
 
         for i in range(len(input_ids) - 1, -1, -1):
             if input_ids[i] == start_token_id:
@@ -89,6 +93,11 @@ class KimiK2ReasoningParser(ReasoningParser):
             if (
                 tool_section_start_token_id is not None
                 and input_ids[i] == tool_section_start_token_id
+            ):
+                return True
+            if (
+                tool_call_start_token_id is not None
+                and input_ids[i] == tool_call_start_token_id
             ):
                 return True
         return False
@@ -104,15 +113,18 @@ class KimiK2ReasoningParser(ReasoningParser):
                 input_ids, delta_ids
             )
 
-        # Materialize iterable for membership checks
         delta_ids_set = set(delta_ids)
-
-        # Check for explicit end token or implicit tool section start in delta
+        # Check for explicit end token or implicit tool-call start in delta
         if self._end_token_id in delta_ids_set:
             return True
-        return (
+        if (
             self._tool_section_start_token_id is not None
             and self._tool_section_start_token_id in delta_ids_set
+        ):
+            return True
+        return (
+            self._tool_call_start_token_id is not None
+            and self._tool_call_start_token_id in delta_ids_set
         )
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
@@ -143,6 +155,17 @@ class KimiK2ReasoningParser(ReasoningParser):
             if tool_section_index != -1:
                 return input_ids[tool_section_index:]
 
+        if (
+            self._tool_call_start_token_id is not None
+            and self._tool_call_start_token_id in input_ids
+        ):
+            tool_call_index = (
+                len(input_ids) - 1 - input_ids[::-1].index(self._tool_call_start_token_id)
+            )
+
+            if tool_call_index != -1:
+                return input_ids[tool_call_index:]
+
         # still reasoning (no content)
         return []
 
@@ -171,6 +194,13 @@ class KimiK2ReasoningParser(ReasoningParser):
             return (
                 model_output[start_token_index:tool_section_index],
                 model_output[tool_section_index:] or None,
+            )
+
+        tool_call_index = model_output.find(self._tool_call_start_token)
+        if tool_call_index != -1:
+            return (
+                model_output[start_token_index:tool_call_index],
+                model_output[tool_call_index:] or None,
             )
 
         # still reasoning (no content)
@@ -222,6 +252,15 @@ class KimiK2ReasoningParser(ReasoningParser):
 
         if self._tool_section_start_token_id in delta_token_ids:
             tool_index = delta_text.find(self._tool_section_start_token)
+            reasoning = delta_text[:tool_index]
+            content = delta_text[tool_index:]
+            return DeltaMessage(reasoning=reasoning, content=content)
+
+        if (
+            self._tool_call_start_token_id is not None
+            and self._tool_call_start_token_id in delta_token_ids
+        ):
+            tool_index = delta_text.find(self._tool_call_start_token)
             reasoning = delta_text[:tool_index]
             content = delta_text[tool_index:]
             return DeltaMessage(reasoning=reasoning, content=content)

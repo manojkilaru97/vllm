@@ -6,6 +6,7 @@ import json
 from abc import abstractmethod
 from collections.abc import Sequence
 from functools import cached_property
+from json import JSONDecodeError
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -81,6 +82,154 @@ class Parser:
         self.model_tokenizer = tokenizer
         self._reasoning_parser: ReasoningParser | None = None
         self._tool_parser: ToolParser | None = None
+
+    @staticmethod
+    def _recover_required_tool_calls(
+        request: ResponsesRequest | ChatCompletionRequest,
+        content: str,
+    ) -> list[FunctionCall]:
+        decoder = json.JSONDecoder()
+        recovered_calls: list[FunctionCall] = []
+
+        def append_call(payload: object) -> None:
+            if not isinstance(payload, dict):
+                return
+            name = payload.get("name")
+            if not isinstance(name, str) or not name:
+                return
+
+            parameters = payload.get("parameters")
+            if parameters is None and "arguments" in payload:
+                parameters = payload["arguments"]
+            if isinstance(parameters, str):
+                try:
+                    parameters = json.loads(parameters)
+                except json.JSONDecodeError:
+                    return
+            if parameters is None:
+                parameters = {}
+            if not isinstance(parameters, dict):
+                return
+
+            recovered_calls.append(
+                FunctionCall(
+                    name=name,
+                    arguments=json.dumps(parameters, ensure_ascii=False),
+                )
+            )
+
+        def repair_json_fragment(fragment: str) -> object | None:
+            candidate = fragment.rstrip()
+            if not candidate:
+                return None
+            if candidate.endswith(","):
+                candidate = candidate[:-1].rstrip()
+
+            repaired = candidate
+            quote_count = 0
+            escaped = False
+            for ch in repaired:
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    escaped = True
+                    continue
+                if ch == '"':
+                    quote_count += 1
+
+            if escaped:
+                repaired += "\\"
+            if quote_count % 2 == 1:
+                repaired += '"'
+
+            closers: list[str] = []
+            stack: list[str] = []
+            in_string = False
+            escaped = False
+            for ch in repaired:
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch in "[{":
+                    stack.append(ch)
+                elif ch == "}" and stack and stack[-1] == "{":
+                    stack.pop()
+                elif ch == "]" and stack and stack[-1] == "[":
+                    stack.pop()
+
+            while stack:
+                opener = stack.pop()
+                closers.append("}" if opener == "{" else "]")
+            repaired += "".join(closers)
+
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                return None
+
+        stripped = content.strip()
+        if len(getattr(request, "tools", []) or []) == 1:
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict) and "name" not in parsed:
+                tool = request.tools[0]
+                append_call({"name": tool.function.name, "parameters": parsed})
+                if recovered_calls:
+                    return recovered_calls
+
+        json_start = min(
+            [idx for idx in (stripped.find("["), stripped.find("{")) if idx != -1],
+            default=-1,
+        )
+        if json_start == -1:
+            return recovered_calls
+        stripped = stripped[json_start:]
+
+        repaired_payload = repair_json_fragment(stripped)
+        if repaired_payload is not None:
+            if isinstance(repaired_payload, list):
+                for item in repaired_payload:
+                    append_call(item)
+            else:
+                append_call(repaired_payload)
+            if recovered_calls:
+                return recovered_calls
+
+        if stripped.startswith("{"):
+            try:
+                payload, _ = decoder.raw_decode(stripped)
+            except json.JSONDecodeError:
+                payload = None
+            append_call(payload)
+            return recovered_calls
+
+        if not stripped.startswith("["):
+            return recovered_calls
+
+        pos = 1
+        while pos < len(stripped):
+            while pos < len(stripped) and stripped[pos] in " \r\n\t,":
+                pos += 1
+            if pos >= len(stripped) or stripped[pos] == "]":
+                break
+            try:
+                payload, end = decoder.raw_decode(stripped, pos)
+            except json.JSONDecodeError:
+                break
+            append_call(payload)
+            pos = end
+
+        return recovered_calls
 
     @cached_property
     def vocab(self) -> dict[str, int]:
@@ -428,20 +577,30 @@ class DelegatingParser(Parser):
 
         if request.tool_choice == "required":
             # Required tool calls - parse JSON
-            tool_calls = []
-            with contextlib.suppress(ValidationError):
-                content = content or ""
-                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                    content
-                )
-            for tool_call in tool_calls:
-                function_calls.append(
+            content = content or ""
+            try:
+                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(content)
+                function_calls.extend(
                     FunctionCall(
                         name=tool_call.name,
                         arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
                     )
+                    for tool_call in tool_calls
                 )
-            return function_calls, None  # Clear content since tool is called.
+                return function_calls, None  # Clear content since tool is called.
+            except (ValidationError, JSONDecodeError, ValueError):
+                recovered_calls = self._recover_required_tool_calls(request, content)
+                if recovered_calls:
+                    logger.warning(
+                        "Recovered %d required tool call(s) from malformed JSON output.",
+                        len(recovered_calls),
+                    )
+                    return recovered_calls, None
+                logger.warning(
+                    "Failed to parse required tool calls; returning raw content instead "
+                    "of raising a request error."
+                )
+                return function_calls, content
 
         if (
             self._tool_parser is not None
