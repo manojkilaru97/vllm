@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from json import JSONDecodeError
 from typing import Any, ClassVar, Generic, Protocol, TypeAlias, TypeVar
 
 import numpy as np
@@ -1144,6 +1145,272 @@ class OpenAIServing:
         return None
 
     @staticmethod
+    def _get_request_tool_name(tool: Any) -> str | None:
+        function = getattr(tool, "function", None)
+        if function is None and isinstance(tool, dict):
+            function = tool.get("function")
+        if function is None:
+            return None
+        if isinstance(function, dict):
+            return function.get("name")
+        return getattr(function, "name", None)
+
+    @staticmethod
+    def _get_request_tool_parameters(tool: Any) -> dict[str, Any]:
+        function = getattr(tool, "function", None)
+        if function is None and isinstance(tool, dict):
+            function = tool.get("function")
+        if function is None:
+            return {}
+        if isinstance(function, dict):
+            params = function.get("parameters")
+        else:
+            params = getattr(function, "parameters", None)
+        return params if isinstance(params, dict) else {}
+
+    @staticmethod
+    def _infer_tool_name_from_parameters(
+        request: ResponsesRequest | ChatCompletionRequest,
+        parameters: dict[str, Any],
+    ) -> str | None:
+        if not parameters:
+            return None
+
+        param_keys = set(parameters.keys())
+        best_name: str | None = None
+        best_score = 0
+
+        for tool in getattr(request, "tools", []) or []:
+            tool_name = OpenAIServing._get_request_tool_name(tool)
+            schema = OpenAIServing._get_request_tool_parameters(tool)
+            properties = schema.get("properties")
+            if not tool_name or not isinstance(properties, dict):
+                continue
+
+            property_keys = set(properties.keys())
+            if not param_keys <= property_keys:
+                continue
+
+            score = len(param_keys & property_keys)
+            if score == 0:
+                continue
+
+            if score > best_score:
+                best_name = tool_name
+                best_score = score
+            elif score == best_score:
+                best_name = None
+
+        return best_name
+
+    @staticmethod
+    def _repair_json_fragment(fragment: str) -> Any | None:
+        candidate = fragment.rstrip()
+        if not candidate:
+            return None
+
+        if candidate.endswith(","):
+            candidate = candidate[:-1].rstrip()
+
+        repaired = candidate
+
+        quote_count = 0
+        escaped = False
+        for ch in repaired:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == '"':
+                quote_count += 1
+
+        if escaped:
+            repaired += "\\"
+        if quote_count % 2 == 1:
+            repaired += '"'
+
+        closers: list[str] = []
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        for ch in repaired:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch in "[{":
+                stack.append(ch)
+            elif ch == "}" and stack and stack[-1] == "{":
+                stack.pop()
+            elif ch == "]" and stack and stack[-1] == "[":
+                stack.pop()
+
+        while stack:
+            opener = stack.pop()
+            closers.append("}" if opener == "{" else "]")
+        repaired += "".join(closers)
+
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _repair_named_arguments(
+        request: ResponsesRequest | ChatCompletionRequest,
+        tool_name: str,
+        raw_args: str | None,
+    ) -> str | None:
+        if raw_args is None:
+            return None
+
+        stripped = raw_args.strip()
+        if not stripped:
+            return None
+
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return json.dumps(parsed, ensure_ascii=False)
+
+        for tool in getattr(request, "tools", []) or []:
+            if OpenAIServing._get_request_tool_name(tool) != tool_name:
+                continue
+
+            schema = OpenAIServing._get_request_tool_parameters(tool)
+            properties = schema.get("properties")
+            if not isinstance(properties, dict) or not properties:
+                return None
+
+            ordered_names: list[str] = []
+            for name in schema.get("required") or []:
+                if isinstance(name, str) and name not in ordered_names:
+                    ordered_names.append(name)
+            for name in properties.keys():
+                if name not in ordered_names:
+                    ordered_names.append(name)
+
+            trimmed = stripped.lstrip(", ")
+            for name in ordered_names:
+                candidate = "{" + json.dumps(name) + ": " + trimmed
+                try:
+                    parsed_candidate = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed_candidate, dict):
+                    return json.dumps(parsed_candidate, ensure_ascii=False)
+            break
+
+        return None
+
+    @staticmethod
+    def _recover_required_tool_calls(
+        request: ResponsesRequest | ChatCompletionRequest,
+        content: str,
+    ) -> list[FunctionCall]:
+        """Recover complete required tool calls from partially malformed JSON."""
+        decoder = json.JSONDecoder()
+        recovered_calls: list[FunctionCall] = []
+
+        def append_call(payload: Any) -> None:
+            if not isinstance(payload, dict):
+                return
+            name = payload.get("name")
+            if not isinstance(name, str) or not name:
+                name = OpenAIServing._infer_tool_name_from_parameters(request, payload)
+            if not isinstance(name, str) or not name:
+                return
+
+            parameters = payload.get("parameters")
+            if parameters is None and "arguments" in payload:
+                parameters = payload["arguments"]
+
+            if isinstance(parameters, str):
+                try:
+                    parameters = json.loads(parameters)
+                except json.JSONDecodeError:
+                    return
+
+            if parameters is None:
+                parameters = {}
+            if not isinstance(parameters, dict):
+                return
+
+            recovered_calls.append(
+                FunctionCall(
+                    name=name,
+                    arguments=json.dumps(parameters, ensure_ascii=False),
+                )
+            )
+
+        stripped = content.strip()
+
+        if len(getattr(request, "tools", []) or []) == 1:
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict) and "name" not in parsed:
+                tool = request.tools[0]
+                append_call({"name": tool.function.name, "parameters": parsed})
+                if recovered_calls:
+                    return recovered_calls
+
+        json_start = min(
+            [idx for idx in (stripped.find("["), stripped.find("{")) if idx != -1],
+            default=-1,
+        )
+        if json_start == -1:
+            return recovered_calls
+        stripped = stripped[json_start:]
+
+        repaired_payload = OpenAIServing._repair_json_fragment(stripped)
+        if repaired_payload is not None:
+            if isinstance(repaired_payload, list):
+                for item in repaired_payload:
+                    append_call(item)
+            else:
+                append_call(repaired_payload)
+            if recovered_calls:
+                return recovered_calls
+
+        if stripped.startswith("{"):
+            try:
+                payload, _ = decoder.raw_decode(stripped)
+            except json.JSONDecodeError:
+                payload = None
+            append_call(payload)
+            return recovered_calls
+
+        if not stripped.startswith("["):
+            return recovered_calls
+
+        pos = 1
+        while pos < len(stripped):
+            while pos < len(stripped) and stripped[pos] in " \r\n\t,":
+                pos += 1
+            if pos >= len(stripped) or stripped[pos] == "]":
+                break
+            try:
+                payload, end = decoder.raw_decode(stripped, pos)
+            except json.JSONDecodeError:
+                break
+            append_call(payload)
+            pos = end
+
+        return recovered_calls
+
+    @staticmethod
     def _parse_tool_calls_from_content(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
@@ -1188,19 +1455,35 @@ class OpenAIServing:
                 for func_name, args in extracted_calls:
                     function_calls.append(FunctionCall(name=func_name, arguments=args))
             else:
-                with contextlib.suppress(ValidationError):
-                    tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                        content
+                try:
+                    tool_calls = TypeAdapter(
+                        list[FunctionDefinition]).validate_json(content)
+                    function_calls.extend(
+                        [
+                            FunctionCall(
+                                name=tool_call.name,
+                                arguments=json.dumps(
+                                    tool_call.parameters, ensure_ascii=False),
+                            )
+                            for tool_call in tool_calls
+                        ]
                     )
-                for tool_call in tool_calls:
-                    function_calls.append(
-                        FunctionCall(
-                            name=tool_call.name,
-                            arguments=json.dumps(
-                                tool_call.parameters, ensure_ascii=False
-                            ),
+                except (ValidationError, JSONDecodeError, ValueError):
+                    recovered_calls = OpenAIServing._recover_required_tool_calls(
+                        request, content
+                    )
+                    if recovered_calls:
+                        logger.warning(
+                            "Recovered %d required tool call(s) from malformed JSON output.",
+                            len(recovered_calls),
                         )
-                    )
+                        function_calls.extend(recovered_calls)
+                    else:
+                        logger.warning(
+                            "Failed to parse required tool calls; returning raw content instead "
+                            "of raising a request error."
+                        )
+                        return None, content
             content = None  # Clear content since tool is called.
         elif (
             tool_parser_cls

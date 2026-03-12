@@ -32,6 +32,28 @@ else:
 logger = init_logger(__name__)
 
 
+class PassthroughGrammar(StructuredOutputGrammar):
+    """Safety-net grammar that leaves decoding unconstrained."""
+
+    def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
+        return True
+
+    def validate_tokens(self, tokens: list[int]) -> list[int]:
+        return tokens
+
+    def rollback(self, num_tokens: int) -> None:
+        return None
+
+    def fill_bitmask(self, bitmask: "torch.Tensor", batch_index: int) -> None:
+        bitmask[batch_index].fill_(-1)
+
+    def is_terminated(self) -> bool:
+        return False
+
+    def reset(self):
+        return None
+
+
 class StructuredOutputManager:
     """Engine-level manager for structured output requests."""
 
@@ -162,7 +184,15 @@ class StructuredOutputManager:
         request_type, grammar_spec = key
 
         assert self.backend is not None
-        return self.backend.compile_grammar(request_type, grammar_spec)
+        try:
+            return self.backend.compile_grammar(request_type, grammar_spec)
+        except Exception:
+            logger.exception(
+                "Structured output grammar compilation failed for request %s; "
+                "falling back to unconstrained decoding for this request.",
+                request.request_id,
+            )
+            return PassthroughGrammar()
 
     def _fill_bitmasks(
         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]

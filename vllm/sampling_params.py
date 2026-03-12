@@ -776,9 +776,40 @@ class SamplingParams(
         )
         from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
 
+        def _fallback_from_xgrammar(err: ValueError) -> None:
+            so_params = self.structured_outputs
+            assert so_params is not None
+
+            skip_guidance = False
+            if so_params.json:
+                if isinstance(so_params.json, str):
+                    schema = json_mod.loads(so_params.json)
+                else:
+                    schema = so_params.json
+                skip_guidance = has_guidance_unsupported_json_features(schema)
+
+            if is_mistral_tokenizer(tokenizer) or skip_guidance:
+                validate_structured_output_request_outlines(self)
+                so_params._backend = "outlines"
+                logger.warning(
+                    "xgrammar validation/compilation failed (%s); "
+                    "falling back to outlines structured output backend.",
+                    err,
+                )
+            else:
+                validate_guidance_grammar(self, tokenizer=None)
+                so_params._backend = "guidance"
+                logger.warning(
+                    "xgrammar validation/compilation failed (%s); "
+                    "falling back to guidance structured output backend.",
+                    err,
+                )
+
         if backend.startswith("xgrammar"):
-            # xgrammar with no fallback
-            validate_xgrammar_grammar(self)
+            try:
+                validate_xgrammar_grammar(self, tokenizer)
+            except ValueError as err:
+                _fallback_from_xgrammar(err)
         elif backend.startswith("guidance"):
             # TODO: ideally we would have the LLTokenizer here as Lark syntax
             # allows <|special_token|> and similar, see
@@ -811,32 +842,12 @@ class SamplingParams(
             # this setting. We include fallback behavior here, but not with any
             # other setting where a specific backend was specified.
             try:
-                validate_xgrammar_grammar(self)
+                validate_xgrammar_grammar(self, tokenizer)
                 self.structured_outputs._backend = "xgrammar"
-            except ValueError:
-                # The request either failed validation
-                # or includes some jsonschema feature(s) that
-                # are not supported in xgrammar.
-
-                # Check if schema has features unsupported by guidance
-                so_params = self.structured_outputs
-                skip_guidance = False
-                if so_params.json:
-                    if isinstance(so_params.json, str):
-                        schema = json_mod.loads(so_params.json)
-                    else:
-                        schema = so_params.json
-                    skip_guidance = has_guidance_unsupported_json_features(schema)
-
-                if is_mistral_tokenizer(tokenizer) or skip_guidance:
-                    # Fall back to outlines if the tokenizer is Mistral
-                    # or if schema contains features unsupported by guidance
-                    validate_structured_output_request_outlines(self)
-                    self.structured_outputs._backend = "outlines"
-                else:
-                    # Fall back to guidance by default.
-                    validate_guidance_grammar(self, tokenizer=None)
-                    self.structured_outputs._backend = "guidance"
+            except ValueError as err:
+                # The request either failed validation,
+                # or includes some feature(s) that xgrammar cannot compile.
+                _fallback_from_xgrammar(err)
             # Remember that this backend was set automatically
             self.structured_outputs._backend_was_auto = True
 

@@ -10,6 +10,7 @@ import torch
 import vllm.envs
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+from vllm.tokenizers import TokenizerLike
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.v1.structured_output.backend_types import (
@@ -29,6 +30,32 @@ else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
 logger = init_logger(__name__)
+
+
+def _make_xgrammar_compiler(tokenizer: TokenizerLike, vocab_size: int):
+    if is_mistral_tokenizer(tokenizer):
+        stop_token_ids = [tokenizer.eos_token_id]
+        tokenizer_info = xgr.TokenizerInfo(  # type: ignore
+            encoded_vocab=tokenizer.vocab,
+            vocab_type=xgr.VocabType.RAW
+            if tokenizer.is_tekken
+            else xgr.VocabType.BYTE_FALLBACK,
+            vocab_size=vocab_size,
+            stop_token_ids=stop_token_ids,
+            add_prefix_space=True,
+        )
+    else:
+        tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+            tokenizer,
+            vocab_size=vocab_size,
+        )
+
+    return xgr.GrammarCompiler(
+        tokenizer_info,
+        max_threads=1,
+        cache_enabled=False,
+        cache_limit_bytes=0,
+    )
 
 
 @dataclass
@@ -275,7 +302,10 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
     return check_object(schema)
 
 
-def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
+def validate_xgrammar_grammar(
+    sampling_params: SamplingParams,
+    tokenizer: TokenizerLike | None = None,
+) -> None:
     """Validate that the request is supported by structured output.
 
     Raises ValueError if the request is not supported.
@@ -284,10 +314,16 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
         return
 
     so_params = sampling_params.structured_outputs
+    compiler = None
+    if tokenizer is not None:
+        vocab_size = len(tokenizer.vocab) if is_mistral_tokenizer(tokenizer) else len(tokenizer)
+        compiler = _make_xgrammar_compiler(tokenizer, vocab_size)
 
     if so_params.regex:
         try:
             xgr.Grammar.from_regex(so_params.regex)
+            if compiler is not None:
+                compiler.compile_regex(so_params.regex)
         except Exception as err:
             raise ValueError(
                 f"Failed to transform regex into a grammar: {err}"
@@ -297,6 +333,8 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
         choice_grammar = choice_as_grammar(so_params.choice)
         try:
             xgr.Grammar.from_ebnf(choice_grammar)
+            if compiler is not None:
+                compiler.compile_grammar(choice_grammar)
         except Exception as err:
             raise ValueError(
                 "Failed to transform choices into a grammar: {err}"
@@ -321,6 +359,8 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
 
         try:
             xgr.Grammar.from_json_schema(schema)
+            if compiler is not None:
+                compiler.compile_json_schema(schema, any_whitespace=True)
         except Exception as err:
             raise ValueError(
                 f"Failed to transform json schema into a grammar: {err}"
@@ -341,6 +381,8 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
         try:
             # parse the grammar, but we aren't compiling it.
             xgr.Grammar.from_ebnf(so_params.grammar)
+            if compiler is not None:
+                compiler.compile_grammar(so_params.grammar)
         except Exception as e:
             raise ValueError("Invalid grammar specification.") from e
         return
@@ -360,7 +402,11 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
                     for s in s_tag["structures"]
                 ]
                 xgr.Grammar.from_structural_tag(tags, s_tag["triggers"])
+                if compiler is not None:
+                    compiler.compile_structural_tag(tags, s_tag["triggers"])
             else:
                 xgr.Grammar.from_structural_tag(so_params.structural_tag)
+                if compiler is not None:
+                    compiler.compile_structural_tag(so_params.structural_tag)
         except Exception as e:
             raise ValueError("Invalid structural tag specification.") from e

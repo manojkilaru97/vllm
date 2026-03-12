@@ -35,6 +35,7 @@ class StructuredOutputRequest:
     def _check_grammar_completion(self) -> bool:
         # NOTE: We have to lazy import to gate circular imports
         from vllm.v1.request import RequestStatus
+        from vllm.v1.structured_output import PassthroughGrammar
 
         if isinstance(self._grammar, Future):
             try:
@@ -43,6 +44,12 @@ class StructuredOutputRequest:
                 self.status = RequestStatus.WAITING
             except TimeoutError:
                 return False
+            except Exception:
+                self._grammar = PassthroughGrammar()
+                self.status = RequestStatus.WAITING
+                return True
+        if self._grammar is None:
+            self._grammar = PassthroughGrammar()
         return True
 
     @property

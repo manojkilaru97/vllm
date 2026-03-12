@@ -1122,6 +1122,75 @@ class OpenAIServingChat(OpenAIServing):
                                     delta_message.reasoning_content = None
                                 else:
                                     current_text = ""
+                                if output.finish_reason is not None:
+                                    accumulated_text = current_text
+                                    try:
+                                        parsed_calls, _ = self._parse_tool_calls_from_content(
+                                            request=request,
+                                            tokenizer=tokenizer,
+                                            content=accumulated_text,
+                                            enable_auto_tools=self.enable_auto_tools,
+                                            tool_parser_cls=self.tool_parser,
+                                        )
+                                    except Exception:
+                                        parsed_calls = None
+
+                                    matched_call = None
+                                    if parsed_calls:
+                                        matched_call = next(
+                                            (
+                                                fc
+                                                for fc in parsed_calls
+                                                if fc.name == tool_choice_function_name
+                                            ),
+                                            parsed_calls[0],
+                                        )
+                                    extracted_args = (
+                                        matched_call.arguments
+                                        if matched_call and matched_call.arguments is not None
+                                        else accumulated_text.strip()
+                                    )
+                                    if extracted_args:
+                                        repaired_args = self._repair_named_arguments(
+                                            request,
+                                            tool_choice_function_name,
+                                            extracted_args,
+                                        )
+                                        extracted_args = repaired_args or ""
+
+                                    previous_args = named_tool_previous_args[i]
+                                    if extracted_args.startswith(previous_args):
+                                        arguments_delta = extracted_args[len(previous_args):]
+                                    else:
+                                        arguments_delta = extracted_args
+                                    named_tool_previous_args[i] = extracted_args
+
+                                    if arguments_delta or not function_name_returned[i]:
+                                        if function_name_returned[i]:
+                                            delta_tool_call = DeltaToolCall(
+                                                function=DeltaFunctionCall(
+                                                    arguments=arguments_delta
+                                                ),
+                                                index=i,
+                                            )
+                                        else:
+                                            delta_tool_call = DeltaToolCall(
+                                                id=make_tool_call_id(),
+                                                type="function",
+                                                function=DeltaFunctionCall(
+                                                    name=tool_choice_function_name,
+                                                    arguments=arguments_delta,
+                                                ),
+                                                index=i,
+                                            )
+                                            function_name_returned[i] = True
+
+                                        delta_message = DeltaMessage(
+                                            tool_calls=[delta_tool_call]
+                                        )
+                                        tools_streamed[i] = True
+                                    else:
+                                        delta_message = None
                         else:
                             # Named tool_choice streaming - handle Kimi K2 marker format
                             # Accumulate full text to extract clean JSON arguments
@@ -1182,27 +1251,39 @@ class OpenAIServingChat(OpenAIServing):
                                     # Markers detected but arguments not yet complete, wait
                                     delta_message = None
                             else:
-                                # No markers - either reasoning text before tool call or standard format
-                                # For Kimi K2, suppress reasoning text (don't send as arguments)
-                                # For non-Kimi models, fall back to original behavior
-                                if self.tool_call_id_type == "kimi_k2":
-                                    # At finish time without markers, use accumulated text as args
-                                    # (similar to non-streaming behavior in engine/serving.py)
-                                    if (
-                                        output.finish_reason is not None
-                                        and not function_name_returned[i]
-                                        and accumulated_text.strip()
-                                    ):
-                                        delta_tool_call = DeltaToolCall(
-                                            id=make_tool_call_id(),
-                                            type="function",
-                                            function=DeltaFunctionCall(
-                                                name=tool_choice_function_name,
-                                                arguments=accumulated_text.strip(),
-                                            ),
-                                            index=i,
-                                        )
-                                        function_name_returned[i] = True
+                                extracted_args = self._repair_named_arguments(
+                                    request,
+                                    tool_choice_function_name,
+                                    accumulated_text,
+                                )
+                                if extracted_args:
+                                    previous_args = named_tool_previous_args[i]
+                                    if extracted_args.startswith(previous_args):
+                                        arguments_delta = extracted_args[len(previous_args):]
+                                    else:
+                                        arguments_delta = extracted_args
+                                    named_tool_previous_args[i] = extracted_args
+
+                                    if arguments_delta or not function_name_returned[i]:
+                                        if function_name_returned[i]:
+                                            delta_tool_call = DeltaToolCall(
+                                                function=DeltaFunctionCall(
+                                                    arguments=arguments_delta
+                                                ),
+                                                index=i,
+                                            )
+                                        else:
+                                            delta_tool_call = DeltaToolCall(
+                                                id=make_tool_call_id(),
+                                                type="function",
+                                                function=DeltaFunctionCall(
+                                                    name=tool_choice_function_name,
+                                                    arguments=arguments_delta,
+                                                ),
+                                                index=i,
+                                            )
+                                            function_name_returned[i] = True
+
                                         delta_message = DeltaMessage(
                                             tool_calls=[delta_tool_call]
                                         )
@@ -1210,39 +1291,7 @@ class OpenAIServingChat(OpenAIServing):
                                     else:
                                         delta_message = None
                                 else:
-                                    # Original behavior for non-Kimi models
-                                    if function_name_returned[i]:
-                                        delta_tool_call = DeltaToolCall(
-                                            function=DeltaFunctionCall(arguments=delta_text),
-                                            index=i,
-                                        )
-                                    else:
-                                        if is_mistral_tokenizer(tokenizer):
-                                            tool_call_id = MistralToolCall.generate_random_id()
-                                        else:
-                                            tool_call_id = make_tool_call_id(
-                                                id_type=self.tool_call_id_type,
-                                                func_name=tool_choice_function_name,
-                                                idx=history_tool_call_cnt,
-                                            )
-                                        delta_tool_call = DeltaToolCall(
-                                            id=tool_call_id,
-                                            type="function",
-                                            function=DeltaFunctionCall(
-                                                name=tool_choice_function_name,
-                                                arguments=delta_text,
-                                            ),
-                                            index=i,
-                                        )
-                                        function_name_returned[i] = True
-                                        history_tool_call_cnt += 1
-
-                                    delta_message = DeltaMessage(
-                                        tool_calls=[
-                                            delta_tool_call,
-                                        ]
-                                    )
-                                    tools_streamed[i] = True
+                                    delta_message = None
 
                     elif request.tool_choice == "required":
                         assert previous_texts is not None
@@ -1277,6 +1326,56 @@ class OpenAIServingChat(OpenAIServing):
                                 else:
                                     # reasoning ended
                                     current_text = ""
+                                if output.finish_reason is not None:
+                                    content = current_text
+                                    try:
+                                        parsed_calls, _ = self._parse_tool_calls_from_content(
+                                            request=request,
+                                            tokenizer=tokenizer,
+                                            content=content,
+                                            enable_auto_tools=self.enable_auto_tools,
+                                            tool_parser_cls=self.tool_parser,
+                                        )
+                                    except Exception:
+                                        parsed_calls = None
+
+                                    delta_tool_calls: list[DeltaToolCall] = []
+                                    for j, call in enumerate(parsed_calls or []):
+                                        if not call.name:
+                                            continue
+                                        args = (
+                                            call.arguments
+                                            if call.arguments is not None
+                                            else "{}"
+                                        )
+                                        tool_call_id = call.id
+                                        if tool_call_id is None:
+                                            tool_call_id = make_tool_call_id(
+                                                id_type=self.tool_call_id_type,
+                                                func_name=call.name,
+                                                idx=history_tool_call_cnt + j,
+                                            )
+                                        delta_tool_calls.append(
+                                            DeltaToolCall(
+                                                id=tool_call_id,
+                                                type="function",
+                                                function=DeltaFunctionCall(
+                                                    name=call.name,
+                                                    arguments=args,
+                                                ),
+                                                index=j,
+                                            )
+                                        )
+
+                                    if delta_tool_calls:
+                                        delta_message = DeltaMessage(
+                                            tool_calls=delta_tool_calls
+                                        )
+                                        function_name_returned[i] = True
+                                        history_tool_call_cnt += len(delta_tool_calls)
+                                        tools_streamed[i] = True
+                                    else:
+                                        delta_message = None
 
                         else:
                             # either finished reasoning or no reasoning at all
@@ -1495,7 +1594,7 @@ class OpenAIServingChat(OpenAIServing):
 
                     # update the previous values for the next iteration
                     if (
-                        tool_choice_auto or self.reasoning_parser or tool_choice_function_name
+                        tool_choice_auto or reasoning_parser or tool_choice_function_name
                     ) and not self.use_harmony:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
@@ -2274,38 +2373,48 @@ class OpenAIServingChat(OpenAIServing):
 
             elif request.tool_choice and request.tool_choice == "required":
                 tool_call_class_items = []
-                tool_calls = tool_calls or []
-                for idx, tool_call in enumerate(tool_calls):
-                    # Use native ID if available,
-                    # otherwise generate ID with correct id_type
-                    if tool_call.id:
-                        tool_call_class_items.append(
-                            tool_call_class(id=tool_call.id, function=tool_call)
-                        )
-                    else:
-                        # Generate ID using the correct format (kimi_k2 or random),
-                        # but leave it to the class if it's Mistral to preserve
-                        # 9-char IDs
-                        if isinstance(tokenizer, MistralTokenizer):
+                if tool_calls:
+                    for idx, tool_call in enumerate(tool_calls):
+                        # Use native ID if available,
+                        # otherwise generate ID with correct id_type
+                        if tool_call.id:
                             tool_call_class_items.append(
-                                tool_call_class(function=tool_call)
+                                tool_call_class(id=tool_call.id, function=tool_call)
                             )
                         else:
-                            generated_id = make_tool_call_id(
-                                id_type=self.tool_call_id_type,
-                                func_name=tool_call.name,
-                                idx=history_tool_call_cnt,
-                            )
-                            tool_call_class_items.append(
-                                tool_call_class(id=generated_id, function=tool_call)
-                            )
-                    history_tool_call_cnt += 1
-                message = ChatMessage(
-                    role=role,
-                    content="",
-                    tool_calls=tool_call_class_items,
-                    reasoning=reasoning,
-                )
+                            # Generate ID using the correct format (kimi_k2 or random),
+                            # but leave it to the class if it's Mistral to preserve
+                            # 9-char IDs
+                            if isinstance(tokenizer, MistralTokenizer):
+                                tool_call_class_items.append(
+                                    tool_call_class(function=tool_call)
+                                )
+                            else:
+                                generated_id = make_tool_call_id(
+                                    id_type=self.tool_call_id_type,
+                                    func_name=tool_call.name,
+                                    idx=history_tool_call_cnt,
+                                )
+                                tool_call_class_items.append(
+                                    tool_call_class(id=generated_id, function=tool_call)
+                                )
+                        history_tool_call_cnt += 1
+                    message = ChatMessage(
+                        role=role,
+                        content="",
+                        tool_calls=tool_call_class_items,
+                        reasoning=reasoning,
+                    )
+                else:
+                    logger.warning(
+                        "Required tool_choice produced no recoverable tool calls; "
+                        "returning assistant content instead of raising."
+                    )
+                    message = ChatMessage(
+                        role=role,
+                        reasoning=reasoning,
+                        content=content or "",
+                    )
 
             # if the request doesn't use tool choice
             # OR specifies to not use a tool
