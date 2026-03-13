@@ -931,9 +931,21 @@ class OpenAIServingChat(OpenAIServing):
                 tool_calls: list[DeltaToolCall] = []
                 updated_tool_states = list(previous_tool_calls)
                 for idx, parsed_call in enumerate(parsed_calls):
+                    already_streamed = idx < len(previous_tool_calls)
+                    if already_streamed:
+                        prev_fn = previous_tool_calls[idx].get("function") or {}
+                        prev_name = prev_fn.get("name")
+                        prev_args = prev_fn.get("arguments", "")
+                        if (
+                            prev_name == parsed_call.name
+                            and isinstance(prev_args, str)
+                            and prev_args == parsed_call.arguments
+                        ):
+                            continue
+
                     tool_call_id = make_tool_call_id(
                         id_type=self.tool_call_id_type,
-                        request_id=request_id,
+                        func_name=parsed_call.name,
                         idx=history_tool_call_cnt + idx,
                     )
                     tool_calls.append(
@@ -957,6 +969,8 @@ class OpenAIServingChat(OpenAIServing):
                             },
                         }
                     )
+                if not tool_calls:
+                    return None, "tool_calls", updated_tool_states
                 return (
                     DeltaMessage(
                         content=parsed_content if parsed_content else None,
@@ -2066,7 +2080,7 @@ class OpenAIServingChat(OpenAIServing):
 
                                     tool_call_id = make_tool_call_id(
                                         id_type=self.tool_call_id_type,
-                                        request_id=request_id,
+                                        func_name=missing_call.name,
                                         idx=history_tool_call_cnt + missing_idx,
                                     )
                                     missing_tool_calls.append(
