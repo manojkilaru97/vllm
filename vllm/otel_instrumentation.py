@@ -623,6 +623,8 @@ class _KratosOffloadFilter(logging.Filter):
                 should_offload = est_bytes >= self.image_threshold_bytes
             else:
                 return full
+            if not should_offload:
+                return full
 
             try:
                 b = base64.b64decode(b64, validate=False)
