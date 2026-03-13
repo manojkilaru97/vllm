@@ -111,7 +111,7 @@ class OpenAIServingChat(OpenAIServing):
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
-        enable_log_deltas: bool = True,
+        enable_log_deltas: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(

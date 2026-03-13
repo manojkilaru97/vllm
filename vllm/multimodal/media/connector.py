@@ -4,6 +4,7 @@
 import asyncio
 import atexit
 from concurrent.futures import ThreadPoolExecutor
+import mimetypes
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.request import url2pathname
@@ -167,19 +168,24 @@ class MediaConnector:
             )
 
     @staticmethod
-    def _enqueue_media_mirror(url: str, media_io: MediaIO[_M], data: bytes) -> None:
+    def _enqueue_media_mirror(
+        url: str,
+        media_io: MediaIO[_M],
+        data: bytes,
+        *,
+        request_id: str = "",
+    ) -> None:
         try:
-            from vllm.request_context import get_request_id
             from vllm.otel_instrumentation import enqueue_media_mirror
 
-            rid = get_request_id() or ""
+            rid = request_id
             if not rid:
                 return
 
             kind = None
             if isinstance(media_io, VideoMediaIO):
                 kind = "video"
-            elif isinstance(media_io, ImageMediaIO):
+            elif isinstance(media_io, (ImageMediaIO, ImageEmbeddingMediaIO)):
                 kind = "image"
 
             if kind:
@@ -208,13 +214,24 @@ class MediaConnector:
             self._assert_url_in_allowed_media_domains(url_spec)
 
             connection = self.connection
+            request_id = ""
+            try:
+                from vllm.request_context import get_request_id
+                request_id = get_request_id() or ""
+            except Exception:
+                request_id = ""
             data = connection.get_bytes(
                 url_spec.url,
                 timeout=fetch_timeout,
                 allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
             )
 
-            self._enqueue_media_mirror(url_spec.url, media_io, data)
+            self._enqueue_media_mirror(
+                url_spec.url,
+                media_io,
+                data,
+                request_id=request_id,
+            )
             return media_io.load_bytes(data)
 
         if url_spec.scheme == "data":
@@ -240,12 +257,23 @@ class MediaConnector:
             self._assert_url_in_allowed_media_domains(url_spec)
 
             connection = self.connection
+            request_id = ""
+            try:
+                from vllm.request_context import get_request_id
+                request_id = get_request_id() or ""
+            except Exception:
+                request_id = ""
             data = await connection.async_get_bytes(
                 url_spec.url,
                 timeout=fetch_timeout,
                 allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
             )
-            self._enqueue_media_mirror(url_spec.url, media_io, data)
+            self._enqueue_media_mirror(
+                url_spec.url,
+                media_io,
+                data,
+                request_id=request_id,
+            )
             future = loop.run_in_executor(global_thread_pool, media_io.load_bytes, data)
             return await future
 
