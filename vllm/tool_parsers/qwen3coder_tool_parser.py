@@ -117,6 +117,16 @@ class Qwen3CoderToolParser(ToolParser):
             self.tool_calls_emitted = True
         return delta
 
+    def _sync_current_streamed_arguments(self) -> None:
+        """Keep parser state aligned with the JSON fragments already streamed."""
+        if self.current_tool_index >= len(self.prev_tool_call_arr):
+            return
+        if self.current_tool_index >= len(self.streamed_args_for_tool):
+            return
+        self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+            self.streamed_args_for_tool[self.current_tool_index]
+        )
+
     def _get_arguments_config(
         self, func_name: str, tools: list[ChatCompletionToolsParam] | None
     ) -> dict:
@@ -416,8 +426,8 @@ class Qwen3CoderToolParser(ToolParser):
                 if self.current_tool_index >= tool_starts:
                     # No more tool calls
                     self.is_tool_call_started = False
-                # Continue processing next tool
-                return None
+                    return None
+                # Continue processing the next tool from the same delta.
 
         # Handle normal content before tool calls
         if not self.is_tool_call_started:
@@ -499,7 +509,7 @@ class Qwen3CoderToolParser(ToolParser):
                     self.prev_tool_call_arr.append(
                         {
                             "name": self.current_function_name,
-                            "arguments": "{}",
+                            "arguments": "",
                         }
                     )
 
@@ -537,6 +547,7 @@ class Qwen3CoderToolParser(ToolParser):
             if not self.json_started:
                 self.json_started = True
                 self.streamed_args_for_tool[self.current_tool_index] += "{"
+                self._sync_current_streamed_arguments()
                 return self._emit_delta(
                     DeltaMessage(
                         tool_calls=[
@@ -642,8 +653,45 @@ class Qwen3CoderToolParser(ToolParser):
             if json_fragments:
                 combined = "".join(json_fragments)
 
+                closing_in_same_delta = (
+                    not self.json_closed and self.function_end_token in tool_text
+                )
+                if closing_in_same_delta:
+                    func_start = tool_text.find(self.tool_call_prefix) + len(
+                        self.tool_call_prefix
+                    )
+                    func_content_end = tool_text.find(
+                        self.function_end_token, func_start
+                    )
+                    if func_content_end != -1:
+                        func_content = tool_text[func_start:func_content_end]
+                        try:
+                            parsed_tool = self._parse_xml_function_call(
+                                func_content,
+                                self.streaming_request.tools
+                                if self.streaming_request
+                                else None,
+                            )
+                            if parsed_tool and self.current_tool_index < len(
+                                self.prev_tool_call_arr
+                            ):
+                                self.prev_tool_call_arr[self.current_tool_index][
+                                    "arguments"
+                                ] = parsed_tool.function.arguments
+                        except Exception:
+                            logger.debug(
+                                "Failed to parse tool call during streaming: %s",
+                                tool_text,
+                                exc_info=True,
+                            )
+                    combined += "}"
+                    self.json_closed = True
+                    self.in_function = False
+                    self.accumulated_params = {}
+
                 if self.current_tool_index < len(self.streamed_args_for_tool):
                     self.streamed_args_for_tool[self.current_tool_index] += combined
+                    self._sync_current_streamed_arguments()
                 else:
                     logger.warning(
                         "streamed_args_for_tool out of sync: index=%d len=%d",
@@ -699,6 +747,7 @@ class Qwen3CoderToolParser(ToolParser):
 
                 if self.current_tool_index < len(self.streamed_args_for_tool):
                     self.streamed_args_for_tool[self.current_tool_index] += "}"
+                    self._sync_current_streamed_arguments()
                 else:
                     logger.warning(
                         "streamed_args_for_tool out of sync: index=%d len=%d",

@@ -37,9 +37,9 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         super().__init__(tokenizer, *args, **kwargs)
 
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        # Qwen3 defaults to thinking enabled; only treat output as
-        # pure content when the user explicitly disables it.
-        self.thinking_enabled = chat_kwargs.get("enable_thinking", True)
+        # This branch uses a chat template whose default generation prompt
+        # is thinking-off unless the user explicitly sets enable_thinking=true.
+        self.thinking_enabled = chat_kwargs.get("enable_thinking", False)
 
     @property
     def start_token(self) -> str:
@@ -132,7 +132,30 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
                     reasoning=reasoning if reasoning else None,
                     content=content if content else None,
                 )
-            # end_token_id in IDs but not in text (already stripped)
+            # Batched decode / speculative bursts can contain the end-token ID
+            # even when the literal marker is absent from delta_text. Recover
+            # the suffix directly from token IDs so we don't drop the first
+            # post-think content/tool tokens.
+            try:
+                end_token_pos = list(delta_token_ids).index(self.end_token_id)
+            except ValueError:
+                end_token_pos = -1
+
+            if end_token_pos >= 0:
+                reasoning_token_ids = list(delta_token_ids[:end_token_pos])
+                content_token_ids = list(delta_token_ids[end_token_pos + 1 :])
+                reasoning = (
+                    self.model_tokenizer.decode(reasoning_token_ids)
+                    if reasoning_token_ids
+                    else None
+                )
+                content = (
+                    self.model_tokenizer.decode(content_token_ids)
+                    if content_token_ids
+                    else None
+                )
+                if reasoning or content:
+                    return DeltaMessage(reasoning=reasoning, content=content)
             return None
 
         # No end token in this delta.
