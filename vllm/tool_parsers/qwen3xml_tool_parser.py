@@ -1179,6 +1179,79 @@ class Qwen3XMLToolParser(ToolParser):
             "vLLM Successfully import tool parser %s !", self.__class__.__name__
         )
 
+    @staticmethod
+    def _parse_simple_xml_json_block(
+        xml_payload: str,
+    ) -> tuple[list[ToolCall], str | None]:
+        tool_calls: list[ToolCall] = []
+        stripped = xml_payload.strip()
+        start_token = "<tool_call>"
+        end_token = "</tool_call>"
+        decoder = json.JSONDecoder()
+        if start_token not in stripped or end_token not in stripped:
+            return [], stripped or None
+
+        residual_parts: list[str] = []
+        cursor = 0
+        while True:
+            start = stripped.find(start_token, cursor)
+            if start < 0:
+                break
+            if start > cursor:
+                residual_parts.append(stripped[cursor:start])
+
+            body_start = start + len(start_token)
+            end = stripped.find(end_token, body_start)
+            if end < 0:
+                residual_parts.append(stripped[start:])
+                cursor = len(stripped)
+                break
+
+            raw_json = stripped[body_start:end].strip()
+            try:
+                parsed, parsed_end = decoder.raw_decode(raw_json)
+                if raw_json[parsed_end:].strip():
+                    raise json.JSONDecodeError(
+                        "trailing data",
+                        raw_json,
+                        parsed_end,
+                    )
+            except json.JSONDecodeError:
+                residual_parts.append(stripped[start : end + len(end_token)])
+                cursor = end + len(end_token)
+                continue
+
+            name = parsed.get("name")
+            arguments = parsed.get("arguments", {})
+            if not isinstance(name, str) or not name:
+                residual_parts.append(stripped[start : end + len(end_token)])
+                cursor = end + len(end_token)
+                continue
+
+            if isinstance(arguments, str):
+                args_text = arguments
+            else:
+                args_text = json.dumps(arguments, ensure_ascii=False)
+
+            tool_calls.append(
+                ToolCall(
+                    id=make_tool_call_id(
+                        id_type="chatcmpl-tool",
+                        func_name=name,
+                        idx=len(tool_calls),
+                    ),
+                    type="function",
+                    function=FunctionCall(name=name, arguments=args_text),
+                )
+            )
+            cursor = end + len(end_token)
+
+        if cursor < len(stripped):
+            residual_parts.append(stripped[cursor:])
+
+        residual = "".join(residual_parts).strip() or None
+        return tool_calls, residual
+
     def extract_tool_calls(
         self,
         model_output: str,
@@ -1191,14 +1264,8 @@ class Qwen3XMLToolParser(ToolParser):
         if request:
             self.parser.set_tools(request.tools)
         result = self.parser.parse_single_streaming_chunks(model_output)
-        if not result.tool_calls:
-            return ExtractedToolCallInformation(
-                tool_calls=[],
-                tools_called=False,
-                content=result.content,
-            )
-        else:
-            tool_calls = []
+        tool_calls = []
+        if result.tool_calls:
             for tool_call in result.tool_calls:
                 if tool_call.function and tool_call.function.name:
                     tool_calls.append(
@@ -1239,11 +1306,40 @@ class Qwen3XMLToolParser(ToolParser):
                             tool_call.function.arguments
                         )
 
+        if not tool_calls:
+            fallback_tool_calls, fallback_content = self._parse_simple_xml_json_block(
+                model_output
+            )
+            if fallback_tool_calls:
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = []
+                for idx, tool_call in enumerate(fallback_tool_calls):
+                    fn = tool_call.function
+                    if fn is None:
+                        continue
+                    self.prev_tool_call_arr.append(
+                        {
+                            "name": fn.name or "",
+                            "arguments": fn.arguments or "",
+                        }
+                    )
+                    self.streamed_args_for_tool.append(fn.arguments or "")
+                return ExtractedToolCallInformation(
+                    tool_calls=fallback_tool_calls,
+                    tools_called=True,
+                    content=fallback_content,
+                )
             return ExtractedToolCallInformation(
-                tool_calls=tool_calls,
-                tools_called=len(tool_calls) > 0,
+                tool_calls=[],
+                tools_called=False,
                 content=result.content,
             )
+
+        return ExtractedToolCallInformation(
+            tool_calls=tool_calls,
+            tools_called=True,
+            content=result.content,
+        )
 
     def extract_tool_calls_streaming(
         self,
@@ -1282,6 +1378,64 @@ class Qwen3XMLToolParser(ToolParser):
 
         # Parse the delta text and get the result
         result = self.parser.parse_single_streaming_chunks(delta_text)
+        has_named_result_call = bool(
+            result
+            and result.tool_calls
+            and any(tc.function and tc.function.name for tc in result.tool_calls)
+        )
+        if not has_named_result_call:
+            previous_calls, _ = self._parse_simple_xml_json_block(previous_text)
+            current_calls, _ = self._parse_simple_xml_json_block(current_text)
+            if current_calls:
+                delta_tool_calls: list[DeltaToolCall] = []
+                for idx, current_call in enumerate(current_calls):
+                    current_fn = current_call.function
+                    if current_fn is None:
+                        continue
+
+                    prev_name = ""
+                    prev_args = ""
+                    if idx < len(previous_calls) and previous_calls[idx].function:
+                        prev_name = previous_calls[idx].function.name or ""
+                        prev_args = previous_calls[idx].function.arguments or ""
+
+                    name_delta = (
+                        current_fn.name if current_fn.name != prev_name else None
+                    )
+                    args_delta = None
+                    current_args = current_fn.arguments or ""
+                    if current_args != prev_args:
+                        if current_args.startswith(prev_args):
+                            args_delta = current_args[len(prev_args) :]
+                        else:
+                            args_delta = current_args
+
+                    if name_delta is None and (args_delta is None or args_delta == ""):
+                        continue
+
+                    while len(self.prev_tool_call_arr) <= idx:
+                        self.prev_tool_call_arr.append({"name": "", "arguments": ""})
+                    while len(self.streamed_args_for_tool) <= idx:
+                        self.streamed_args_for_tool.append("")
+
+                    self.prev_tool_call_arr[idx]["name"] = current_fn.name or ""
+                    self.prev_tool_call_arr[idx]["arguments"] = current_args
+                    self.streamed_args_for_tool[idx] = current_args
+
+                    delta_tool_calls.append(
+                        DeltaToolCall(
+                            id=current_call.id,
+                            type=current_call.type,
+                            index=idx,
+                            function=DeltaFunctionCall(
+                                name=name_delta,
+                                arguments=args_delta,
+                            ),
+                        )
+                    )
+
+                if delta_tool_calls:
+                    return DeltaMessage(tool_calls=delta_tool_calls)
 
         # Update tool call tracking arrays based on incremental parsing results
         if result and result.tool_calls:
