@@ -185,11 +185,29 @@ def _ready_payload(raw_request: Request, state: HealthProbeState | None) -> dict
 def _health_context_payload(raw_request: Request, state: HealthProbeState | None) -> dict[str, Any]:
     payload: dict[str, Any] = _ready_payload(raw_request, state)
     payload["hostname"] = os.getenv("HOSTNAME", "")
-    payload["recent_request_failures"] = recent_failure_summary(window_s=1800.0)
+    recent_failures = recent_failure_summary(window_s=1800.0)
+    payload["recent_request_failures"] = recent_failures
+    fingerprint_source = {
+        "alive": payload["alive"],
+        "ready": payload["ready"],
+        "consecutive_failures": payload["consecutive_failures"],
+        "last_error": payload["last_error"],
+        "hostname": payload["hostname"],
+        "failure_classes": recent_failures.get("failure_classes", {}),
+        "recent_items": [
+            {
+                "rid": item.get("rid", ""),
+                "failure_class": item.get("failure_class", ""),
+                "status_code": item.get("status_code", 0),
+                "shape_hash": item.get("shape_hash", ""),
+            }
+            for item in recent_failures.get("recent_items", [])
+        ],
+    }
     payload["health_fingerprint"] = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode(
-            "utf-8"
-        )
+        json.dumps(
+            fingerprint_source, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
     ).hexdigest()[:16]
     return payload
 
