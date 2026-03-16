@@ -539,25 +539,15 @@ class Qwen3CoderToolParser(ToolParser):
 
         # We've sent header, now handle function body
         if self.in_function:
-            # Always send opening brace first, regardless of whether
-            # parameter_prefix is in the current delta. With speculative
-            # decoding, a single delta may contain both the opening brace
-            # and parameter data; skipping "{" here would desync
-            # json_started from what was actually streamed.
+            opening_brace_delta = ""
             if not self.json_started:
+                # With stream_interval > 1 and speculative decoding, the same
+                # burst can contain the opening brace, one or more parameters,
+                # and even </function>. Do not return immediately after "{";
+                # otherwise the remainder of the burst is lost if generation
+                # finishes in the same iteration.
                 self.json_started = True
-                self.streamed_args_for_tool[self.current_tool_index] += "{"
-                self._sync_current_streamed_arguments()
-                return self._emit_delta(
-                    DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_index,
-                                function=DeltaFunctionCall(arguments="{"),
-                            )
-                        ]
-                    )
-                )
+                opening_brace_delta = "{"
 
             # Find all parameter start positions in current tool_text
             param_starts = []
@@ -651,7 +641,7 @@ class Qwen3CoderToolParser(ToolParser):
                 json_fragments.append(json_fragment)
 
             if json_fragments:
-                combined = "".join(json_fragments)
+                combined = opening_brace_delta + "".join(json_fragments)
 
                 closing_in_same_delta = (
                     not self.json_closed and self.function_end_token in tool_text
@@ -745,8 +735,9 @@ class Qwen3CoderToolParser(ToolParser):
                             exc_info=True,
                         )
 
+                close_delta = opening_brace_delta + "}"
                 if self.current_tool_index < len(self.streamed_args_for_tool):
-                    self.streamed_args_for_tool[self.current_tool_index] += "}"
+                    self.streamed_args_for_tool[self.current_tool_index] += close_delta
                     self._sync_current_streamed_arguments()
                 else:
                     logger.warning(
@@ -759,7 +750,7 @@ class Qwen3CoderToolParser(ToolParser):
                     tool_calls=[
                         DeltaToolCall(
                             index=self.current_tool_index,
-                            function=DeltaFunctionCall(arguments="}"),
+                            function=DeltaFunctionCall(arguments=close_delta),
                         )
                     ]
                 )
@@ -769,5 +760,33 @@ class Qwen3CoderToolParser(ToolParser):
                 self.accumulated_params = {}
 
                 return self._emit_delta(result)
+
+            if opening_brace_delta:
+                if self.current_tool_index < len(self.streamed_args_for_tool):
+                    self.streamed_args_for_tool[
+                        self.current_tool_index
+                    ] += opening_brace_delta
+                    self._sync_current_streamed_arguments()
+                else:
+                    logger.warning(
+                        "streamed_args_for_tool out of sync: index=%d len=%d",
+                        self.current_tool_index,
+                        len(self.streamed_args_for_tool),
+                    )
+
+                # No complete params yet; emit just the opening brace and wait
+                # for the next burst.
+                return self._emit_delta(
+                    DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.current_tool_index,
+                                function=DeltaFunctionCall(
+                                    arguments=opening_brace_delta
+                                ),
+                            )
+                        ]
+                    )
+                )
 
         return None
