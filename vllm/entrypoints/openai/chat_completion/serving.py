@@ -84,10 +84,19 @@ from vllm.utils.mistral import is_mistral_tokenizer
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
-from vllm.entrypoints.openai.request_metrics import classify_chat_request
+from vllm.entrypoints.openai.request_metrics import (
+    classify_chat_request,
+    log_request_failure,
+    summarize_chat_request,
+)
 
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
+
+
+def _is_probe_request(request_id: str | None) -> bool:
+    rid = request_id or ""
+    return rid.startswith("health-probe-")
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -228,6 +237,11 @@ class OpenAIServingChat(OpenAIServing):
         rid_hint = self._base_request_id(raw_request, getattr(request, "request_id", None))
         ctx_token = set_request_id(rid_hint)
         try:
+            if raw_request is not None:
+                try:
+                    raw_request.state.vllm_request_id_hint = rid_hint or ""
+                except Exception:
+                    pass
             # Log request payload BEFORE any chat template is applied
             if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
                 # Collect all incoming headers unfiltered
@@ -250,6 +264,7 @@ class OpenAIServingChat(OpenAIServing):
                 except Exception:
                     req_dump = None
                 try:
+                    request_shape = summarize_chat_request(req_dump)
                     payload_logger.info(
                         "openai.request",
                         extra={
@@ -258,6 +273,8 @@ class OpenAIServingChat(OpenAIServing):
                             # Pass dict directly for proper OTEL structured logging
                             "payload": req_dump,
                             "headers": headers_obj,
+                            "request_shape": request_shape,
+                            "shape_hash": request_shape.get("shape_hash", ""),
                         },
                     )
                 except Exception:
@@ -273,6 +290,16 @@ class OpenAIServingChat(OpenAIServing):
                     )
                 except Exception as e:
                     logger.exception("Error while resolving NVCF assets")
+                    log_request_failure(
+                        endpoint=self.__class__.__name__,
+                        request_id=rid_hint or "",
+                        error=str(e),
+                        status_code=400,
+                        payload=req_dump if 'req_dump' in locals() else request,
+                        probe=_is_probe_request(rid_hint),
+                        exc_type=type(e).__name__,
+                        error_type="BadRequestError",
+                    )
                     return self.create_error_response(str(e))
 
             # Strip raw multimodal special tokens from plain text to avoid
@@ -381,6 +408,18 @@ class OpenAIServingChat(OpenAIServing):
             )
         result = await self.render_chat_request(request, raw_request)
         if isinstance(result, ErrorResponse):
+            rid = self._base_request_id(raw_request, getattr(request, "request_id", None))
+            log_request_failure(
+                endpoint=self.__class__.__name__,
+                request_id=rid,
+                error=result.error.message,
+                status_code=result.error.code,
+                payload=original_request_payload or request,
+                probe=_is_probe_request(rid),
+                error_type=result.error.type,
+                path=raw_request.url.path if raw_request is not None else "",
+                method=raw_request.method if raw_request is not None else "",
+            )
             return result
 
         classify_chat_request(request)

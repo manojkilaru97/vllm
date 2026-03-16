@@ -117,6 +117,12 @@ def _is_truthy(value: Optional[str]) -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+def _mm_input_metadata_enabled() -> bool:
+    # MM payload logging is the top-level gate for any media offload/mirroring.
+    # If the caller does not want MM metadata logs, do not trigger Kratos work.
+    return _is_truthy(os.getenv("VLLM_LOG_MM_INPUT_METADATA", "0"))
+
+
 def _apply_nvcf_secrets(secrets: Dict[str, Any], *, initial: bool) -> None:
     # Accept both PRODUCTION_* and generic names; prefer PRODUCTION_* if present
     prod_cid = secrets.get("PRODUCTION_KRATOS_CLI_SSA_CLIENT_ID")
@@ -464,6 +470,8 @@ def _sanitize_url_no_query(url: str) -> str:
 
 
 def _media_mirror_enabled() -> bool:
+    if not _mm_input_metadata_enabled():
+        return False
     # Default to enabled when kratos is enabled, since mirroring relies on it.
     return _is_truthy(os.getenv("VLLM_MEDIA_MIRROR_ENABLE", os.getenv("KRATOS_BULKUPLOAD_ENABLE", "0")))
 
@@ -738,7 +746,7 @@ def _wrap_with_queue(logging_handler: logging.Handler) -> logging.Handler:
 
     # Configure offload filter on the downstream handler
     threshold = _env_int("KRATOS_OFFLOAD_THRESHOLD_BYTES", 131072)
-    enabled = _truthy_env("KRATOS_BULKUPLOAD_ENABLE", "0")
+    enabled = _truthy_env("KRATOS_BULKUPLOAD_ENABLE", "0") and _mm_input_metadata_enabled()
     cfg = _kratos_defaults()
     offload_filter = _KratosOffloadFilter(threshold, enabled, cfg)
     logging_handler.addFilter(offload_filter)

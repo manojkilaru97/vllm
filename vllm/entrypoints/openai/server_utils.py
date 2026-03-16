@@ -22,6 +22,11 @@ from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.entrypoints.openai.request_metrics import log_request_failure
+from vllm.entrypoints.serve.instrumentator.health import (
+    start_health_probe_loop,
+    stop_health_probe_loop,
+)
 from vllm.entrypoints.utils import create_error_response, sanitize_message
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -29,6 +34,22 @@ from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 logger = init_logger("vllm.entrypoints.openai.server_utils")
+
+
+def _request_id(req: Request) -> str:
+    if hasattr(req.state, "request_metadata"):
+        return getattr(req.state.request_metadata, "request_id", "") or ""
+    if hasattr(req.state, "vllm_request_id_hint"):
+        return getattr(req.state, "vllm_request_id_hint", "") or ""
+    return ""
+
+
+def _request_payload(req: Request):
+    return getattr(req.state, "vllm_original_chat_request_payload", None)
+
+
+def _is_probe_request_id(request_id: str) -> bool:
+    return request_id.startswith("health-probe-")
 
 
 class AuthenticationMiddleware:
@@ -351,6 +372,19 @@ async def engine_error_handler(
         engine=req.app.state.engine_client,
     )
     err = create_error_response(exc)
+    rid = _request_id(req)
+    log_request_failure(
+        endpoint=req.url.path,
+        request_id=rid,
+        error=err.error.message,
+        status_code=err.error.code,
+        payload=_request_payload(req),
+        probe=_is_probe_request_id(rid),
+        exc_type=type(exc).__name__,
+        error_type=err.error.type,
+        path=req.url.path,
+        method=req.method,
+    )
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -364,6 +398,19 @@ async def exception_handler(req: Request, exc: Exception):
         )
 
     err = create_error_response(exc)
+    rid = _request_id(req)
+    log_request_failure(
+        endpoint=req.url.path,
+        request_id=rid,
+        error=err.error.message,
+        status_code=err.error.code,
+        payload=_request_payload(req),
+        probe=_is_probe_request_id(rid),
+        exc_type=type(exc).__name__,
+        error_type=err.error.type,
+        path=req.url.path,
+        method=req.method,
+    )
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -381,6 +428,19 @@ async def http_exception_handler(req: Request, exc: HTTPException):
             type=HTTPStatus(exc.status_code).phrase,
             code=exc.status_code,
         )
+    )
+    rid = _request_id(req)
+    log_request_failure(
+        endpoint=req.url.path,
+        request_id=rid,
+        error=err.error.message,
+        status_code=err.error.code,
+        payload=_request_payload(req),
+        probe=_is_probe_request_id(rid),
+        exc_type=type(exc).__name__,
+        error_type=err.error.type,
+        path=req.url.path,
+        method=req.method,
     )
     return JSONResponse(err.model_dump(), status_code=exc.status_code)
 
@@ -419,6 +479,19 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
             param=param,
         )
     )
+    rid = _request_id(req)
+    log_request_failure(
+        endpoint=req.url.path,
+        request_id=rid,
+        error=err.error.message,
+        status_code=err.error.code,
+        payload=_request_payload(req),
+        probe=_is_probe_request_id(rid),
+        exc_type=type(exc).__name__,
+        error_type=err.error.type,
+        path=req.url.path,
+        method=req.method,
+    )
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 
@@ -442,12 +515,15 @@ async def lifespan(app: FastAPI):
         else:
             task = None
 
+        start_health_probe_loop(app)
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
         try:
             yield
         finally:
+            await stop_health_probe_loop(app)
             if task is not None:
                 task.cancel()
     finally:
