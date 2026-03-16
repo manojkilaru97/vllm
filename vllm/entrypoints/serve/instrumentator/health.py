@@ -23,10 +23,8 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.request_metrics import recent_failure_summary
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
-import logging
 
 logger = init_logger(__name__)
-payload_logger = logging.getLogger("vllm.payload")
 
 
 router = APIRouter()
@@ -224,17 +222,6 @@ def _maybe_log_unhealthy(path: str, payload: dict[str, Any], state: HealthProbeS
             "health_fingerprint": payload.get("health_fingerprint", ""),
         },
     )
-    try:
-        payload_logger.warning(
-            "health.unhealthy",
-            extra={
-                "endpoint": path,
-                "health_fingerprint": payload.get("health_fingerprint", ""),
-                "health_payload": payload,
-            },
-        )
-    except Exception:
-        pass
     if state is not None:
         state.last_unhealthy_log_at = now
 
