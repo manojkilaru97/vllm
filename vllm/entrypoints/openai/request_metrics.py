@@ -35,19 +35,19 @@ def register_request_type_counters() -> None:
     from prometheus_client import Counter
 
     request_type_image = Counter(
-        name="request_type_image_total",
+        name="vllm:request_type_image_total",
         documentation="Total requests containing images",
     )
     request_type_video = Counter(
-        name="request_type_video_total",
+        name="vllm:request_type_video_total",
         documentation="Total requests containing videos",
     )
     request_type_tool_call = Counter(
-        name="request_type_tool_call_total",
+        name="vllm:request_type_tool_call_total",
         documentation="Total requests with tool calls enabled",
     )
     request_type_structured_output = Counter(
-        name="request_type_structured_output_total",
+        name="vllm:request_type_structured_output_total",
         documentation="Total requests with structured output "
         "(json_schema, json_object, structural_tag, regex, choice, or grammar)",
     )
