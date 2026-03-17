@@ -25,6 +25,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     RequestResponseMetadata,
     UsageInfo,
 )
+from vllm.entrypoints.openai.request_metrics import classify_completion_request
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
@@ -128,6 +129,7 @@ class OpenAIServingCompletion(OpenAIServing):
             return result
 
         engine_inputs = result
+        classify_completion_request(request)
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
         created_time = int(time.time())

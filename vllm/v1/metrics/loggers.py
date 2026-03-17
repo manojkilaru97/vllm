@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorLogging,
     KVConnectorProm,
 )
+from vllm.entrypoints.openai.request_metrics import register_request_type_counters
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
 from vllm.v1.engine import FinishReason
@@ -403,6 +404,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.engine_indexes = engine_indexes
 
         unregister_vllm_metrics()
+        register_request_type_counters()
         self.vllm_config = vllm_config
         # Use this flag to hide metrics that were deprecated in
         # a previous release and which will be removed future

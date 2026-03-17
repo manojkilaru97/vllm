@@ -11,6 +11,7 @@ from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final
 
+import jinja2
 import partial_json_parser
 import regex as re
 import base64
@@ -43,6 +44,7 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
     extract_harmony_streaming_delta,
 )
+from vllm.entrypoints.openai.request_metrics import classify_chat_request
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
@@ -316,6 +318,7 @@ class OpenAIServingChat(OpenAIServing):
             return result
 
         conversation, engine_inputs = result
+        classify_chat_request(request)
 
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
