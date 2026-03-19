@@ -153,7 +153,7 @@ class SpecDecodingProm:
             return
 
         counter_drafts = self._counter_cls(
-            name="spec_decode_num_drafts_total",
+            name="vllm:spec_decode_num_drafts",
             documentation="Number of spec decoding drafts.",
             labelnames=labelnames,
         )
@@ -162,7 +162,7 @@ class SpecDecodingProm:
         )
 
         counter_draft_tokens = self._counter_cls(
-            name="spec_decode_num_draft_tokens_total",
+            name="vllm:spec_decode_num_draft_tokens",
             documentation="Number of draft tokens.",
             labelnames=labelnames,
         )
@@ -171,7 +171,7 @@ class SpecDecodingProm:
         )
 
         counter_accepted_tokens = self._counter_cls(
-            name="spec_decode_num_accepted_tokens_total",
+            name="vllm:spec_decode_num_accepted_tokens",
             documentation="Number of accepted tokens.",
             labelnames=labelnames,
         )
@@ -187,7 +187,7 @@ class SpecDecodingProm:
         )
         pos_labelnames = labelnames + ["position"]
         base_counter = self._counter_cls(
-            name="spec_decode_num_accepted_tokens_per_pos_total",
+            name="vllm:spec_decode_num_accepted_tokens_per_pos",
             documentation="Accepted tokens per draft position.",
             labelnames=pos_labelnames,
         )
@@ -200,7 +200,7 @@ class SpecDecodingProm:
 
         # SGLang-compatible: Mean acceptance length gauge
         gauge_spec_accept_length = self._gauge_cls(
-            name="spec_accept_length",
+            name="vllm:spec_accept_length",
             documentation=(
                 "Average accepted sequence length in speculative decoding "
                 "(including bonus token)."
@@ -215,7 +215,7 @@ class SpecDecodingProm:
 
         # SGLang-compatible: Draft acceptance rate gauge
         gauge_spec_accept_rate = self._gauge_cls(
-            name="spec_accept_rate",
+            name="vllm:spec_accept_rate",
             documentation=(
                 "Draft acceptance rate in speculative decoding "
                 "(accepted_tokens / draft_tokens, 0-1)."
