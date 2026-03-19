@@ -950,6 +950,40 @@ class OpenAIServing:
         return stripped[min(starts):]
 
     @staticmethod
+    def _normalize_tool_arguments_json(arguments: str) -> str:
+        """Best-effort repair for truncated object-like argument payloads."""
+        stripped = arguments.strip()
+        if not stripped:
+            return arguments
+
+        candidates: list[str] = [stripped]
+        if ":" in stripped and not stripped.startswith(("{", "[")):
+            candidates.append("{" + stripped)
+            candidates.append("{" + stripped + "}")
+        if stripped.startswith("{") and not stripped.endswith("}"):
+            candidates.append(stripped + "}")
+        if stripped.endswith("}") and not stripped.startswith("{"):
+            candidates.append("{" + stripped)
+
+        seen: set[str] = set()
+        decoder = json.JSONDecoder()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                parsed_obj, end = decoder.raw_decode(candidate)
+            except json.JSONDecodeError:
+                continue
+            if candidate[end:].strip():
+                continue
+            if isinstance(parsed_obj, (dict, list)):
+                return json.dumps(parsed_obj, ensure_ascii=False)
+            return candidate
+
+        return arguments
+
+    @staticmethod
     def _extract_tool_calls_with_parser(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
@@ -1000,6 +1034,11 @@ class OpenAIServing:
         content: str | None = None,
     ) -> tuple[list[FunctionCall] | None, str | None]:
         function_calls = list[FunctionCall]()
+        if content is not None and "</think>" in content:
+            # MiniMax append-think responses may contain brace-heavy prompt
+            # echoes in reasoning. Tool-call parsing should inspect only the
+            # generated suffix after the reasoning terminator.
+            content = content.rsplit("</think>", 1)[-1]
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
             # Forced Function Call - handle Kimi K2 marker format
@@ -1035,14 +1074,19 @@ class OpenAIServing:
                         arguments = matched.arguments
                 else:
                     # Normalize direct JSON object arguments when present.
+                    normalized_candidate = (
+                        OpenAIServing._normalize_tool_arguments_json(
+                            json_candidate
+                        )
+                    )
                     try:
-                        parsed_obj = json.loads(json_candidate)
+                        parsed_obj = json.loads(normalized_candidate)
                         if isinstance(parsed_obj, dict):
                             arguments = json.dumps(parsed_obj, ensure_ascii=False)
                         else:
-                            arguments = json_candidate
+                            arguments = normalized_candidate
                     except json.JSONDecodeError:
-                        arguments = json_candidate
+                        arguments = normalized_candidate
             function_calls.append(
                 FunctionCall(name=request.tool_choice.name, arguments=arguments)
             )
@@ -1084,14 +1128,19 @@ class OpenAIServing:
                         arguments = matched.arguments
                 else:
                     # Normalize direct JSON object arguments when present.
+                    normalized_candidate = (
+                        OpenAIServing._normalize_tool_arguments_json(
+                            json_candidate
+                        )
+                    )
                     try:
-                        parsed_obj = json.loads(json_candidate)
+                        parsed_obj = json.loads(normalized_candidate)
                         if isinstance(parsed_obj, dict):
                             arguments = json.dumps(parsed_obj, ensure_ascii=False)
                         else:
-                            arguments = json_candidate
+                            arguments = normalized_candidate
                     except json.JSONDecodeError:
-                        arguments = json_candidate
+                        arguments = normalized_candidate
             function_calls.append(
                 FunctionCall(name=request.tool_choice.function.name, arguments=arguments)
             )
@@ -1124,7 +1173,25 @@ class OpenAIServing:
                         function_calls.extend(parsed_calls)
                         content = None
                         return function_calls, content
-                    raise
+                    single_content = OpenAIServing._strip_non_json_prefix(
+                        content, prefer_array=False
+                    )
+                    try:
+                        tool_call = TypeAdapter(FunctionDefinition).validate_json(
+                            single_content
+                        )
+                    except Exception:
+                        raise
+                    function_calls.append(
+                        FunctionCall(
+                            name=tool_call.name,
+                            arguments=json.dumps(
+                                tool_call.parameters, ensure_ascii=False
+                            ),
+                        )
+                    )
+                    content = None
+                    return function_calls, content
                 for tool_call in tool_calls:
                     function_calls.append(
                         FunctionCall(

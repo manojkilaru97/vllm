@@ -1060,67 +1060,38 @@ class OpenAIServingChat(OpenAIServing):
                         harmony_tools_streamed[i] |= tools_streamed_flag
                     # handle streaming deltas for tools with named tool_choice
                     elif tool_choice_function_name:
-                        # When encountering think end id in prompt_token_ids
-                        # i.e {"enable_thinking": False},
-                        # check BEFORE calling the parser to avoid a spurious
-                        # reasoning delta on the first chunk.
-                        if (
-                            reasoning_parser
-                            and not reasoning_end_arr[i]
-                            and prompt_is_reasoning_end_arr[i]
-                        ):
-                            reasoning_end_arr[i] = True
+                        minimax_finish_only_named = (
+                            reasoning_parser is not None
+                            and reasoning_parser.__class__.__name__
+                            == "MiniMaxM2AppendThinkReasoningParser"
+                        )
+                        if minimax_finish_only_named:
+                            accumulated_text = previous_text + delta_text
+                            current_text = accumulated_text
+                            output_token_ids = as_list(output.token_ids)
 
-                        if (
-                            reasoning_parser
-                            and not reasoning_end_arr[i]
-                            and not reasoning_parser.is_reasoning_end(
-                                previous_token_ids
-                            )
-                        ):
-                            assert reasoning_parser is not None
-                            delta_message = (
+                            if (
+                                reasoning_parser
+                                and not reasoning_end_arr[i]
+                                and prompt_is_reasoning_end_arr[i]
+                            ):
+                                reasoning_end_arr[i] = True
+
+                            if reasoning_parser and not reasoning_end_arr[i]:
                                 reasoning_parser.extract_reasoning_streaming(
                                     previous_text,
                                     current_text,
                                     delta_text,
                                     previous_token_ids,
                                     current_token_ids,
-                                    output.token_ids,
+                                    output_token_ids,
                                 )
-                            )
-                            # When encountering think end id in delta_token_ids,
-                            # set reasoning status to end.
-                            # Only keep 'content', remove 'reasoning'.
-                            if reasoning_parser.is_reasoning_end(
-                                as_list(output.token_ids)
-                            ):
-                                reasoning_end_arr[i] = True
-                                if delta_message and delta_message.content:
-                                    # This need to be added to next `delta_text`
-                                    current_text = delta_message.content
-                                    delta_message.content = None
-                                elif (
-                                    delta_message
-                                    and delta_message.reasoning
-                                    and delta_message.reasoning.lstrip().startswith(("{", "["))
-                                    and tool_choice_function_name
+                                if reasoning_parser.is_reasoning_end(
+                                    output_token_ids
                                 ):
-                                    # CRITICAL FIX: Model output raw JSON without <thinking> tags.
-                                    # The "reasoning" is actually the start of JSON arguments.
-                                    # Preserve it so it can be combined with subsequent chunks.
-                                    current_text = delta_message.reasoning
-                                    # Don't send this as reasoning to the client
-                                    delta_message.reasoning = None
-                                    delta_message.reasoning_content = None
-                                else:
-                                    current_text = ""
-                            elif output.finish_reason is not None:
-                                # Fallback for cases where thinking mode is enabled
-                                # but the model never emits </think>. Parse the final
-                                # accumulated text as named tool arguments.
-                                accumulated_text = previous_text + delta_text
-                                current_text = accumulated_text
+                                    reasoning_end_arr[i] = True
+
+                            if output.finish_reason is not None:
                                 try:
                                     parsed_calls, _ = self._parse_tool_calls_from_content(
                                         request=request,
@@ -1147,88 +1118,293 @@ class OpenAIServingChat(OpenAIServing):
                                     if matched_call and matched_call.arguments is not None
                                     else accumulated_text.strip()
                                 )
+                                extracted_args = (
+                                    OpenAIServingChat._normalize_tool_arguments_json(
+                                        extracted_args
+                                    )
+                                )
                                 if extracted_args:
                                     try:
                                         json.loads(extracted_args)
                                     except json.JSONDecodeError:
                                         extracted_args = ""
 
-                                previous_args = named_tool_previous_args[i]
-                                if extracted_args.startswith(previous_args):
-                                    arguments_delta = extracted_args[len(previous_args) :]
-                                else:
-                                    arguments_delta = extracted_args
-                                named_tool_previous_args[i] = extracted_args
-
-                                if arguments_delta or not function_name_returned[i]:
-                                    if function_name_returned[i]:
-                                        delta_tool_call = DeltaToolCall(
-                                            function=DeltaFunctionCall(
-                                                arguments=arguments_delta
-                                            ),
-                                            index=i,
-                                        )
-                                    else:
-                                        emitted_tool_call_id = make_tool_call_id()
-                                        delta_tool_call = DeltaToolCall(
-                                            id=emitted_tool_call_id,
-                                            type="function",
-                                            function=DeltaFunctionCall(
-                                                name=tool_choice_function_name,
-                                                arguments=arguments_delta,
-                                            ),
-                                            index=i,
-                                        )
-                                        function_name_returned[i] = True
+                                if extracted_args:
                                     delta_message = DeltaMessage(
-                                        tool_calls=[delta_tool_call]
+                                        tool_calls=[
+                                            DeltaToolCall(
+                                                id=make_tool_call_id(),
+                                                type="function",
+                                                function=DeltaFunctionCall(
+                                                    name=tool_choice_function_name,
+                                                    arguments=extracted_args,
+                                                ),
+                                                index=i,
+                                            )
+                                        ]
                                     )
+                                    function_name_returned[i] = True
+                                    named_tool_previous_args[i] = extracted_args
                                     tools_streamed[i] = True
                                 else:
                                     delta_message = None
-                                reasoning_end_arr[i] = True
+                            else:
+                                delta_message = None
                         else:
-                            # Named tool_choice streaming - handle Kimi K2 marker format
-                            # Accumulate full text to extract clean JSON arguments
-                            # Detection of <think> content handles stripping
-                            accumulated_text = previous_text + delta_text
-                            current_text = accumulated_text  # Persist for next iteration
+                            # When encountering think end id in prompt_token_ids
+                            # i.e {"enable_thinking": False},
+                            # check BEFORE calling the parser to avoid a spurious
+                            # reasoning delta on the first chunk.
+                            if (
+                                reasoning_parser
+                                and not reasoning_end_arr[i]
+                                and prompt_is_reasoning_end_arr[i]
+                            ):
+                                reasoning_end_arr[i] = True
 
-                            # Check if the model outputs Kimi K2 marker format
-                            if OpenAIServingChat._has_kimi_k2_markers(accumulated_text):
-                                # Extract clean arguments from between markers
-                                # Allow partial extraction for streaming deltas (partial_ok=True)
-                                extracted_args = OpenAIServingChat._extract_kimi_k2_arguments(accumulated_text, partial_ok=True)
-
-                                if extracted_args is not None:
-                                    # We have extracted arguments - compute delta from what was sent before
-                                    previous_args = named_tool_previous_args[i]
-
-                                    # Compute delta: only send the new portion
-                                    if extracted_args.startswith(previous_args):
-                                        arguments_delta = extracted_args[len(previous_args):]
+                            if (
+                                reasoning_parser
+                                and not reasoning_end_arr[i]
+                                and not reasoning_parser.is_reasoning_end(
+                                    previous_token_ids
+                                )
+                            ):
+                                assert reasoning_parser is not None
+                                delta_message = (
+                                    reasoning_parser.extract_reasoning_streaming(
+                                        previous_text,
+                                        current_text,
+                                        delta_text,
+                                        previous_token_ids,
+                                        current_token_ids,
+                                        output.token_ids,
+                                    )
+                                )
+                                # When encountering think end id in delta_token_ids,
+                                # set reasoning status to end.
+                                # Only keep 'content', remove 'reasoning'.
+                                if reasoning_parser.is_reasoning_end(
+                                    as_list(output.token_ids)
+                                ):
+                                    reasoning_end_arr[i] = True
+                                    if delta_message and delta_message.content:
+                                        # This need to be added to next `delta_text`
+                                        current_text = delta_message.content
+                                        delta_message.content = None
+                                    elif (
+                                        delta_message
+                                        and delta_message.reasoning
+                                        and delta_message.reasoning.lstrip().startswith(
+                                            ("{", "[")
+                                        )
+                                        and tool_choice_function_name
+                                    ):
+                                        # CRITICAL FIX: Model output raw JSON without <thinking> tags.
+                                        # The "reasoning" is actually the start of JSON arguments.
+                                        # Preserve it so it can be combined with subsequent chunks.
+                                        current_text = delta_message.reasoning
+                                        # Don't send this as reasoning to the client
+                                        delta_message.reasoning = None
+                                        delta_message.reasoning_content = None
                                     else:
-                                        # Fallback: send full extracted args if prefix doesn't match
-                                        arguments_delta = extracted_args
+                                        current_text = ""
+                                elif output.finish_reason is not None:
+                                    # Fallback for cases where thinking mode is enabled
+                                    # but the model never emits </think>. Parse the final
+                                    # accumulated text as named tool arguments.
+                                    accumulated_text = previous_text + delta_text
+                                    current_text = accumulated_text
+                                    try:
+                                        parsed_calls, _ = self._parse_tool_calls_from_content(
+                                            request=request,
+                                            tokenizer=tokenizer,
+                                            content=accumulated_text,
+                                            enable_auto_tools=self.enable_auto_tools,
+                                            tool_parser_cls=self.tool_parser,
+                                        )
+                                    except Exception:
+                                        parsed_calls = None
 
-                                    # Update tracking
+                                    matched_call = None
+                                    if parsed_calls:
+                                        matched_call = next(
+                                            (
+                                                fc
+                                                for fc in parsed_calls
+                                                if fc.name == tool_choice_function_name
+                                            ),
+                                            parsed_calls[0],
+                                        )
+                                    extracted_args = (
+                                        matched_call.arguments
+                                        if matched_call and matched_call.arguments is not None
+                                        else accumulated_text.strip()
+                                    )
+                                    extracted_args = (
+                                        OpenAIServingChat._normalize_tool_arguments_json(
+                                            extracted_args
+                                        )
+                                    )
+                                    if extracted_args:
+                                        try:
+                                            json.loads(extracted_args)
+                                        except json.JSONDecodeError:
+                                            extracted_args = ""
+
+                                    previous_args = named_tool_previous_args[i]
+                                    if extracted_args.startswith(previous_args):
+                                        arguments_delta = extracted_args[len(previous_args) :]
+                                    else:
+                                        arguments_delta = extracted_args
                                     named_tool_previous_args[i] = extracted_args
 
-                                    # Send delta if there's new content
                                     if arguments_delta or not function_name_returned[i]:
                                         if function_name_returned[i]:
                                             delta_tool_call = DeltaToolCall(
-                                                function=DeltaFunctionCall(arguments=arguments_delta),
+                                                function=DeltaFunctionCall(
+                                                    arguments=arguments_delta
+                                                ),
                                                 index=i,
                                             )
                                         else:
-                                            # First delta includes function name
+                                            emitted_tool_call_id = make_tool_call_id()
+                                            delta_tool_call = DeltaToolCall(
+                                                id=emitted_tool_call_id,
+                                                type="function",
+                                                function=DeltaFunctionCall(
+                                                    name=tool_choice_function_name,
+                                                    arguments=arguments_delta,
+                                                ),
+                                                index=i,
+                                            )
+                                            function_name_returned[i] = True
+                                        delta_message = DeltaMessage(
+                                            tool_calls=[delta_tool_call]
+                                        )
+                                        tools_streamed[i] = True
+                                    else:
+                                        delta_message = None
+                                    reasoning_end_arr[i] = True
+                            else:
+                                # Named tool_choice streaming - handle Kimi K2 marker format
+                                # Accumulate full text to extract clean JSON arguments
+                                # Detection of <think> content handles stripping
+                                accumulated_text = previous_text + delta_text
+                                current_text = accumulated_text  # Persist for next iteration
+
+                                # Check if the model outputs Kimi K2 marker format
+                                if OpenAIServingChat._has_kimi_k2_markers(
+                                    accumulated_text
+                                ):
+                                    # Extract clean arguments from between markers
+                                    # Allow partial extraction for streaming deltas (partial_ok=True)
+                                    extracted_args = OpenAIServingChat._extract_kimi_k2_arguments(
+                                        accumulated_text, partial_ok=True
+                                    )
+
+                                    if extracted_args is not None:
+                                        # We have extracted arguments - compute delta from what was sent before
+                                        previous_args = named_tool_previous_args[i]
+
+                                        # Compute delta: only send the new portion
+                                        if extracted_args.startswith(previous_args):
+                                            arguments_delta = extracted_args[
+                                                len(previous_args) :
+                                            ]
+                                        else:
+                                            # Fallback: send full extracted args if prefix doesn't match
+                                            arguments_delta = extracted_args
+
+                                        # Update tracking
+                                        named_tool_previous_args[i] = extracted_args
+
+                                        # Send delta if there's new content
+                                        if (
+                                            arguments_delta
+                                            or not function_name_returned[i]
+                                        ):
+                                            if function_name_returned[i]:
+                                                delta_tool_call = DeltaToolCall(
+                                                    function=DeltaFunctionCall(
+                                                        arguments=arguments_delta
+                                                    ),
+                                                    index=i,
+                                                )
+                                            else:
+                                                # First delta includes function name
+                                                delta_tool_call = DeltaToolCall(
+                                                    id=make_tool_call_id(),
+                                                    type="function",
+                                                    function=DeltaFunctionCall(
+                                                        name=tool_choice_function_name,
+                                                        arguments=arguments_delta,
+                                                    ),
+                                                    index=i,
+                                                )
+                                                function_name_returned[i] = True
+
+                                            delta_message = DeltaMessage(
+                                                tool_calls=[
+                                                    delta_tool_call,
+                                                ]
+                                            )
+                                            tools_streamed[i] = True
+                                        else:
+                                            # No new content, don't send a delta
+                                            delta_message = None
+                                    else:
+                                        # Markers detected but arguments not yet complete, wait
+                                        delta_message = None
+                                else:
+                                    # No markers - either reasoning text before tool call or standard format
+                                    # For Kimi K2, suppress reasoning text (don't send as arguments)
+                                    # For non-Kimi models, fall back to original behavior
+                                    if self.tool_call_id_type == "kimi_k2":
+                                        # At finish time without markers, use accumulated text as args
+                                        # (similar to non-streaming behavior in engine/serving.py)
+                                        if (
+                                            output.finish_reason is not None
+                                            and not function_name_returned[i]
+                                            and accumulated_text.strip()
+                                        ):
                                             delta_tool_call = DeltaToolCall(
                                                 id=make_tool_call_id(),
                                                 type="function",
                                                 function=DeltaFunctionCall(
                                                     name=tool_choice_function_name,
-                                                    arguments=arguments_delta,
+                                                    arguments=accumulated_text.strip(),
+                                                ),
+                                                index=i,
+                                            )
+                                            function_name_returned[i] = True
+                                            delta_message = DeltaMessage(
+                                                tool_calls=[delta_tool_call]
+                                            )
+                                            tools_streamed[i] = True
+                                        else:
+                                            delta_message = None
+                                    else:
+                                        # Original behavior for non-Kimi models
+                                        if function_name_returned[i]:
+                                            delta_tool_call = DeltaToolCall(
+                                                function=DeltaFunctionCall(
+                                                    arguments=delta_text
+                                                ),
+                                                index=i,
+                                            )
+                                        else:
+                                            if is_mistral_tokenizer(tokenizer):
+                                                tool_call_id = (
+                                                    MistralToolCall.generate_random_id()
+                                                )
+                                            else:
+                                                tool_call_id = make_tool_call_id()
+                                            delta_tool_call = DeltaToolCall(
+                                                id=tool_call_id,
+                                                type="function",
+                                                function=DeltaFunctionCall(
+                                                    name=tool_choice_function_name,
+                                                    arguments=delta_text,
                                                 ),
                                                 index=i,
                                             )
@@ -1240,69 +1416,6 @@ class OpenAIServingChat(OpenAIServing):
                                             ]
                                         )
                                         tools_streamed[i] = True
-                                    else:
-                                        # No new content, don't send a delta
-                                        delta_message = None
-                                else:
-                                    # Markers detected but arguments not yet complete, wait
-                                    delta_message = None
-                            else:
-                                # No markers - either reasoning text before tool call or standard format
-                                # For Kimi K2, suppress reasoning text (don't send as arguments)
-                                # For non-Kimi models, fall back to original behavior
-                                if self.tool_call_id_type == "kimi_k2":
-                                    # At finish time without markers, use accumulated text as args
-                                    # (similar to non-streaming behavior in engine/serving.py)
-                                    if (
-                                        output.finish_reason is not None
-                                        and not function_name_returned[i]
-                                        and accumulated_text.strip()
-                                    ):
-                                        delta_tool_call = DeltaToolCall(
-                                            id=make_tool_call_id(),
-                                            type="function",
-                                            function=DeltaFunctionCall(
-                                                name=tool_choice_function_name,
-                                                arguments=accumulated_text.strip(),
-                                            ),
-                                            index=i,
-                                        )
-                                        function_name_returned[i] = True
-                                        delta_message = DeltaMessage(
-                                            tool_calls=[delta_tool_call]
-                                        )
-                                        tools_streamed[i] = True
-                                    else:
-                                        delta_message = None
-                                else:
-                                    # Original behavior for non-Kimi models
-                                    if function_name_returned[i]:
-                                        delta_tool_call = DeltaToolCall(
-                                            function=DeltaFunctionCall(arguments=delta_text),
-                                            index=i,
-                                        )
-                                    else:
-                                        if is_mistral_tokenizer(tokenizer):
-                                            tool_call_id = MistralToolCall.generate_random_id()
-                                        else:
-                                            tool_call_id = make_tool_call_id()
-                                        delta_tool_call = DeltaToolCall(
-                                            id=tool_call_id,
-                                            type="function",
-                                            function=DeltaFunctionCall(
-                                                name=tool_choice_function_name,
-                                                arguments=delta_text,
-                                            ),
-                                            index=i,
-                                        )
-                                        function_name_returned[i] = True
-
-                                    delta_message = DeltaMessage(
-                                        tool_calls=[
-                                            delta_tool_call,
-                                        ]
-                                    )
-                                    tools_streamed[i] = True
 
                     elif request.tool_choice == "required":
                         assert previous_texts is not None
@@ -1310,16 +1423,21 @@ class OpenAIServingChat(OpenAIServing):
                         current_text = previous_text + delta_text
                         fn_name_returned = function_name_returned[i]
                         output_token_ids = as_list(output.token_ids)
-
-                        if (
+                        minimax_finish_only_required = (
                             reasoning_parser is not None
-                            and not reasoning_end_arr[i]
-                            and prompt_is_reasoning_end_arr[i]
-                        ):
-                            reasoning_end_arr[i] = True
+                            and reasoning_parser.__class__.__name__
+                            == "MiniMaxM2AppendThinkReasoningParser"
+                        )
 
-                        if reasoning_parser and not reasoning_end_arr[i]:
-                            delta_message = (
+                        if minimax_finish_only_required:
+                            if (
+                                reasoning_parser is not None
+                                and not reasoning_end_arr[i]
+                                and prompt_is_reasoning_end_arr[i]
+                            ):
+                                reasoning_end_arr[i] = True
+
+                            if reasoning_parser and not reasoning_end_arr[i]:
                                 reasoning_parser.extract_reasoning_streaming(
                                     previous_text,
                                     current_text,
@@ -1328,26 +1446,19 @@ class OpenAIServingChat(OpenAIServing):
                                     current_token_ids,
                                     output_token_ids,
                                 )
-                            )
-                            if reasoning_parser.is_reasoning_end(output_token_ids):
-                                reasoning_end_arr[i] = True
-                                if delta_message and delta_message.content:
-                                    current_text = delta_message.content
-                                    delta_message.content = None
-                                else:
-                                    # reasoning ended
-                                    current_text = ""
-                            elif output.finish_reason is not None:
-                                # Fallback for cases where thinking mode is enabled
-                                # but the model never emits </think>. Parse at
-                                # finish from the full accumulated text.
-                                reasoning_end_arr[i] = True
-                                content = current_text
+                                if reasoning_parser.is_reasoning_end(
+                                    output_token_ids
+                                ):
+                                    reasoning_end_arr[i] = True
+                                delta_message = None
+                            elif output.finish_reason is None:
+                                delta_message = None
+                            else:
                                 try:
                                     parsed_calls, _ = self._parse_tool_calls_from_content(
                                         request=request,
                                         tokenizer=tokenizer,
-                                        content=content,
+                                        content=current_text,
                                         enable_auto_tools=self.enable_auto_tools,
                                         tool_parser_cls=self.tool_parser,
                                     )
@@ -1383,121 +1494,208 @@ class OpenAIServingChat(OpenAIServing):
                                     )
 
                                 if delta_tool_calls:
-                                    delta_message = DeltaMessage(tool_calls=delta_tool_calls)
+                                    delta_message = DeltaMessage(
+                                        tool_calls=delta_tool_calls
+                                    )
                                     function_name_returned[i] = True
                                     history_tool_call_cnt += len(delta_tool_calls)
                                     tools_streamed[i] = True
                                 else:
                                     delta_message = None
-
                         else:
-                            # either finished reasoning or no reasoning at all
-                            content = current_text
+                            if (
+                                reasoning_parser is not None
+                                and not reasoning_end_arr[i]
+                                and prompt_is_reasoning_end_arr[i]
+                            ):
+                                reasoning_end_arr[i] = True
 
-                            # For `tool_choice=required`, we only emit tool_call
-                            # deltas once we have the *full* tool-call JSON.
-                            # Incremental parsing here is fragile and can
-                            # mis-index tool calls (merging arguments across
-                            # tools), especially when the JSON array grows
-                            # between token boundaries.
-                            if output.finish_reason is None:
-                                delta_message = None
-                            elif OpenAIServingChat._has_kimi_k2_markers(content):
-                                # Best-effort: only support single-call marker format.
-                                extracted_args = OpenAIServingChat._extract_kimi_k2_arguments(
-                                    content, partial_ok=False
-                                )
-                                if extracted_args is not None and extracted_args.strip():
-                                    func_name = None
-                                    import re as re_std
-
-                                    name_match = re_std.search(
-                                        r"<\|tool_call_begin\|>\s*(?:functions\.)?(\w+):\d+",
-                                        content,
+                            if reasoning_parser and not reasoning_end_arr[i]:
+                                delta_message = (
+                                    reasoning_parser.extract_reasoning_streaming(
+                                        previous_text,
+                                        current_text,
+                                        delta_text,
+                                        previous_token_ids,
+                                        current_token_ids,
+                                        output_token_ids,
                                     )
-                                    if name_match:
-                                        func_name = name_match.group(1)
-                                    if func_name:
-                                        tool_call_id = make_tool_call_id(
-                                            id_type=self.tool_call_id_type,
-                                            func_name=func_name,
-                                            idx=history_tool_call_cnt,
-                                        )
-                                        delta_message = DeltaMessage(
-                                            tool_calls=[
-                                                DeltaToolCall(
-                                                    id=tool_call_id,
-                                                    type="function",
-                                                    function=DeltaFunctionCall(
-                                                        name=func_name,
-                                                        arguments=extracted_args,
-                                                    ),
-                                                    index=0,
-                                                )
-                                            ]
-                                        )
-                                        function_name_returned[i] = True
+                                )
+                                if reasoning_parser.is_reasoning_end(output_token_ids):
+                                    reasoning_end_arr[i] = True
+                                    if delta_message and delta_message.content:
+                                        current_text = delta_message.content
+                                        delta_message.content = None
                                     else:
-                                        delta_message = None
-                                else:
-                                    delta_message = None
-                            else:
-                                # Standard JSON format (OpenAI-style array)
-                                tool_calls_obj = None
-                                try:
-                                    tool_calls_obj = json.loads(content)
-                                except json.JSONDecodeError:
+                                        # reasoning ended
+                                        current_text = ""
+                                elif output.finish_reason is not None:
+                                    # Fallback for cases where thinking mode is enabled
+                                    # but the model never emits </think>. Parse at
+                                    # finish from the full accumulated text.
+                                    reasoning_end_arr[i] = True
+                                    content = current_text
                                     try:
-                                        tool_calls_obj, _ = partial_json_loads(
-                                            content, Allow.ALL
+                                        parsed_calls, _ = self._parse_tool_calls_from_content(
+                                            request=request,
+                                            tokenizer=tokenizer,
+                                            content=content,
+                                            enable_auto_tools=self.enable_auto_tools,
+                                            tool_parser_cls=self.tool_parser,
                                         )
-                                    except (
-                                        partial_json_parser.core.exceptions.MalformedJSON,
-                                        json.JSONDecodeError,
-                                    ):
-                                        tool_calls_obj = None
+                                    except Exception:
+                                        parsed_calls = None
 
-                                delta_tool_calls: list[DeltaToolCall] = []
-                                if isinstance(tool_calls_obj, list):
-                                    for j, tc in enumerate(tool_calls_obj):
-                                        if not isinstance(tc, dict):
+                                    delta_tool_calls: list[DeltaToolCall] = []
+                                    for j, call in enumerate(parsed_calls or []):
+                                        if not call.name:
                                             continue
-                                        name = tc.get("name")
-                                        params = tc.get("parameters")
-                                        if not isinstance(name, str):
-                                            continue
-                                        if params is None:
-                                            params = {}
-                                        args = json.dumps(params, ensure_ascii=False)
-                                        tool_call_id = make_tool_call_id(
-                                            id_type=self.tool_call_id_type,
-                                            func_name=name,
-                                            idx=history_tool_call_cnt + j,
+                                        args = (
+                                            call.arguments
+                                            if call.arguments is not None
+                                            else "{}"
                                         )
+                                        tool_call_id = call.id
+                                        if tool_call_id is None:
+                                            tool_call_id = make_tool_call_id(
+                                                id_type=self.tool_call_id_type,
+                                                func_name=call.name,
+                                                idx=history_tool_call_cnt + j,
+                                            )
                                         delta_tool_calls.append(
                                             DeltaToolCall(
                                                 id=tool_call_id,
                                                 type="function",
                                                 function=DeltaFunctionCall(
-                                                    name=name,
+                                                    name=call.name,
                                                     arguments=args,
                                                 ),
                                                 index=j,
                                             )
                                         )
 
-                                if delta_tool_calls:
-                                    delta_message = DeltaMessage(tool_calls=delta_tool_calls)
-                                    function_name_returned[i] = True
-                                else:
+                                    if delta_tool_calls:
+                                        delta_message = DeltaMessage(
+                                            tool_calls=delta_tool_calls
+                                        )
+                                        function_name_returned[i] = True
+                                        history_tool_call_cnt += len(
+                                            delta_tool_calls
+                                        )
+                                        tools_streamed[i] = True
+                                    else:
+                                        delta_message = None
+
+                            else:
+                                # either finished reasoning or no reasoning at all
+                                content = current_text
+
+                                # For `tool_choice=required`, we only emit tool_call
+                                # deltas once we have the *full* tool-call JSON.
+                                # Incremental parsing here is fragile and can
+                                # mis-index tool calls (merging arguments across
+                                # tools), especially when the JSON array grows
+                                # between token boundaries.
+                                if output.finish_reason is None:
                                     delta_message = None
-                            if (
-                                delta_message
-                                and delta_message.tool_calls
-                                and delta_message.tool_calls[0].id is not None
-                            ):
-                                history_tool_call_cnt += 1
-                                tools_streamed[i] = True
+                                elif OpenAIServingChat._has_kimi_k2_markers(content):
+                                    # Best-effort: only support single-call marker format.
+                                    extracted_args = OpenAIServingChat._extract_kimi_k2_arguments(
+                                        content, partial_ok=False
+                                    )
+                                    if extracted_args is not None and extracted_args.strip():
+                                        func_name = None
+                                        import re as re_std
+
+                                        name_match = re_std.search(
+                                            r"<\|tool_call_begin\|>\s*(?:functions\.)?(\w+):\d+",
+                                            content,
+                                        )
+                                        if name_match:
+                                            func_name = name_match.group(1)
+                                        if func_name:
+                                            tool_call_id = make_tool_call_id(
+                                                id_type=self.tool_call_id_type,
+                                                func_name=func_name,
+                                                idx=history_tool_call_cnt,
+                                            )
+                                            delta_message = DeltaMessage(
+                                                tool_calls=[
+                                                    DeltaToolCall(
+                                                        id=tool_call_id,
+                                                        type="function",
+                                                        function=DeltaFunctionCall(
+                                                            name=func_name,
+                                                            arguments=extracted_args,
+                                                        ),
+                                                        index=0,
+                                                    )
+                                                ]
+                                            )
+                                            function_name_returned[i] = True
+                                        else:
+                                            delta_message = None
+                                    else:
+                                        delta_message = None
+                                else:
+                                    # Standard JSON format (OpenAI-style array)
+                                    tool_calls_obj = None
+                                    try:
+                                        tool_calls_obj = json.loads(content)
+                                    except json.JSONDecodeError:
+                                        try:
+                                            tool_calls_obj, _ = partial_json_loads(
+                                                content, Allow.ALL
+                                            )
+                                        except (
+                                            partial_json_parser.core.exceptions.MalformedJSON,
+                                            json.JSONDecodeError,
+                                        ):
+                                            tool_calls_obj = None
+
+                                    delta_tool_calls: list[DeltaToolCall] = []
+                                    if isinstance(tool_calls_obj, list):
+                                        for j, tc in enumerate(tool_calls_obj):
+                                            if not isinstance(tc, dict):
+                                                continue
+                                            name = tc.get("name")
+                                            params = tc.get("parameters")
+                                            if not isinstance(name, str):
+                                                continue
+                                            if params is None:
+                                                params = {}
+                                            args = json.dumps(params, ensure_ascii=False)
+                                            tool_call_id = make_tool_call_id(
+                                                id_type=self.tool_call_id_type,
+                                                func_name=name,
+                                                idx=history_tool_call_cnt + j,
+                                            )
+                                            delta_tool_calls.append(
+                                                DeltaToolCall(
+                                                    id=tool_call_id,
+                                                    type="function",
+                                                    function=DeltaFunctionCall(
+                                                        name=name,
+                                                        arguments=args,
+                                                    ),
+                                                    index=j,
+                                                )
+                                            )
+
+                                    if delta_tool_calls:
+                                        delta_message = DeltaMessage(
+                                            tool_calls=delta_tool_calls
+                                        )
+                                        function_name_returned[i] = True
+                                    else:
+                                        delta_message = None
+                                if (
+                                    delta_message
+                                    and delta_message.tool_calls
+                                    and delta_message.tool_calls[0].id is not None
+                                ):
+                                    history_tool_call_cnt += 1
+                                    tools_streamed[i] = True
 
                     # handle streaming deltas for tools with "auto" tool choice
                     # and reasoning parser
@@ -1607,7 +1805,7 @@ class OpenAIServingChat(OpenAIServing):
 
                     # update the previous values for the next iteration
                     if (
-                        tool_choice_auto or self.reasoning_parser or tool_choice_function_name
+                        tool_choice_auto or reasoning_parser or tool_choice_function_name
                     ) and not self.use_harmony:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
@@ -2002,6 +2200,14 @@ class OpenAIServingChat(OpenAIServing):
                             should_check_unstreamed
                             and tool_parser
                             and tool_parser.__class__.__name__ == "Qwen3XMLToolParser"
+                        ):
+                            should_check_unstreamed = False
+                        if (
+                            should_check_unstreamed
+                            and tool_parser
+                            and tool_parser.__class__.__name__ == "MinimaxM2ToolParser"
+                            and delta_message
+                            and delta_message.tool_calls
                         ):
                             should_check_unstreamed = False
                         if minimax_reconciled and tool_parser:

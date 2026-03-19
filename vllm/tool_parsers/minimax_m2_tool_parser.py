@@ -85,6 +85,7 @@ class MinimaxM2ToolParser(ToolParser):
             # Ensure MiniMax tool-call tags are preserved in decoded text.
             request.skip_special_tokens = False
         return request
+
     def _extract_name(self, name_str: str) -> str:
         """Extract name from quoted string."""
         name_str = name_str.strip()
@@ -324,19 +325,25 @@ class MinimaxM2ToolParser(ToolParser):
 
             args_json = tool_call.function.arguments
             idx = self.current_tool_index
+            tool_call_id = self._generate_tool_call_id()
             self.current_tool_index += 1
 
             self.prev_tool_call_arr.append(
                 {
+                    "id": tool_call_id,
                     "name": tool_call.function.name,
-                    "arguments": json.loads(args_json),
+                    "arguments": args_json,
                 }
             )
             self.streamed_args_for_tool.append(args_json)
+            self.tool_name_sent_arr.append(True)
+            self.tool_calls_emitted = True
+            self.current_tool_name_sent = True
+            self.current_tool_id = tool_call_id
             delta_tool_calls.append(
                 DeltaToolCall(
                     index=idx,
-                    id=self._generate_tool_call_id(),
+                    id=tool_call_id,
                     function=DeltaFunctionCall(
                         name=tool_call.function.name,
                         arguments=args_json,
