@@ -248,7 +248,9 @@ class OpenAIServingChat(OpenAIServing):
             request.chat_template_kwargs,
             self.default_chat_template_kwargs,
         )
-        reasoning_budget = chat_template_kwargs.get("reasoning_budget")
+        reasoning_budget = getattr(request, "reasoning_budget", None)
+        if reasoning_budget is None:
+            reasoning_budget = chat_template_kwargs.get("reasoning_budget")
         if reasoning_budget is None:
             return
 
@@ -267,7 +269,9 @@ class OpenAIServingChat(OpenAIServing):
 
         extra.setdefault("reasoning_budget", budget_int)
 
-        grace = chat_template_kwargs.get("reasoning_budget_grace_period", 0)
+        grace = getattr(request, "reasoning_budget_grace_period", None)
+        if grace is None:
+            grace = chat_template_kwargs.get("reasoning_budget_grace_period", 0)
         try:
             grace_int = int(grace)
         except Exception:
