@@ -193,7 +193,7 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
         return self.load_bytes(pybase64.b64decode(data))
 
     def load_file(self, filepath: Path) -> tuple[npt.NDArray, float]:
-        return load_audio(filepath, sr=None)
+        return self.load_bytes(filepath.read_bytes())
 
     def encode_base64(
         self,
