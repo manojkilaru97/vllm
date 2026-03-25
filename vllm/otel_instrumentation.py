@@ -605,7 +605,8 @@ class _KratosOffloadFilter(logging.Filter):
     def __init__(self, image_threshold_bytes: int, enabled: bool, cfg: Dict[str, str]):
         super().__init__()
         # Offload rules:
-        # - Images are offloaded only if decoded size >= image_threshold_bytes
+        # - Images and audio are offloaded only if decoded size >=
+        #   image_threshold_bytes
         # - Videos are always offloaded
         self.image_threshold_bytes = image_threshold_bytes
         self.enabled = enabled
@@ -625,10 +626,11 @@ class _KratosOffloadFilter(logging.Filter):
 
             is_video = mime.startswith("video/")
             is_image = mime.startswith("image/")
+            is_audio = mime.startswith("audio/")
 
             if is_video:
                 should_offload = True
-            elif is_image:
+            elif is_image or is_audio:
                 should_offload = est_bytes >= self.image_threshold_bytes
             else:
                 return full
