@@ -1411,11 +1411,8 @@ class Scheduler(SchedulerInterface):
                 if not ok:
                     logger.warning(
                         "Unexpected: grammar rejected tokens %s for request %s.",
-                else:
-                    logger.debug(
-                        "Advancing grammar for request %s with tokens %s",
-                        new_token_ids,
                         req_id,
+                        new_token_ids,
                     )
                 else:
                     logger.debug(
