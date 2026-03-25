@@ -23,6 +23,7 @@ from vllm.entrypoints.utils import (
     with_cancellation,
 )
 from vllm.logger import init_logger
+from vllm.payload_sanitization import maybe_redact_mm_payload
 
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
@@ -71,7 +72,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     extra={
                         "rid": rid,
                         "endpoint": handler.__class__.__name__,
-                        "payload": generator.model_dump(),
+                        "payload": maybe_redact_mm_payload(generator.model_dump()),
                     },
                 )
             except Exception:
