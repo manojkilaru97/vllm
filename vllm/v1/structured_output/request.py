@@ -18,19 +18,22 @@ from vllm.v1.structured_output.backend_types import (
 @dataclasses.dataclass
 class StructuredOutputRequest:
     params: StructuredOutputsParams
+    request_id: str | None = None
     _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
+    _grammar_error: Exception | None = None
     reasoning_ended: bool | None = None
 
     @staticmethod
     def from_sampling_params(
         sampling_params: SamplingParams | None,
+        request_id: str | None = None,
     ) -> "StructuredOutputRequest | None":
         if sampling_params is None:
             return None
         params = sampling_params.structured_outputs
         if not params or params.all_constraints_none():
             return None
-        return StructuredOutputRequest(params=params)
+        return StructuredOutputRequest(params=params, request_id=request_id)
 
     def _check_grammar_completion(self) -> bool:
         # NOTE: We have to lazy import to gate circular imports
@@ -43,6 +46,9 @@ class StructuredOutputRequest:
                 self.status = RequestStatus.WAITING
             except TimeoutError:
                 return False
+            except Exception as exc:
+                self._grammar = None
+                self._grammar_error = exc
         return True
 
     @property
@@ -52,9 +58,16 @@ class StructuredOutputRequest:
     @property
     def grammar(self) -> StructuredOutputGrammar | None:
         completed = self._check_grammar_completion()
+        if self._grammar_error is not None:
+            return None
         return (
             cast(StructuredOutputGrammar | None, self._grammar) if completed else None
         )
+
+    @property
+    def grammar_error(self) -> Exception | None:
+        self._check_grammar_completion()
+        return self._grammar_error
 
     @grammar.setter
     def grammar(

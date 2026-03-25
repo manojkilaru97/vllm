@@ -1416,24 +1416,42 @@ class OpenAIServingChat(OpenAIServing):
                         else:
                             index = 0
 
-                        if (
-                            self._should_check_for_unstreamed_tool_arg_tokens(
-                                delta_message, output
-                            )
-                            and tool_parser
-                        ):
-                            latest_delta_len = 0
+                        if tool_parser and auto_tools_called:
                             if (
-                                isinstance(
-                                    delta_message.tool_calls[0].function,
-                                    DeltaFunctionCall,
-                                )
-                            ) and isinstance(
-                                delta_message.tool_calls[0].function.arguments, str
+                                delta_message is None
+                                or not delta_message.tool_calls
                             ):
-                                latest_delta_len = len(
-                                    delta_message.tool_calls[0].function.arguments
+                                # Some tool parsers finish with an empty/content
+                                # delta after having already streamed most of the
+                                # tool arguments. In that case we still need to
+                                # compare the parser's final expected arguments
+                                # against what was streamed so far and emit the
+                                # missing suffix (commonly the final "}").
+                                delta_message = DeltaMessage(
+                                    tool_calls=[
+                                        DeltaToolCall(
+                                            index=index,
+                                            function=DeltaFunctionCall(arguments=""),
+                                        )
+                                    ]
                                 )
+
+                            if self._should_check_for_unstreamed_tool_arg_tokens(
+                                delta_message, output
+                            ):
+                                latest_delta_len = 0
+                                if (
+                                    isinstance(
+                                        delta_message.tool_calls[0].function,
+                                        DeltaFunctionCall,
+                                    )
+                                ) and isinstance(
+                                    delta_message.tool_calls[0].function.arguments,
+                                    str,
+                                ):
+                                    latest_delta_len = len(
+                                        delta_message.tool_calls[0].function.arguments
+                                    )
 
                             # get the expected call based on partial JSON
                             # parsing which "autocompletes" the JSON.
@@ -1446,26 +1464,51 @@ class OpenAIServingChat(OpenAIServing):
                             # replace() below to fail and append the
                             # entire double-serialized string as a
                             # spurious final delta.
-                            args = tool_parser.prev_tool_call_arr[index].get(
-                                "arguments", {}
-                            )
-                            if isinstance(args, str):
-                                expected_call = args
-                            else:
-                                expected_call = json.dumps(args, ensure_ascii=False)
+                                args = tool_parser.prev_tool_call_arr[index].get(
+                                    "arguments", {}
+                                )
+                                if isinstance(args, str):
+                                    expected_call = args
+                                else:
+                                    expected_call = json.dumps(
+                                        args, ensure_ascii=False
+                                    )
 
                             # get what we've streamed so far for arguments
                             # for the current tool
-                            actual_call = tool_parser.streamed_args_for_tool[index]
-                            if latest_delta_len > 0:
-                                actual_call = actual_call[:-latest_delta_len]
+                                actual_call_full = (
+                                    tool_parser.streamed_args_for_tool[index]
+                                )
+                                # Some tool parsers initialize their internal
+                                # state with a placeholder "{}" and only replace it
+                                # once they fully parse the closing tag. If that
+                                # replacement never happens but we already streamed
+                                # concrete argument text, prefer the streamed text
+                                # over the placeholder to avoid appending a bogus
+                                # trailing "{}" on the finish chunk.
+                                if (
+                                    expected_call == "{}"
+                                    and actual_call_full
+                                    and actual_call_full != "{}"
+                                ):
+                                    expected_call = actual_call_full
 
-                            # check to see if there's anything left to stream
-                            remaining_call = expected_call.replace(actual_call, "", 1)
-                            # set that as a delta message
-                            delta_message = self._create_remaining_args_delta(
-                                delta_message, remaining_call, index
-                            )
+                                actual_call = actual_call_full
+                                if latest_delta_len > 0:
+                                    actual_call = actual_call[:-latest_delta_len]
+
+                            # Only synthesize a final arguments delta when the
+                            # expected full arguments are a clean extension of
+                            # what we had already streamed before this chunk.
+                            # If they diverge, keep the original delta rather
+                            # than appending junk such as a placeholder "{}".
+                                if expected_call.startswith(actual_call):
+                                    remaining_call = expected_call[
+                                        len(actual_call) :
+                                    ]
+                                    delta_message = self._create_remaining_args_delta(
+                                        delta_message, remaining_call, index
+                                    )
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
