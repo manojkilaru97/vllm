@@ -896,7 +896,10 @@ def get_otel_meter():
 
 
 def _sanitize_metric_name(name: str) -> str:
-    return name.replace(":", "_")
+    sanitized = name.replace(":", "_")
+    if sanitized.startswith("vllm_"):
+        sanitized = sanitized[len("vllm_"):]
+    return sanitized
 
 
 def _labels_to_attributes(labels: Dict[str, str]) -> Dict[str, str]:

@@ -23,6 +23,10 @@ request_type_structured_output = Counter(
     documentation="Total requests with structured output "
     "(json_schema, json_object, structural_tag, regex, choice, or grammar)",
 )
+num_aborted_requests = Counter(
+    name="num_aborted_requests_total",
+    documentation="Total streaming requests aborted after client disconnects.",
+)
 
 
 def classify_chat_request(request) -> None:
@@ -125,3 +129,8 @@ def _classify_structured_output_chat_completion(request) -> None:
     if getattr(request, "structured_outputs", None) is not None:
         request_type_structured_output.inc()
         return
+
+
+def record_aborted_request() -> None:
+    """Record a client-aborted request for OTEL/prometheus export."""
+    num_aborted_requests.inc()

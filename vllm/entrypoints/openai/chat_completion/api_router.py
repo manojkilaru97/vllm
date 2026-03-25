@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import logging
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -22,6 +23,7 @@ from vllm.entrypoints.utils import (
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 router = APIRouter()
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
@@ -55,6 +57,19 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
+        rid = raw_request.headers.get("X-Request-Id", "")
+        if rid:
+            try:
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": rid,
+                        "endpoint": handler.__class__.__name__,
+                        "payload": generator.model_dump(),
+                    },
+                )
+            except Exception:
+                pass
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
