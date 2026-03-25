@@ -70,7 +70,7 @@ from vllm.inputs.data import ProcessorInputs
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
-from vllm.payload_sanitization import maybe_redact_mm_payload
+from vllm.payload_sanitization import prepare_request_payload_for_logging
 from vllm.parser import ParserManager
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
@@ -235,13 +235,23 @@ class OpenAIServingChat(OpenAIServing):
                 except Exception:
                     req_dump = None
                 try:
+                    allowed_local_media_path = (
+                        self.openai_serving_render.model_config.allowed_local_media_path
+                    )
+                except Exception:
+                    allowed_local_media_path = ""
+                try:
                     payload_logger.info(
                         "openai.request",
                         extra={
                             "rid": rid_hint or "",
                             "endpoint": self.__class__.__name__,
                             # Pass dict directly for proper OTEL structured logging
-                            "payload": maybe_redact_mm_payload(req_dump),
+                            "payload": prepare_request_payload_for_logging(
+                                req_dump,
+                                headers=headers_obj,
+                                allowed_local_media_path=allowed_local_media_path,
+                            ),
                             "headers": headers_obj,
                         },
                     )

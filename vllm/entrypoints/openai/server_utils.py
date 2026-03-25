@@ -30,7 +30,10 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.utils import create_error_response, sanitize_message
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
-from vllm.payload_sanitization import maybe_redact_mm_payload
+from vllm.payload_sanitization import (
+    maybe_redact_mm_payload,
+    prepare_request_payload_for_logging,
+)
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
@@ -62,13 +65,27 @@ async def _log_request_payload(req: Request) -> None:
             payload = json.loads(body)
     except Exception:
         payload = None
+    allowed_local_media_path = ""
+    try:
+        serving_chat = getattr(req.app.state, "openai_serving_chat", None)
+        render = getattr(serving_chat, "openai_serving_render", None)
+        model_config = getattr(render, "model_config", None)
+        allowed_local_media_path = str(
+            getattr(model_config, "allowed_local_media_path", "") or ""
+        )
+    except Exception:
+        allowed_local_media_path = ""
     try:
         payload_logger.info(
             "openai.request",
             extra={
                 "rid": rid,
                 "endpoint": req.url.path,
-                "payload": maybe_redact_mm_payload(payload),
+                "payload": prepare_request_payload_for_logging(
+                    payload,
+                    headers=headers_obj,
+                    allowed_local_media_path=allowed_local_media_path,
+                ),
                 "headers": headers_obj,
             },
         )

@@ -666,7 +666,7 @@ class _KratosOffloadFilter(logging.Filter):
             return str(uri)
 
         try:
-            return _DATA_URI_RE.sub(_maybe_upload, text)
+            return maybe_redact_mm_text(_DATA_URI_RE.sub(_maybe_upload, text))
         except Exception:
             return maybe_redact_mm_text(text)
 
