@@ -141,6 +141,11 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, filepath: Path) -> tuple[npt.NDArray, float]:
+        # Keep file:// behavior aligned with HTTP/data URLs so local video
+        # files can participate in audio-in-video requests.
+        data = filepath.read_bytes()
+        if is_video(data):
+            return extract_audio_from_video_bytes(data)
         return librosa.load(filepath, sr=None)
 
     def encode_base64(
