@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import uuid
 from argparse import Namespace
@@ -33,6 +34,62 @@ from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 logger = init_logger("vllm.entrypoints.openai.server_utils")
+payload_logger = logging.getLogger("vllm.payload")
+
+
+def _extract_request_rid(req: Request) -> str:
+    rid = req.headers.get("X-Request-Id", "")
+    if not rid and hasattr(req.state, "request_metadata"):
+        rid = str(getattr(req.state.request_metadata, "request_id", "") or "")
+        if rid.startswith("chatcmpl-"):
+            rid = rid[len("chatcmpl-") :]
+    return rid
+
+
+async def _log_request_payload(req: Request) -> None:
+    rid = _extract_request_rid(req)
+    if not rid:
+        return
+    try:
+        headers_obj = {k: v for k, v in req.headers.items()}
+    except Exception:
+        headers_obj = None
+    payload = None
+    try:
+        body = await req.body()
+        if body:
+            payload = json.loads(body)
+    except Exception:
+        payload = None
+    try:
+        payload_logger.info(
+            "openai.request",
+            extra={
+                "rid": rid,
+                "endpoint": req.url.path,
+                "payload": payload,
+                "headers": headers_obj,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _log_error_response(req: Request, err: ErrorResponse) -> None:
+    rid = _extract_request_rid(req)
+    if not rid:
+        return
+    try:
+        payload_logger.info(
+            "openai.response",
+            extra={
+                "rid": rid,
+                "endpoint": req.url.path,
+                "payload": err.model_dump(),
+            },
+        )
+    except Exception:
+        pass
 
 
 class AuthenticationMiddleware:
@@ -358,6 +415,7 @@ async def engine_error_handler(
         engine=req.app.state.engine_client,
     )
     err = create_error_response(exc)
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -369,6 +427,7 @@ async def generation_error_handler(req: Request, exc: GenerationError):
     server logs with stack traces.
     """
     err = create_error_response(exc)
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -382,6 +441,7 @@ async def exception_handler(req: Request, exc: Exception):
         )
 
     err = create_error_response(exc)
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -400,6 +460,7 @@ async def http_exception_handler(req: Request, exc: HTTPException):
             code=exc.status_code,
         )
     )
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=exc.status_code)
 
 
@@ -437,6 +498,8 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
             param=param,
         )
     )
+    await _log_request_payload(req)
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 

@@ -86,7 +86,10 @@ from vllm.utils.mistral import is_mistral_tokenizer
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
-from vllm.entrypoints.openai.request_metrics import classify_chat_request
+from vllm.entrypoints.openai.request_metrics import (
+    classify_chat_request,
+    record_aborted_request,
+)
 
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
@@ -634,8 +637,15 @@ class OpenAIServingChat(OpenAIServing):
         else:
             history_tool_call_cnt = 0
 
-        # Always track previous_texts for comprehensive output logging
+        # Track full streamed state so we can emit one final structured
+        # response log without re-enabling token-by-token logging.
         previous_texts = [""] * num_choices
+        previous_reasoning_texts = [""] * num_choices
+        previous_content_texts = [""] * num_choices
+        previous_tool_calls: list[list[dict[str, Any]]] = [
+            [] for _ in range(num_choices)
+        ]
+        final_finish_reasons: list[str | None] = [None] * num_choices
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -1039,6 +1049,58 @@ class OpenAIServingChat(OpenAIServing):
                             continue
                         delta_message = DeltaMessage()
 
+                    # Accumulate the final streamed response so we can emit
+                    # exactly one structured openai.response record later.
+                    if delta_message is not None:
+                        reasoning_delta = (
+                            delta_message.reasoning_content
+                            if delta_message.reasoning_content is not None
+                            else delta_message.reasoning
+                        )
+                        if reasoning_delta:
+                            previous_reasoning_texts[i] += reasoning_delta
+                        if delta_message.content:
+                            previous_content_texts[i] += delta_message.content
+                        if delta_message.tool_calls:
+                            for delta_tc in delta_message.tool_calls:
+                                tc_idx = (
+                                    delta_tc.index
+                                    if delta_tc.index is not None
+                                    else 0
+                                )
+                                while len(previous_tool_calls[i]) <= tc_idx:
+                                    previous_tool_calls[i].append(
+                                        {
+                                            "id": None,
+                                            "type": "function",
+                                            "function": {
+                                                "name": None,
+                                                "arguments": "",
+                                            },
+                                        }
+                                    )
+
+                                tool_state = previous_tool_calls[i][tc_idx]
+                                if delta_tc.id:
+                                    tool_state["id"] = delta_tc.id
+                                if delta_tc.type:
+                                    tool_state["type"] = delta_tc.type
+
+                                fn_name: str | None = None
+                                fn_args: str | None = None
+                                if isinstance(delta_tc.function, dict):
+                                    fn_name = delta_tc.function.get("name")
+                                    fn_args = delta_tc.function.get("arguments")
+                                elif delta_tc.function is not None:
+                                    fn_name = delta_tc.function.name
+                                    fn_args = delta_tc.function.arguments
+
+                                function_state = tool_state["function"]
+                                if fn_name:
+                                    function_state["name"] = fn_name
+                                if fn_args:
+                                    function_state["arguments"] += fn_args
+
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
                         delta_content_parts = []
@@ -1182,6 +1244,7 @@ class OpenAIServingChat(OpenAIServing):
                         )
 
                         finish_reason_sent[i] = True
+                        final_finish_reasons[i] = finish_reason_
 
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
                     chunk = ChatCompletionStreamResponse(
@@ -1239,6 +1302,73 @@ class OpenAIServingChat(OpenAIServing):
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
 
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                try:
+                    usage_dict = (
+                        request_metadata.final_usage_info.model_dump()
+                        if request_metadata.final_usage_info
+                        else None
+                    )
+                except Exception:
+                    usage_dict = None
+
+                choices_list = []
+                for i in range(num_choices):
+                    choice_data: dict[str, Any] = {
+                        "index": i,
+                        "message": {
+                            "role": "assistant",
+                            "content": previous_content_texts[i]
+                            if previous_content_texts[i]
+                            else "",
+                        },
+                        "finish_reason": final_finish_reasons[i] or "stop",
+                    }
+                    if previous_reasoning_texts[i]:
+                        choice_data["message"]["reasoning_content"] = (
+                            previous_reasoning_texts[i]
+                        )
+
+                    if previous_tool_calls[i]:
+                        filtered_tool_calls = []
+                        for tool_state in previous_tool_calls[i]:
+                            fn = tool_state.get("function") or {}
+                            if (
+                                tool_state.get("id")
+                                or fn.get("name")
+                                or fn.get("arguments")
+                            ):
+                                filtered_tool_calls.append(tool_state)
+                        if filtered_tool_calls:
+                            choice_data["message"]["tool_calls"] = filtered_tool_calls
+                    choices_list.append(choice_data)
+
+                rid_hint = (
+                    request_id[len("chatcmpl-") :]
+                    if request_id.startswith("chatcmpl-")
+                    else request_id
+                )
+                resp_summary = {
+                    "id": request_id,
+                    "object": "chat.completion",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": choices_list,
+                    "usage": usage_dict,
+                    "stream": True,
+                }
+                try:
+                    payload_logger.info(
+                        "openai.response",
+                        extra={
+                            "rid": rid_hint,
+                            "endpoint": self.__class__.__name__,
+                            "payload": resp_summary,
+                        },
+                    )
+                except Exception:
+                    pass
+
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
                 # Log the complete response for each choice
@@ -1257,6 +1387,11 @@ class OpenAIServingChat(OpenAIServing):
                         delta=False,
                     )
 
+        except (asyncio.CancelledError, GeneratorExit):
+            await self.engine_client.abort(request_id)
+            record_aborted_request()
+            logger.info("Streaming request %s cancelled by client disconnect", request_id)
+            return
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
         except Exception as e:
@@ -1619,6 +1754,24 @@ class OpenAIServingChat(OpenAIServing):
             ),
             kv_transfer_params=final_res.kv_transfer_params,
         )
+
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            rid_hint = (
+                request_id[len("chatcmpl-") :]
+                if request_id.startswith("chatcmpl-")
+                else request_id
+            )
+            try:
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": rid_hint,
+                        "endpoint": self.__class__.__name__,
+                        "payload": response.model_dump(),
+                    },
+                )
+            except Exception:
+                pass
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
