@@ -304,11 +304,15 @@ class StructuredOutputManager:
         if not request.use_structured_output:
             return False
 
+        structured_req = request.structured_output_request
+        if structured_req is None or structured_req.grammar is None:
+            return False
+
         # To determine whether we can advance the FSM.
         # Supports thinking usage where we skip the reasoning components.
         if TYPE_CHECKING:
-            assert request.structured_output_request is not None
-            assert request.structured_output_request.grammar is not None
+            assert structured_req is not None
+            assert structured_req.grammar is not None
         # by default, we should always advance
         # for cases that don't use thinking mode.
         if self.reasoner is None:
@@ -318,7 +322,6 @@ class StructuredOutputManager:
         if self.enable_in_reasoning:
             return True
 
-        structured_req = request.structured_output_request
         if structured_req.reasoning_ended:
             return True
 

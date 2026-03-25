@@ -1414,15 +1414,11 @@ class Scheduler(SchedulerInterface):
                 if not struct_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
                     req_id, new_token_ids
                 ):
-                    logger.error(
-                        "Unexpected: grammar rejected tokens %s for request %s. "
-                        "Terminating request.",
+                    logger.warning(
+                        "Unexpected: grammar rejected tokens %s for request %s.",
                         new_token_ids,
                         req_id,
                     )
-                    request.status = RequestStatus.FINISHED_ERROR
-                    request.resumable = False
-                    stopped = True
 
             routed_experts = None
             finish_reason = None
