@@ -46,8 +46,8 @@ _ASSET_ID_URI_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSET_ID_TEXT_RE = re.compile(r"(asset_id:)([^\s\"'<>]+)", re.IGNORECASE)
-_HTML_VISUAL_SRC_RE = re.compile(
-    r"<(?P<tag>img|video)\s+[^>]*src=\"(?P<src>[^\"]+)\"[^>]*\/?>",
+_HTML_MEDIA_SRC_RE = re.compile(
+    r"<(?P<tag>img|video|audio)\s+[^>]*src=\"(?P<src>[^\"]+)\"[^>]*\/?>",
     re.IGNORECASE,
 )
 
@@ -128,12 +128,11 @@ def prepare_request_payload_for_logging(
     if payload is None:
         return payload
     payload_copy = copy.deepcopy(payload)
-    if log_mm_input_metadata_enabled():
-        payload_copy = _materialize_visual_payload_for_logging(
-            payload_copy,
-            headers=headers or {},
-            allowed_local_media_path=allowed_local_media_path,
-        )
+    payload_copy = _materialize_media_payload_for_logging(
+        payload_copy,
+        headers=headers or {},
+        allowed_local_media_path=allowed_local_media_path,
+    )
     return maybe_redact_mm_payload(payload_copy)
 
 
@@ -239,7 +238,7 @@ def _should_redact_mime(
     return False
 
 
-def _materialize_visual_payload_for_logging(
+def _materialize_media_payload_for_logging(
     payload: Any,
     *,
     headers: dict[str, str],
@@ -251,7 +250,7 @@ def _materialize_visual_payload_for_logging(
     messages = payload.get("messages")
     if isinstance(messages, list):
         payload["messages"] = [
-            _materialize_visual_message_for_logging(
+            _materialize_media_message_for_logging(
                 msg,
                 headers=headers,
                 allowed_local_media_path=allowed_local_media_path,
@@ -262,7 +261,7 @@ def _materialize_visual_payload_for_logging(
     return payload
 
 
-def _materialize_visual_message_for_logging(
+def _materialize_media_message_for_logging(
     message: Any,
     *,
     headers: dict[str, str],
@@ -274,7 +273,7 @@ def _materialize_visual_message_for_logging(
     content = message.get("content")
     if isinstance(content, list):
         message["content"] = [
-            _materialize_visual_part_for_logging(
+            _materialize_media_part_for_logging(
                 part,
                 headers=headers,
                 allowed_local_media_path=allowed_local_media_path,
@@ -282,7 +281,7 @@ def _materialize_visual_message_for_logging(
             for part in content
         ]
     elif isinstance(content, str):
-        message["content"] = _materialize_visual_text_for_logging(
+        message["content"] = _materialize_media_text_for_logging(
             content,
             headers=headers,
             allowed_local_media_path=allowed_local_media_path,
@@ -291,7 +290,7 @@ def _materialize_visual_message_for_logging(
     return message
 
 
-def _materialize_visual_part_for_logging(
+def _materialize_media_part_for_logging(
     part: Any,
     *,
     headers: dict[str, str],
@@ -300,12 +299,16 @@ def _materialize_visual_part_for_logging(
     if not isinstance(part, dict):
         return part
 
-    for field_name, kind in (("image_url", "image"), ("video_url", "video")):
+    for field_name, kind in (
+        ("image_url", "image"),
+        ("video_url", "video"),
+        ("audio_url", "audio"),
+    ):
         field_value = part.get(field_name)
         if isinstance(field_value, dict):
             url = field_value.get("url")
             if isinstance(url, str):
-                field_value["url"] = _materialize_visual_url_for_logging(
+                field_value["url"] = _materialize_media_url_for_logging(
                     url,
                     kind=kind,
                     headers=headers,
@@ -313,7 +316,7 @@ def _materialize_visual_part_for_logging(
                 )
         elif isinstance(field_value, str):
             part[field_name] = {
-                "url": _materialize_visual_url_for_logging(
+                "url": _materialize_media_url_for_logging(
                     field_value,
                     kind=kind,
                     headers=headers,
@@ -321,10 +324,17 @@ def _materialize_visual_part_for_logging(
                 )
             }
 
+    input_audio = part.get("input_audio")
+    if isinstance(input_audio, dict) and log_audio_input_metadata_enabled():
+        audio_format = str(input_audio.get("format") or "").strip().lower()
+        audio_data = input_audio.get("data")
+        if audio_format and isinstance(audio_data, str) and audio_data:
+            input_audio["data"] = f"data:audio/{audio_format};base64,{audio_data}"
+
     return part
 
 
-def _materialize_visual_text_for_logging(
+def _materialize_media_text_for_logging(
     text: str,
     *,
     headers: dict[str, str],
@@ -332,9 +342,14 @@ def _materialize_visual_text_for_logging(
 ) -> str:
     def _replace(match: re.Match[str]) -> str:
         tag = (match.group("tag") or "").lower()
-        kind = "image" if tag == "img" else "video"
+        if tag == "img":
+            kind = "image"
+        elif tag == "video":
+            kind = "video"
+        else:
+            kind = "audio"
         src = match.group("src") or ""
-        replaced = _materialize_visual_url_for_logging(
+        replaced = _materialize_media_url_for_logging(
             src,
             kind=kind,
             headers=headers,
@@ -342,16 +357,18 @@ def _materialize_visual_text_for_logging(
         )
         return match.group(0).replace(src, replaced, 1)
 
-    return _HTML_VISUAL_SRC_RE.sub(_replace, text)
+    return _HTML_MEDIA_SRC_RE.sub(_replace, text)
 
 
-def _materialize_visual_url_for_logging(
+def _materialize_media_url_for_logging(
     url: str,
     *,
     kind: str,
     headers: dict[str, str],
     allowed_local_media_path: str,
 ) -> str:
+    if not _should_materialize_kind(kind):
+        return url
     lowered = url.lower()
     if lowered.startswith("file://"):
         return _file_url_to_data_url_for_logging(
@@ -359,7 +376,7 @@ def _materialize_visual_url_for_logging(
             kind=kind,
             allowed_local_media_path=allowed_local_media_path,
         )
-    if ";asset_id," in lowered:
+    if kind in {"image", "video"} and ";asset_id," in lowered:
         return _asset_ref_to_data_url_for_logging(url, headers=headers)
     return url
 
@@ -440,6 +457,16 @@ def _normalize_asset_id(value: str) -> str:
 
 
 def _fallback_mime(kind: str) -> str:
+    if kind == "audio":
+        return "audio/wav"
     if kind == "video":
         return "video/mp4"
     return "image/png"
+
+
+def _should_materialize_kind(kind: str) -> bool:
+    if kind == "audio":
+        return log_audio_input_metadata_enabled()
+    if kind in {"image", "video"}:
+        return log_mm_input_metadata_enabled()
+    return False
