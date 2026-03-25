@@ -30,6 +30,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.utils import create_error_response, sanitize_message
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.payload_sanitization import maybe_redact_mm_payload
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
@@ -67,7 +68,7 @@ async def _log_request_payload(req: Request) -> None:
             extra={
                 "rid": rid,
                 "endpoint": req.url.path,
-                "payload": payload,
+                "payload": maybe_redact_mm_payload(payload),
                 "headers": headers_obj,
             },
         )
@@ -85,7 +86,7 @@ def _log_error_response(req: Request, err: ErrorResponse) -> None:
             extra={
                 "rid": rid,
                 "endpoint": req.url.path,
-                "payload": err.model_dump(),
+                "payload": maybe_redact_mm_payload(err.model_dump()),
             },
         )
     except Exception:

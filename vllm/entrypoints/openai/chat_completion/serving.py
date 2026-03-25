@@ -70,6 +70,7 @@ from vllm.inputs.data import ProcessorInputs
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.payload_sanitization import maybe_redact_mm_payload
 from vllm.parser import ParserManager
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
@@ -240,7 +241,7 @@ class OpenAIServingChat(OpenAIServing):
                             "rid": rid_hint or "",
                             "endpoint": self.__class__.__name__,
                             # Pass dict directly for proper OTEL structured logging
-                            "payload": req_dump,
+                            "payload": maybe_redact_mm_payload(req_dump),
                             "headers": headers_obj,
                         },
                     )
