@@ -7,6 +7,7 @@ import base64
 import copy
 import mimetypes
 import re
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 from urllib.request import url2pathname
@@ -127,13 +128,46 @@ def prepare_request_payload_for_logging(
 ) -> Any:
     if payload is None:
         return payload
-    payload_copy = copy.deepcopy(payload)
+    payload_copy = _normalize_logging_payload(payload)
     payload_copy = _materialize_media_payload_for_logging(
         payload_copy,
         headers=headers or {},
         allowed_local_media_path=allowed_local_media_path,
     )
     return maybe_redact_mm_payload(payload_copy)
+
+
+def _normalize_logging_payload(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, Mapping):
+        return {
+            _normalize_logging_payload(key): _normalize_logging_payload(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [_normalize_logging_payload(item) for item in value]
+
+    if hasattr(value, "model_dump"):
+        try:
+            return _normalize_logging_payload(value.model_dump(mode="json"))
+        except Exception:
+            pass
+
+    if isinstance(value, Iterable) and not isinstance(
+        value, (bytes, bytearray, str)
+    ):
+        try:
+            return [_normalize_logging_payload(item) for item in value]
+        except Exception:
+            pass
+
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return str(value)
 
 
 def redact_mm_input_metadata(payload: Any) -> Any:

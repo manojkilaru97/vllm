@@ -14,6 +14,8 @@ from fastapi import Request
 from openai.types.responses import (
     ToolChoiceFunction,
 )
+from partial_json_parser.core.exceptions import MalformedJSON
+from partial_json_parser.core.options import Allow
 from pydantic import ConfigDict, TypeAdapter, ValidationError
 from starlette.datastructures import Headers
 
@@ -82,6 +84,7 @@ from vllm.entrypoints.serve.tokenize.protocol import (
     TokenizeCompletionRequest,
     TokenizeResponse,
 )
+from vllm.tool_parsers.utils import partial_json_loads
 from vllm.entrypoints.utils import create_error_response, get_max_tokens
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs.data import (
@@ -1132,6 +1135,32 @@ class OpenAIServing:
                 tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
                     content
                 )
+            if not tool_calls and content:
+                try:
+                    parsed, _ = partial_json_loads(content, Allow.ALL)
+                except (
+                    MalformedJSON,
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    parsed = None
+                if isinstance(parsed, list):
+                    for tool_call in parsed:
+                        if not isinstance(tool_call, dict):
+                            continue
+                        name = tool_call.get("name")
+                        parameters = tool_call.get("parameters")
+                        if not isinstance(name, str) or parameters is None:
+                            continue
+                        function_calls.append(
+                            FunctionCall(
+                                name=name,
+                                arguments=json.dumps(
+                                    parameters, ensure_ascii=False
+                                ),
+                            )
+                        )
             for tool_call in tool_calls:
                 function_calls.append(
                     FunctionCall(

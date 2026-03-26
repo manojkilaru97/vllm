@@ -378,7 +378,7 @@ class OpenAIServingChat(OpenAIServing):
                 except Exception:
                     headers_obj = None
                 try:
-                    req_dump = request.model_dump()
+                    req_dump = request.model_dump(mode="json")
                 except Exception:
                     req_dump = None
                 try:
@@ -403,7 +403,7 @@ class OpenAIServingChat(OpenAIServing):
                         },
                     )
                 except Exception:
-                    pass
+                    logger.exception("Failed to log openai.request rid=%s", rid_hint)
 
             # Resolve NVCF assets in-place before preprocessing.
             # This happens after request payload logging so we preserve what
@@ -652,6 +652,119 @@ class OpenAIServingChat(OpenAIServing):
                     break
         return updated_delta, passed_zero
 
+    @staticmethod
+    def _parse_partial_required_tool_list(text: str | None) -> list[dict[str, Any]]:
+        if not text:
+            return []
+        try:
+            flags = Allow.ALL
+            obj, _ = partial_json_loads(text, flags)
+        except (
+            partial_json_parser.core.exceptions.MalformedJSON,
+            json.JSONDecodeError,
+        ):
+            return []
+        if not isinstance(obj, list):
+            return []
+        return [tool for tool in obj if isinstance(tool, dict)]
+
+    @staticmethod
+    def _required_tool_arguments_json(tool_call: dict[str, Any] | None) -> str:
+        if not isinstance(tool_call, dict):
+            return ""
+        params = tool_call.get("parameters")
+        if params is None:
+            return ""
+        try:
+            return json.dumps(params, ensure_ascii=False)
+        except TypeError:
+            return ""
+
+    @staticmethod
+    def _required_emitted_tool_state(
+        emitted_tool_calls: list[dict[str, Any]] | None,
+        index: int,
+    ) -> tuple[str | None, str, str | None, str | None]:
+        if emitted_tool_calls is None or index >= len(emitted_tool_calls):
+            return None, "", None, None
+        tool_call = emitted_tool_calls[index]
+        if not isinstance(tool_call, dict):
+            return None, "", None, None
+        function = tool_call.get("function", {})
+        if not isinstance(function, dict):
+            function = {}
+        name = function.get("name")
+        arguments = function.get("arguments", "")
+        if not isinstance(arguments, str):
+            arguments = ""
+        tool_id = tool_call.get("id")
+        tool_type = tool_call.get("type")
+        return (
+            name if isinstance(name, str) else None,
+            arguments,
+            tool_id if isinstance(tool_id, str) else None,
+            tool_type if isinstance(tool_type, str) else None,
+        )
+
+    @staticmethod
+    def _accumulate_stream_delta_state(
+        *,
+        delta_message: DeltaMessage | None,
+        previous_reasoning_texts: list[str],
+        previous_content_texts: list[str],
+        previous_tool_calls: list[list[dict[str, Any]]],
+        index: int,
+    ) -> None:
+        if delta_message is None:
+            return
+
+        reasoning_delta = (
+            delta_message.reasoning_content
+            if delta_message.reasoning_content is not None
+            else delta_message.reasoning
+        )
+        if reasoning_delta:
+            previous_reasoning_texts[index] += reasoning_delta
+        if delta_message.content:
+            previous_content_texts[index] += delta_message.content
+        if not delta_message.tool_calls:
+            return
+
+        for delta_tc in delta_message.tool_calls:
+            tc_idx = delta_tc.index if delta_tc.index is not None else 0
+            while len(previous_tool_calls[index]) <= tc_idx:
+                previous_tool_calls[index].append(
+                    {
+                        "id": None,
+                        "type": "function",
+                        "function": {
+                            "name": None,
+                            "arguments": "",
+                        },
+                    }
+                )
+
+            tool_state = previous_tool_calls[index][tc_idx]
+            if delta_tc.id:
+                tool_state["id"] = delta_tc.id
+            if delta_tc.type:
+                tool_state["type"] = delta_tc.type
+
+            fn_name: str | None = None
+            fn_args: str | None = None
+            if isinstance(delta_tc.function, dict):
+                fn_name = delta_tc.function.get("name")
+                fn_args = delta_tc.function.get("arguments")
+            elif delta_tc.function is not None:
+                fn_name = delta_tc.function.name
+                fn_args = delta_tc.function.arguments
+
+            function_state = tool_state["function"]
+            if fn_name:
+                function_state["name"] = fn_name
+            if fn_args:
+                function_state["arguments"] += fn_args
+
     def extract_tool_call_required_streaming(
         self,
         previous_text: str,
@@ -659,98 +772,92 @@ class OpenAIServingChat(OpenAIServing):
         delta_text: str,
         function_name_returned: bool,
         tool_call_idx: int | None = None,
+        emitted_tool_calls: list[dict[str, Any]] | None = None,
     ) -> tuple[DeltaMessage | None, bool]:
         if current_text is None or current_text == "":
             # if the current text is empty, we cannot parse it
             return None, function_name_returned
-        try:
-            flags = Allow.ALL
-            obj, _ = partial_json_loads(current_text, flags)
-        except (
-            partial_json_parser.core.exceptions.MalformedJSON,
-            json.JSONDecodeError,
-        ):
-            logger.debug("not enough tokens to parse into JSON yet")
-            obj = None
 
-        # check if the current text is a valid array
-        # containing a partial tool calling object
-        # if not repeat
-        if obj is None or not isinstance(obj, list) or not len(obj) > 0:
-            function_name_returned = False
-            delta_message = None
-        else:
-            _, finishes_previous_tool = OpenAIServingChat._filter_delta_text(
-                delta_text, previous_text
+        current_tools = OpenAIServingChat._parse_partial_required_tool_list(
+            current_text
+        )
+        if not current_tools:
+            return None, False
+
+        tool_deltas: list[DeltaToolCall] = []
+        next_tool_call_idx = tool_call_idx or 0
+
+        for idx, current_tool_call in enumerate(current_tools):
+            current_name = current_tool_call.get("name")
+            current_name = current_name if isinstance(current_name, str) else None
+            current_arguments = OpenAIServingChat._required_tool_arguments_json(
+                current_tool_call
             )
-            # take the last tool call from the generated list
-            current_tool_call = obj[-1]
+            emitted_name, emitted_arguments, _, _ = (
+                OpenAIServingChat._required_emitted_tool_state(
+                    emitted_tool_calls, idx
+                )
+            )
+            is_last_tool = idx == len(current_tools) - 1
+            list_complete = current_text.rstrip().endswith("]")
 
-            # once parameters have been generated the name is complete as well
-            if not finishes_previous_tool and (
-                "name" not in current_tool_call or "parameters" not in current_tool_call
+            # Emit the header as soon as a new tool object appears.
+            if emitted_name is None:
+                if not current_name:
+                    continue
+                if is_last_tool and not current_arguments and not list_complete:
+                    continue
+                tool_deltas.append(
+                    DeltaToolCall(
+                        id=make_tool_call_id(
+                            id_type=self.tool_call_id_type,
+                            func_name=current_name,
+                            idx=next_tool_call_idx,
+                        ),
+                        function=DeltaFunctionCall(
+                            name=current_name, arguments=""
+                        ),
+                        index=idx,
+                        type="function",
+                    )
+                )
+                next_tool_call_idx += 1
+            # Defer arguments for the current last tool until either a later
+            # tool appears or the finish path flushes the final state. This
+            # avoids emitting synthetic closed JSON for still-growing objects.
+            if is_last_tool:
+                continue
+
+            if current_arguments == emitted_arguments:
+                continue
+
+            if (
+                emitted_arguments
+                and current_arguments.startswith(emitted_arguments)
             ):
-                function_name_returned = False
-                delta_message = None
+                delta_arguments = current_arguments[len(emitted_arguments) :]
             else:
-                if not function_name_returned:
-                    # get partly generated arguments from the latest tool call
-                    param_match = re.search(
-                        r'.*"parameters":\s*(.*)', current_text, re.DOTALL
-                    )
-                    arguments = param_match.group(1) if param_match else ""
-                    arguments, _ = OpenAIServingChat._filter_delta_text(
-                        arguments, previous_text
-                    )
+                delta_arguments = current_arguments
 
-                    # if this iteration finishes a previous tool call but a
-                    # new incomplete tool is already generated, take the
-                    # previous from the list
-                    if finishes_previous_tool and "parameters" not in current_tool_call:
-                        current_tool_call = obj[-2]
+            if not delta_arguments:
+                continue
 
-                    function_name_returned = True
-                    tool_call_id = make_tool_call_id(
-                        id_type=self.tool_call_id_type,
-                        func_name=current_tool_call["name"],
-                        idx=tool_call_idx,
-                    )
-                    delta_message = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                id=tool_call_id,
-                                function=DeltaFunctionCall(
-                                    name=current_tool_call["name"], arguments=arguments
-                                ),
-                                index=len(obj) - 1,
-                                type="function",
-                            )
-                        ]
-                    )
+            tool_deltas.append(
+                DeltaToolCall(
+                    function=DeltaFunctionCall(
+                        # OpenAI API returns None instead of the name on
+                        # argument continuation chunks.
+                        name=None,
+                        arguments=delta_arguments,
+                    ),
+                    index=idx,
+                )
+            )
 
-                else:
-                    delta_text, _ = OpenAIServingChat._filter_delta_text(
-                        delta_text, previous_text
-                    )
+        if not tool_deltas:
+            return None, bool(current_tools)
 
-                    if delta_text != "":
-                        delta_message = DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    function=DeltaFunctionCall(
-                                        # OpenAI API returns None
-                                        # instead of name every time
-                                        name=None,
-                                        arguments=delta_text,
-                                    ),
-                                    index=len(obj) - 1,
-                                )
-                            ]
-                        )
-                    else:
-                        delta_message = None
-
-        return delta_message, function_name_returned
+        return DeltaMessage(tool_calls=tool_deltas), bool(current_tools)
 
     async def chat_completion_stream_generator(
         self,
@@ -843,6 +950,14 @@ class OpenAIServingChat(OpenAIServing):
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
+        )
+        chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+            request.chat_template_kwargs,
+            self.default_chat_template_kwargs,
+        )
+        bypass_reasoning_in_stream = bool(
+            chat_template_kwargs.get("enable_thinking") is False
+            or chat_template_kwargs.get("force_nonempty_content") is True
         )
 
         try:
@@ -948,7 +1063,11 @@ class OpenAIServingChat(OpenAIServing):
                         # only check once per choice, because prompt_token_ids
                         # are the same for all deltas in that choice
                         prompt_is_reasoning_end_arr[i] = (
-                            reasoning_parser.is_reasoning_end(res.prompt_token_ids)
+                            True
+                            if bypass_reasoning_in_stream
+                            else reasoning_parser.is_reasoning_end(
+                                res.prompt_token_ids
+                            )
                         )
                     if finish_reason_sent[i]:
                         continue
@@ -1156,14 +1275,15 @@ class OpenAIServingChat(OpenAIServing):
                                     delta_text=delta_text,
                                     function_name_returned=fn_name_returned,
                                     tool_call_idx=history_tool_call_cnt,
+                                    emitted_tool_calls=previous_tool_calls[i],
                                 )
                             )
-                            if (
-                                delta_message
-                                and delta_message.tool_calls
-                                and delta_message.tool_calls[0].id is not None
-                            ):
-                                history_tool_call_cnt += 1
+                            if delta_message and delta_message.tool_calls:
+                                history_tool_call_cnt += sum(
+                                    1
+                                    for tc in delta_message.tool_calls
+                                    if tc.id is not None
+                                )
                                 tools_streamed[i] = True
 
                     # handle streaming deltas for tools with "auto" tool choice
@@ -1300,58 +1420,6 @@ class OpenAIServingChat(OpenAIServing):
                         ):
                             continue
                         delta_message = DeltaMessage()
-
-                    # Accumulate the final streamed response so we can emit
-                    # exactly one structured openai.response record later.
-                    if delta_message is not None:
-                        reasoning_delta = (
-                            delta_message.reasoning_content
-                            if delta_message.reasoning_content is not None
-                            else delta_message.reasoning
-                        )
-                        if reasoning_delta:
-                            previous_reasoning_texts[i] += reasoning_delta
-                        if delta_message.content:
-                            previous_content_texts[i] += delta_message.content
-                        if delta_message.tool_calls:
-                            for delta_tc in delta_message.tool_calls:
-                                tc_idx = (
-                                    delta_tc.index
-                                    if delta_tc.index is not None
-                                    else 0
-                                )
-                                while len(previous_tool_calls[i]) <= tc_idx:
-                                    previous_tool_calls[i].append(
-                                        {
-                                            "id": None,
-                                            "type": "function",
-                                            "function": {
-                                                "name": None,
-                                                "arguments": "",
-                                            },
-                                        }
-                                    )
-
-                                tool_state = previous_tool_calls[i][tc_idx]
-                                if delta_tc.id:
-                                    tool_state["id"] = delta_tc.id
-                                if delta_tc.type:
-                                    tool_state["type"] = delta_tc.type
-
-                                fn_name: str | None = None
-                                fn_args: str | None = None
-                                if isinstance(delta_tc.function, dict):
-                                    fn_name = delta_tc.function.get("name")
-                                    fn_args = delta_tc.function.get("arguments")
-                                elif delta_tc.function is not None:
-                                    fn_name = delta_tc.function.name
-                                    fn_args = delta_tc.function.arguments
-
-                                function_state = tool_state["function"]
-                                if fn_name:
-                                    function_state["name"] = fn_name
-                                if fn_args:
-                                    function_state["arguments"] += fn_args
 
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
@@ -1509,6 +1577,68 @@ class OpenAIServingChat(OpenAIServing):
                                     delta_message = self._create_remaining_args_delta(
                                         delta_message, remaining_call, index
                                     )
+                        elif request.tool_choice == "required":
+                            final_required_tools = (
+                                self._parse_partial_required_tool_list(current_text)
+                            )
+                            required_tool_deltas: list[DeltaToolCall] = []
+                            for tc_idx, final_tool_call in enumerate(final_required_tools):
+                                expected_arguments = (
+                                    self._required_tool_arguments_json(final_tool_call)
+                                )
+                                (
+                                    emitted_name,
+                                    emitted_arguments,
+                                    emitted_id,
+                                    emitted_type,
+                                ) = self._required_emitted_tool_state(
+                                    previous_tool_calls[i], tc_idx
+                                )
+                                if not expected_arguments:
+                                    continue
+                                if expected_arguments == emitted_arguments:
+                                    continue
+                                if (
+                                    emitted_arguments
+                                    and expected_arguments.startswith(emitted_arguments)
+                                ):
+                                    remaining_call = expected_arguments[
+                                        len(emitted_arguments) :
+                                    ]
+                                else:
+                                    remaining_call = expected_arguments
+                                if not remaining_call:
+                                    continue
+                                final_name = final_tool_call.get("name")
+                                final_name = (
+                                    final_name if isinstance(final_name, str) else None
+                                )
+                                required_tool_deltas.append(
+                                    DeltaToolCall(
+                                        index=tc_idx,
+                                        id=(
+                                            emitted_id
+                                            or make_tool_call_id(
+                                                id_type=self.tool_call_id_type,
+                                                func_name=final_name,
+                                                idx=tc_idx,
+                                            )
+                                        ),
+                                        type=emitted_type or "function",
+                                        function=DeltaFunctionCall(
+                                            name=(
+                                                None
+                                                if emitted_name is not None
+                                                else final_name
+                                            ),
+                                            arguments=remaining_call,
+                                        ),
+                                    )
+                                )
+                            if required_tool_deltas:
+                                delta_message = DeltaMessage(
+                                    tool_calls=required_tool_deltas
+                                )
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -1540,6 +1670,16 @@ class OpenAIServingChat(OpenAIServing):
 
                         finish_reason_sent[i] = True
                         final_finish_reasons[i] = finish_reason_
+
+                    # Accumulate the final streamed response only after any
+                    # finish-time parser/tool-call fixups have run.
+                    self._accumulate_stream_delta_state(
+                        delta_message=delta_message,
+                        previous_reasoning_texts=previous_reasoning_texts,
+                        previous_content_texts=previous_content_texts,
+                        previous_tool_calls=previous_tool_calls,
+                        index=i,
+                    )
 
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
                     chunk = ChatCompletionStreamResponse(
