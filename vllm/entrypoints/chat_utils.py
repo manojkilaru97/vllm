@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import re
 import warnings
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
@@ -97,6 +98,11 @@ MODALITY_PLACEHOLDERS_MAP = {
     "audio": "<##AUDIO##>",
     "video": "<##VIDEO##>",
 }
+
+_HTML_MEDIA_TAG_RE = re.compile(
+    r"<(?P<tag>img|audio|video)\s+[^>]*src=(?P<quote>[\"'])(?P<src>.*?)(?P=quote)[^>]*\/?>",
+    re.IGNORECASE,
+)
 
 
 class AudioURL(TypedDict, total=False):
@@ -1273,6 +1279,59 @@ MM_PARSER_MAP: dict[
 }
 
 
+def _expand_html_media_tags_in_text_content(
+    text: str,
+) -> list[ChatCompletionContentPartParam]:
+    """Expand inline HTML-style asset tags into structured content parts.
+
+    Supported tags:
+    - <img src="data:image/...;asset_id,..."/>
+    - <audio src="data:audio/...;asset_id,..."/>
+    - <video src="data:video/...;asset_id,..."/>
+
+    Any text outside supported tags is preserved as regular text parts.
+    Non-asset tags are left untouched as plain text.
+    """
+    parts: list[ChatCompletionContentPartParam] = []
+    idx = 0
+    transformed = False
+
+    for match in _HTML_MEDIA_TAG_RE.finditer(text):
+        start, end = match.span()
+        if start > idx:
+            prefix = text[idx:start]
+            if prefix:
+                parts.append({"type": "text", "text": prefix})
+
+        tag = (match.group("tag") or "").lower()
+        src = match.group("src")
+        if ";asset_id," not in src:
+            parts.append({"type": "text", "text": match.group(0)})
+        elif tag == "img" and src.startswith("data:image/"):
+            parts.append({"type": "image_url", "image_url": {"url": src}})
+            transformed = True
+        elif tag == "audio" and src.startswith("data:audio/"):
+            parts.append({"type": "audio_url", "audio_url": {"url": src}})
+            transformed = True
+        elif tag == "video" and src.startswith("data:video/"):
+            parts.append({"type": "video_url", "video_url": {"url": src}})
+            transformed = True
+        else:
+            parts.append({"type": "text", "text": match.group(0)})
+
+        idx = end
+
+    if not transformed:
+        return [ChatCompletionContentPartTextParam(type="text", text=text)]
+
+    if idx < len(text):
+        suffix = text[idx:]
+        if suffix:
+            parts.append({"type": "text", "text": suffix})
+
+    return parts
+
+
 def _parse_chat_message_content_mm_part(
     part: ChatCompletionContentPartParam,
 ) -> tuple[str, _ContentPart]:
@@ -1513,7 +1572,10 @@ def _parse_chat_message_content(
     if content is None:
         content = []
     elif isinstance(content, str):
-        content = [ChatCompletionContentPartTextParam(type="text", text=content)]
+        if role == "user":
+            content = _expand_html_media_tags_in_text_content(content)
+        else:
+            content = [ChatCompletionContentPartTextParam(type="text", text=content)]
     result = _parse_chat_message_content_parts(
         role,
         content,  # type: ignore
