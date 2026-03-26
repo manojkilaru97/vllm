@@ -578,6 +578,12 @@ class Scheduler(SchedulerInterface):
                 if self._is_blocked_waiting_status(
                     request.status
                 ) and not self._try_promote_blocked_waiting_request(request):
+                    # Request-local failures (for example invalid structured
+                    # output grammar) may finish and remove the request while
+                    # probing the blocked state. Do not try to pop/requeue a
+                    # request that is already gone from the waiting queues.
+                    if request.request_id not in self.requests or request.is_finished():
+                        continue
                     if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
