@@ -14,6 +14,7 @@ from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
 from vllm.tokenizers.registry import tokenizer_args_from_config
@@ -395,4 +396,13 @@ def test_json_schema_response_format_missing_schema():
             model=MODEL_NAME,
             messages=[{"role": "user", "content": "hello"}],
             response_format={"type": "json_schema"},
+        )
+
+
+def test_priority_body_field_rejected():
+    with pytest.raises(VLLMValidationError, match="body field `priority`"):
+        ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "hello"}],
+            priority=-10,
         )

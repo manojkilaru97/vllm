@@ -485,6 +485,9 @@ class OpenAIServingChat(OpenAIServing):
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+        request_priority = self._resolve_request_priority(
+            request.priority, raw_request
+        )
         tokenizer = self.renderer.tokenizer
 
         # Schedule the request and get the result generator.
@@ -562,7 +565,7 @@ class OpenAIServingChat(OpenAIServing):
                     sub_request_id,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
-                    priority=request.priority,
+                    priority=request_priority,
                     data_parallel_rank=data_parallel_rank,
                     reasoning_ended=reasoning_ended,
                 )

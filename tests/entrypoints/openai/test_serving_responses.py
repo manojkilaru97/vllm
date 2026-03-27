@@ -37,6 +37,8 @@ from vllm.entrypoints.openai.responses.serving import (
 from vllm.entrypoints.openai.responses.streaming_events import (
     StreamingState,
 )
+from vllm.exceptions import VLLMValidationError
+from vllm.inputs import tokens_input
 from vllm.inputs.data import TokensPrompt
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -563,7 +565,6 @@ class TestHarmonyPreambleStreaming:
         type_names = [e.type for e in events]
         assert "response.output_text.done" not in type_names
 
-
 def _make_simple_context_with_output(text, token_ids):
     """Create a SimpleContext with a RequestOutput containing the given text."""
     ctx = SimpleContext()
@@ -873,3 +874,9 @@ class TestStreamingReasoningToContentTransition:
         ]
         assert len(item_done_events) == 1
         assert isinstance(item_done_events[0].item, ResponseReasoningItem)
+def test_priority_body_field_rejected():
+    with pytest.raises(VLLMValidationError, match="body field `priority`"):
+        ResponsesRequest(
+            input="hello",
+            priority=-10,
+        )
