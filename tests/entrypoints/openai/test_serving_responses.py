@@ -29,6 +29,7 @@ from vllm.entrypoints.openai.responses.serving import (
 from vllm.entrypoints.openai.responses.streaming_events import (
     StreamingState,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.inputs.data import TokensPrompt
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -554,3 +555,11 @@ class TestHarmonyPreambleStreaming:
 
         type_names = [e.type for e in events]
         assert "response.output_text.done" not in type_names
+
+
+def test_priority_body_field_rejected():
+    with pytest.raises(VLLMValidationError, match="body field `priority`"):
+        ResponsesRequest(
+            input="hello",
+            priority=-10,
+        )

@@ -380,6 +380,19 @@ class ResponsesRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def validate_priority_field(cls, data):
+        if not isinstance(data, dict):
+            return data
+        if data.get("priority", 0) != 0:
+            raise VLLMValidationError(
+                "Request body field `priority` is not supported.",
+                parameter="priority",
+                value=data.get("priority"),
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def validate_background(cls, data):
         if not data.get("background"):
             return data

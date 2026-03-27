@@ -326,6 +326,19 @@ class CompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def validate_priority_field(cls, data):
+        if not isinstance(data, dict):
+            return data
+        if data.get("priority", 0) != 0:
+            raise VLLMValidationError(
+                "Request body field `priority` is not supported.",
+                parameter="priority",
+                value=data.get("priority"),
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def validate_response_format(cls, data):
         response_format = data.get("response_format")
         if response_format is None:

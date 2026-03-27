@@ -1042,6 +1042,76 @@ async def test_serving_chat_data_parallel_rank_extraction():
     assert mock_engine.generate.call_args.kwargs["data_parallel_rank"] is None
 
 
+@pytest.mark.asyncio
+async def test_billing_priority_header_passed_to_engine():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    async def mock_generate(*args, **kwargs):
+        yield RequestOutput(
+            request_id="test-request",
+            prompt="test prompt",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="test response",
+                    token_ids=[4, 5, 6],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            ],
+            finished=True,
+        )
+
+    mock_engine.generate = AsyncMock(side_effect=mock_generate)
+    serving_chat = _build_serving_chat(mock_engine)
+
+    req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "what is 1+1?"}],
+    )
+    mock_raw_request = MagicMock()
+    mock_raw_request.headers = {"X-BILLING-Request-Priority": "high"}
+    mock_raw_request.state = MagicMock()
+
+    with suppress(Exception):
+        await serving_chat.create_chat_completion(req, mock_raw_request)
+
+    assert mock_engine.generate.call_args.kwargs["priority"] == -1000
+
+
+@pytest.mark.asyncio
+async def test_invalid_billing_priority_header_returns_error():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine)
+    req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Say hello"}],
+    )
+    mock_raw_request = MagicMock()
+    mock_raw_request.headers = {"X-BILLING-Request-Priority": "urgent"}
+    mock_raw_request.state = MagicMock()
+
+    response = await serving_chat.create_chat_completion(req, mock_raw_request)
+
+    assert isinstance(response, ErrorResponse)
+    assert "Only `high` is supported" in response.error.message
+
+
 class TestServingChatWithHarmony:
     """
     These tests ensure Chat Completion requests are being properly converted into

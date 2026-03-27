@@ -398,6 +398,9 @@ class OpenAIServingResponses(OpenAIServing):
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[ConversationContext, None]] = []
+        request_priority = self._resolve_request_priority(
+            request.priority, raw_request
+        )
 
         # Only include builtin tools that the request actually asked for.
         # Without this filter, tools registered on the server (e.g. via
@@ -501,7 +504,7 @@ class OpenAIServingResponses(OpenAIServing):
                     sampling_params=sampling_params,
                     context=context,
                     lora_request=lora_request,
-                    priority=request.priority,
+                    priority=request_priority,
                     trace_headers=trace_headers,
                 )
                 generators.append(generator)

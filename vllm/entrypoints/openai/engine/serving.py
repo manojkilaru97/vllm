@@ -11,6 +11,7 @@ from http import HTTPStatus
 from typing import Any, ClassVar, Generic, Protocol, TypeAlias, TypeVar
 
 import numpy as np
+from prometheus_client import Counter
 from fastapi import Request
 from openai.types.responses import (
     ToolChoiceFunction,
@@ -136,6 +137,15 @@ class GenerationError(Exception):
 
 logger = init_logger(__name__)
 
+_BILLING_REQUESTS_TOTAL = Counter(
+    "billing_requests_total",
+    "Count of requests admitted through the OpenAI serving layer.",
+)
+_BILLING_HIGH_PRIORITY_REQUESTS_TOTAL = Counter(
+    "billing_high_priority_requests_total",
+    "Count of admitted requests using the secret high-priority billing header.",
+)
+
 
 class RendererRequest(Protocol):
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
@@ -213,6 +223,8 @@ class ServeContext(Generic[RequestT]):
 
 
 class OpenAIServing:
+    BILLING_PRIORITY_HEADER: ClassVar[str] = "X-BILLING-Request-Priority"
+    HIGH_BILLING_PRIORITY: ClassVar[int] = -1000
     request_id_prefix: ClassVar[str] = """
     A short string prepended to every request’s ID (e.g. "embd")
     so you can easily tell “this ID came from Embedding.”
@@ -1167,6 +1179,40 @@ class OpenAIServing:
             return req_id
 
         return random_uuid() if default is None else default
+
+    def _resolve_request_priority(
+        self,
+        request_priority: int,
+        raw_request: Request | None,
+    ) -> int:
+        if request_priority != 0:
+            raise VLLMValidationError(
+                "Request body field `priority` is not supported.",
+                parameter="priority",
+                value=request_priority,
+            )
+
+        if raw_request is None:
+            _BILLING_REQUESTS_TOTAL.inc()
+            return 0
+
+        billing_priority = raw_request.headers.get(self.BILLING_PRIORITY_HEADER)
+        if billing_priority is None:
+            _BILLING_REQUESTS_TOTAL.inc()
+            return 0
+
+        normalized = billing_priority.strip().lower()
+        if normalized == "high":
+            _BILLING_REQUESTS_TOTAL.inc()
+            _BILLING_HIGH_PRIORITY_REQUESTS_TOTAL.inc()
+            return self.HIGH_BILLING_PRIORITY
+
+        raise VLLMValidationError(
+            f"Unsupported value for `{self.BILLING_PRIORITY_HEADER}`. "
+            "Only `high` is supported.",
+            parameter=self.BILLING_PRIORITY_HEADER,
+            value=billing_priority,
+        )
 
     @staticmethod
     def _get_data_parallel_rank(raw_request: Request | None) -> int | None:

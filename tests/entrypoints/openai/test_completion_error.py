@@ -14,6 +14,7 @@ from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
 from vllm.tokenizers.registry import tokenizer_args_from_config
@@ -251,4 +252,13 @@ def test_negative_prompt_token_ids_flat():
             model=MODEL_NAME,
             prompt=[-1],
             max_tokens=10,
+        )
+
+
+def test_priority_body_field_rejected():
+    with pytest.raises(VLLMValidationError, match="body field `priority`"):
+        CompletionRequest(
+            model=MODEL_NAME,
+            prompt="hello",
+            priority=-10,
         )
