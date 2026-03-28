@@ -42,14 +42,20 @@ class Step3p5ReasoningParser(BaseThinkingReasoningParser):
         # token to confirm the end.
         self._end_token_pending = False
 
+    @property
+    def supports_prompt_reasoning_end_check(self) -> bool:
+        # Step-3.5 should remain unconstrained during reasoning and only
+        # enable grammar after a generated </think> boundary.
+        return False
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         return self._is_reasoning_end_from_ids(input_ids)
 
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
-        # Only examine newly generated tokens; they may contain multiple ids.
-        return self._is_reasoning_end_from_ids(tuple(delta_ids))
+        # Enable grammar immediately after a generated </think> boundary.
+        return self.end_token_id in delta_ids
 
     def _is_reasoning_end_from_ids(self, input_ids: Sequence[int]) -> bool:
         # Scan backwards to find the last special token, <think> or </think>.

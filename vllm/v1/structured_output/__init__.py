@@ -296,8 +296,17 @@ class StructuredOutputManager:
                         apply_bitmask = False
                     if apply_bitmask and not grammar.is_terminated():
                         accepted = grammar.accept_tokens(req_id, [token])
-                        assert accepted, (token, req_id, scheduled_spec_decode_tokens)
-                        state_advancements += 1
+                        if accepted:
+                            state_advancements += 1
+                        else:
+                            logger.warning(
+                                "Structured output rejected speculative token %s "
+                                "for request %s; treating remaining draft tokens "
+                                "as padding for this step.",
+                                token,
+                                req_id,
+                            )
+                            apply_bitmask = False
                     cumulative_index += 1
                 if state_advancements > 0:
                     grammar.rollback(state_advancements)

@@ -154,11 +154,13 @@ class Step3p5Attention(nn.Module):
         self.total_num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
         self.layer_idx = extract_layer_index(prefix)
-        if layer_types:
-            enable_sliding_window = layer_types[self.layer_idx] == "sliding_attention"
+        layer_type = None
+        if layer_types and self.layer_idx < len(layer_types):
+            layer_type = layer_types[self.layer_idx]
+            enable_sliding_window = layer_type == "sliding_attention"
         else:
             enable_sliding_window = self.layer_idx % 2 == 0
-        if yarn_only_types and layer_types[self.layer_idx] not in yarn_only_types:
+        if yarn_only_types and layer_type not in yarn_only_types:
             rope_scaling = None
 
         if sliding_window is not None and enable_sliding_window:
@@ -169,7 +171,7 @@ class Step3p5Attention(nn.Module):
         else:
             sliding_window = None
 
-        if isinstance(rope_theta, list):
+        if isinstance(rope_theta, list) and self.layer_idx < len(rope_theta):
             rope_theta = rope_theta[self.layer_idx]
 
         self.rank = get_tensor_model_parallel_rank()
@@ -237,7 +239,7 @@ class Step3p5Attention(nn.Module):
             )
 
         self.use_rope = True
-        if use_rope_layers:
+        if use_rope_layers and self.layer_idx < len(use_rope_layers):
             self.use_rope = use_rope_layers[self.layer_idx]
 
         self.attn = Attention(
@@ -443,10 +445,12 @@ class Step3p5DecoderLayer(nn.Module):
             num_attention_heads = None
             num_attention_groups = None
             head_dim = None
+            layer_types = getattr(config, "layer_types", [])
             if (
                 getattr(config, "attention_other_setting", None)
-                and getattr(config, "layer_types", [])
-                and config.layer_types[layer_idx]
+                and layer_types
+                and layer_idx < len(layer_types)
+                and layer_types[layer_idx]
                 == config.attention_other_setting["attention_type"]
             ):
                 num_attention_heads = config.attention_other_setting[

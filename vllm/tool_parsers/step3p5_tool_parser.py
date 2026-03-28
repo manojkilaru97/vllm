@@ -1217,15 +1217,38 @@ class StreamingXMLToolCallParser:
                         properties[param_name], dict
                     ):
                         return self.repair_param_type(
-                            str(properties[param_name].get("type", "string"))
+                            self._infer_schema_type(properties[param_name])
                         )
                 elif isinstance(params, dict) and param_name in params:
                     param_config = params[param_name]
                     if isinstance(param_config, dict):
                         return self.repair_param_type(
-                            str(param_config.get("type", "string"))
+                            self._infer_schema_type(param_config)
                         )
                 break
+        return "string"
+
+    def _infer_schema_type(self, schema: dict[str, Any]) -> str:
+        """Infer a concrete JSON schema type for combinator schemas."""
+        schema_type = schema.get("type")
+        if isinstance(schema_type, str):
+            return schema_type
+
+        for key in ("anyOf", "oneOf", "allOf"):
+            options = schema.get(key)
+            if not isinstance(options, list):
+                continue
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                inferred = self._infer_schema_type(option)
+                if inferred != "string":
+                    return inferred
+
+        if "properties" in schema or "additionalProperties" in schema:
+            return "object"
+        if "items" in schema:
+            return "array"
         return "string"
 
     def repair_param_type(self, param_type: str) -> str:

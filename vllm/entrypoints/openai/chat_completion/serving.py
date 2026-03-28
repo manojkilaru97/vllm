@@ -846,7 +846,15 @@ class OpenAIServingChat(OpenAIServing):
 
         # Prepare the tool parser if it's needed
         try:
-            if tool_choice_auto and self.tool_parser:
+            should_init_tool_parser = (
+                self.tool_parser is not None
+                and (
+                    tool_choice_auto
+                    or tool_choice_function_name is not None
+                    or request.tool_choice == "required"
+                )
+            )
+            if should_init_tool_parser:
                 if tokenizer is None:
                     raise ValueError(
                         "Tokenizer not available when `skip_tokenizer_init=True`"
@@ -1060,12 +1068,19 @@ class OpenAIServingChat(OpenAIServing):
                         harmony_tools_streamed[i] |= tools_streamed_flag
                     # handle streaming deltas for tools with named tool_choice
                     elif tool_choice_function_name:
-                        minimax_finish_only_named = (
-                            reasoning_parser is not None
-                            and reasoning_parser.__class__.__name__
-                            == "MiniMaxM2AppendThinkReasoningParser"
+                        finish_only_named_tool = (
+                            (
+                                reasoning_parser is not None
+                                and reasoning_parser.__class__.__name__
+                                == "MiniMaxM2AppendThinkReasoningParser"
+                            )
+                            or (
+                                tool_parser is not None
+                                and tool_parser.__class__.__name__
+                                == "Step3p5ToolParser"
+                            )
                         )
-                        if minimax_finish_only_named:
+                        if finish_only_named_tool:
                             accumulated_text = previous_text + delta_text
                             current_text = accumulated_text
                             output_token_ids = as_list(output.token_ids)
@@ -1423,13 +1438,20 @@ class OpenAIServingChat(OpenAIServing):
                         current_text = previous_text + delta_text
                         fn_name_returned = function_name_returned[i]
                         output_token_ids = as_list(output.token_ids)
-                        minimax_finish_only_required = (
-                            reasoning_parser is not None
-                            and reasoning_parser.__class__.__name__
-                            == "MiniMaxM2AppendThinkReasoningParser"
+                        finish_only_required_tool = (
+                            (
+                                reasoning_parser is not None
+                                and reasoning_parser.__class__.__name__
+                                == "MiniMaxM2AppendThinkReasoningParser"
+                            )
+                            or (
+                                tool_parser is not None
+                                and tool_parser.__class__.__name__
+                                == "Step3p5ToolParser"
+                            )
                         )
 
-                        if minimax_finish_only_required:
+                        if finish_only_required_tool:
                             if (
                                 reasoning_parser is not None
                                 and not reasoning_end_arr[i]
