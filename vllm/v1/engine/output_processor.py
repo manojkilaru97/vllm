@@ -32,6 +32,7 @@ from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (
+    FinishedRequestStats,
     IterationStats,
     LoRARequestStates,
     RequestStateStats,
@@ -430,12 +431,21 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
+        self.pending_finished_requests: list[FinishedRequestStats] = []
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
 
     def has_unfinished_requests(self) -> bool:
         return len(self.request_states) > 0
+
+    def has_pending_finished_requests(self) -> bool:
+        return bool(self.pending_finished_requests)
+
+    def drain_pending_finished_requests(self) -> list[FinishedRequestStats]:
+        finished = self.pending_finished_requests
+        self.pending_finished_requests = []
+        return finished
 
     def propagate_error(self, e: Exception):
         """Propagate error to all generate() tasks."""
@@ -482,6 +492,19 @@ class OutputProcessor:
             if req_state is not None:
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
+                if self.log_stats and req_state.stats is not None:
+                    abort_stats = IterationStats()
+                    abort_stats.update_from_finished_request(
+                        finish_reason=FinishReason.ABORT,
+                        num_prompt_tokens=req_state.prompt_len,
+                        max_tokens_param=req_state.max_tokens_param,
+                        req_stats=req_state.stats,
+                        num_cached_tokens=req_state.num_cached_tokens,
+                        num_preemptions=req_state.num_preemptions,
+                    )
+                    self.pending_finished_requests.extend(
+                        abort_stats.finished_requests
+                    )
                 # Produce final abort output.
                 if req_state.queue is not None and (
                     request_output := req_state.make_request_output(
@@ -600,6 +623,10 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        if iteration_stats is not None and self.pending_finished_requests:
+            iteration_stats.finished_requests.extend(
+                self.drain_pending_finished_requests()
+            )
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)

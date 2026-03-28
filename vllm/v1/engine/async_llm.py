@@ -668,7 +668,15 @@ class AsyncLLM(EngineClient):
                     num_outputs = len(outputs.outputs)
 
                     iteration_stats = (
-                        IterationStats() if (log_stats and num_outputs) else None
+                        IterationStats()
+                        if (
+                            log_stats
+                            and (
+                                num_outputs
+                                or output_processor.has_pending_finished_requests()
+                            )
+                        )
+                        else None
                     )
 
                     # Split outputs into chunks of at most
@@ -722,6 +730,16 @@ class AsyncLLM(EngineClient):
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
         )
         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
+        if self.logger_manager and self.output_processor.has_pending_finished_requests():
+            iteration_stats = IterationStats()
+            iteration_stats.finished_requests.extend(
+                self.output_processor.drain_pending_finished_requests()
+            )
+            self.logger_manager.record(
+                scheduler_stats=None,
+                iteration_stats=iteration_stats,
+                engine_idx=0,
+            )
         await self.engine_core.abort_requests_async(all_request_ids)
 
         if self.log_requests:

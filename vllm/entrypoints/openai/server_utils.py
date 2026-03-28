@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import uuid
 from argparse import Namespace
@@ -33,6 +34,52 @@ from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 logger = init_logger("vllm.entrypoints.openai.server_utils")
+payload_logger = logging.getLogger("vllm.payload")
+
+
+def _request_log_rid(req: Request) -> str:
+    rid = req.headers.get("x-request-id")
+    if rid:
+        return rid
+    request_metadata = getattr(req.state, "request_metadata", None)
+    request_id = getattr(request_metadata, "request_id", "")
+    return request_id if isinstance(request_id, str) else ""
+
+
+def _log_openai_error_response(req: Request, err: ErrorResponse) -> None:
+    try:
+        payload_logger.info(
+            "openai.response",
+            extra={
+                "rid": _request_log_rid(req),
+                "endpoint": str(req.url.path),
+                "payload": err.model_dump(),
+            },
+        )
+    except Exception:
+        pass
+
+
+async def _log_openai_request(req: Request) -> None:
+    try:
+        payload = None
+        body = await req.body()
+        if body:
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = None
+        payload_logger.info(
+            "openai.request",
+            extra={
+                "rid": _request_log_rid(req),
+                "endpoint": str(req.url.path),
+                "payload": payload,
+                "headers": {k: v for k, v in req.headers.items()},
+            },
+        )
+    except Exception:
+        pass
 
 
 class AuthenticationMiddleware:
@@ -355,6 +402,7 @@ async def engine_error_handler(
         engine=req.app.state.engine_client,
     )
     err = create_error_response(exc)
+    _log_openai_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -366,6 +414,7 @@ async def generation_error_handler(req: Request, exc: GenerationError):
     server logs with stack traces.
     """
     err = create_error_response(exc)
+    _log_openai_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -379,6 +428,7 @@ async def exception_handler(req: Request, exc: Exception):
         )
 
     err = create_error_response(exc)
+    _log_openai_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -397,6 +447,7 @@ async def http_exception_handler(req: Request, exc: HTTPException):
             code=exc.status_code,
         )
     )
+    _log_openai_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=exc.status_code)
 
 
@@ -408,6 +459,7 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
             if hasattr(req.state, "request_metadata")
             else None,
         )
+    await _log_openai_request(req)
 
     param = None
     errors = exc.errors()
@@ -434,6 +486,7 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
             param=param,
         )
     )
+    _log_openai_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 

@@ -38,6 +38,11 @@ AggregateStatLoggerFactory = type["AggregateStatLoggerBase"]
 StatLoggerFactory = AggregateStatLoggerFactory | PerEngineStatLoggerFactory
 
 
+def make_per_engine(metric, engine_indexes: list[int], model_name: str):
+    """Build per-engine metric handles for metrics labeled by model and engine."""
+    return {idx: metric.labels(model_name, str(idx)) for idx in engine_indexes}
+
+
 class StatLoggerBase(ABC):
     """Interface for logging metrics.
 

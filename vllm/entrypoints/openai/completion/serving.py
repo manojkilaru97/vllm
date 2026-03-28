@@ -251,7 +251,8 @@ class OpenAIServingCompletion(OpenAIServing):
                 request_metadata,
             )
         except asyncio.CancelledError:
-            return self.create_error_response("Client disconnected")
+            await self.engine_client.abort(request_id)
+            raise
 
         # When user requests streaming but we don't stream, we still need to
         # return a streaming response with a single event.
@@ -444,12 +445,24 @@ class OpenAIServingCompletion(OpenAIServing):
             # report to FastAPI middleware aggregate usage across all choices
             request_metadata.final_usage_info = final_usage_info
 
+        except asyncio.CancelledError:
+            await self.engine_client.abort(request_id)
+            raise
+        except GeneratorExit:
+            await self.engine_client.abort(request_id)
+            return
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
         except Exception as e:
             logger.exception("Error in completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            if request_metadata.final_usage_info is None:
+                try:
+                    await self.engine_client.abort(request_id)
+                except Exception:
+                    pass
         yield "data: [DONE]\n\n"
 
     def request_output_to_completion_response(

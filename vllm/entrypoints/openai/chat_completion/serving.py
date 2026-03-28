@@ -2554,12 +2554,24 @@ class OpenAIServingChat(OpenAIServing):
                             delta=False,
                         )
 
+        except asyncio.CancelledError:
+            await self.engine_client.abort(request_id)
+            raise
+        except GeneratorExit:
+            await self.engine_client.abort(request_id)
+            return
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            if request_metadata.final_usage_info is None:
+                try:
+                    await self.engine_client.abort(request_id)
+                except Exception:
+                    pass
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 
@@ -2584,6 +2596,10 @@ class OpenAIServingChat(OpenAIServing):
             async for res in result_generator:
                 final_res = res
         except asyncio.CancelledError:
+            await self.engine_client.abort(request_id)
+            raise
+        except GeneratorExit:
+            await self.engine_client.abort(request_id)
             return self.create_error_response("Client disconnected")
 
         if final_res is None:
