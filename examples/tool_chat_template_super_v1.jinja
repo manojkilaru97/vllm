@@ -1,0 +1,68 @@
+{{- bos_token }}
+{%- if messages[0]['role'] == 'system' %}
+    {%- set system_message = messages[0]['content'] | trim %}
+    {%- set messages = messages[1:] %}
+{%- else %}
+    {%- set system_message = "detailed thinking off" %}
+{%- endif %}
+{%- if not tools is defined %}
+    {%- set tools = none %}
+{%- endif %}
+{%- if not tool_choice is defined %}
+    {%- set tool_choice = none %}
+{%- endif %}
+
+{{- "<|start_header_id|>system<|end_header_id|>\n\n" }}
+{{- system_message }}
+{{- "<|eot_id|>" }}
+
+{%- for message in messages %}
+    {%- if message['role'] == 'assistant' %}
+        {%- set content = message['content'] | default('', true) | string %}
+        {%- if '</think>' in content %}
+            {%- set content = content.split('</think>')[-1].lstrip() %}
+        {%- endif %}
+        {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
+        {{- content | trim }}
+        {%- if message.tool_calls is defined and message.tool_calls %}
+            {{- '\n<TOOLCALL>' }}
+            {{- '[' }}
+            {%- for tc in message.tool_calls %}
+                {%- if tc.function is defined %}
+                    {%- set fn = tc.function %}
+                {%- else %}
+                    {%- set fn = tc %}
+                {%- endif %}
+                {%- set args = fn.arguments if fn.arguments is mapping else {} %}
+                {{- fn.name }}(
+                {%- for k, v in args.items() %}
+                    {{- k }}={{ v | tojson }}{%- if not loop.last %}, {% endif %}
+                {%- endfor -%}
+                )
+                {%- if not loop.last %}, {% endif %}
+            {%- endfor %}
+            {{- ']</TOOLCALL>' }}
+        {%- endif %}
+        {{- '<|eot_id|>' }}
+    {%- elif message['role'] == 'tool' %}
+        {{- '<|start_header_id|>ipython<|end_header_id|>\n\n' }}
+        {{- message['content'] if message['content'] is string else (message['content'] | tojson) }}
+        {{- '<|eot_id|>' }}
+    {%- elif message['role'] == 'user' and tools is not none and tool_choice != 'none' and loop.last %}
+        {{- '<|start_header_id|>user<|end_header_id|>\n\n' }}
+        Here is a list of functions in JSON format that you can invoke.
+<FUNCTIONS>{{ tools | tojson }}</FUNCTIONS>
+<QUESTION>{{ message['content'] | trim }}</QUESTION>
+If you decide to invoke any function(s), you MUST put it in the format of <TOOLCALL>[func_name1(params_name1=params_value1...), func_name2(params_name2=params_value2...)]</TOOLCALL>
+You SHOULD NOT include any other text in the response when you call tools.
+        {{- '<|eot_id|>' }}
+    {%- else %}
+        {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' }}
+        {{- message['content'] | trim }}
+        {{- '<|eot_id|>' }}
+    {%- endif %}
+{%- endfor %}
+
+{%- if add_generation_prompt %}
+{{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
+{%- endif %}

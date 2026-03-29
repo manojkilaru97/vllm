@@ -74,6 +74,14 @@ class MultiModalProcessingInfo(BaseProcessingInfo):
         processor = self.get_hf_processor()
         multimodal_config = self.ctx.model_config.multimodal_config
         mm_processor_kwargs = multimodal_config.mm_processor_kwargs or {}
+        # MllamaProcessor in current transformers releases does not implement
+        # `_get_num_multimodal_tokens`, but it still uses a single `<|image|>`
+        # placeholder token per image in the prompt. Returning 1 here is
+        # sufficient to let vLLM initialize the multimodal budget and start.
+        if processor.__class__.__name__ == "MllamaProcessor" and not hasattr(
+            processor, "_get_num_multimodal_tokens"
+        ):
+            return 1
         mm_tokens = processor._get_num_multimodal_tokens(
             image_sizes=([height, width],), **mm_processor_kwargs
         )

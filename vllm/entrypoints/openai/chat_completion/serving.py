@@ -1077,7 +1077,7 @@ class OpenAIServingChat(OpenAIServing):
                             or (
                                 tool_parser is not None
                                 and tool_parser.__class__.__name__
-                                == "Step3p5ToolParser"
+                                in {"Step3p5ToolParser", "SuperV15ToolParser"}
                             )
                         )
                         if finish_only_named_tool:

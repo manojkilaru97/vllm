@@ -142,6 +142,14 @@ _TOOL_PARSERS_TO_REGISTER = {
         "step3p5_tool_parser",
         "Step3p5ToolParser",
     ),
+    "super_v1": (
+        "super_v1_tool_parser",
+        "SuperV1ToolParser",
+    ),
+    "super_v1_5": (
+        "super_v1_5_tool_parser",
+        "SuperV15ToolParser",
+    ),
     "xlam": (
         "xlam_tool_parser",
         "xLAMToolParser",

@@ -92,6 +92,14 @@ _REASONING_PARSERS_TO_REGISTER = {
         "step3p5_reasoning_parser",
         "Step3p5ReasoningParser",
     ),
+    "super_v1": (
+        "super_v1_reasoning_parser",
+        "SuperV1ReasoningParser",
+    ),
+    "super_v1_5": (
+        "super_v1_5_reasoning_parser",
+        "SuperV15ReasoningParser",
+    ),
 }
 
 

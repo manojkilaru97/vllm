@@ -507,6 +507,7 @@ class OpenAIServingRender:
             default_template_kwargs,
             dict(
                 tools=tool_dicts,
+                tool_choice=getattr(request, "tool_choice", None),
                 tokenize=is_mistral_tokenizer(renderer.tokenizer),
             ),
         )
