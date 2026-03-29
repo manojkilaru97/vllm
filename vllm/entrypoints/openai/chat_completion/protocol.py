@@ -208,6 +208,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "reasoning termination."
         ),
     )
+    min_thinking_tokens: Annotated[int, Field(ge=1, le=_LONG_INFO.max)] | None = Field(
+        default=None,
+        description=(
+            "Compatibility alias for the minimum reasoning length before "
+            "reasoning termination can begin."
+        ),
+    )
+    max_thinking_tokens: Annotated[int, Field(ge=1, le=_LONG_INFO.max)] | None = Field(
+        default=None,
+        description=(
+            "Compatibility alias for the maximum reasoning length before "
+            "reasoning termination is forced."
+        ),
+    )
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -736,6 +750,89 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise VLLMValidationError(
                 "Stream options can only be defined when `stream=True`.",
                 parameter="stream_options",
+            )
+
+        return data
+
+    @staticmethod
+    def _message_contains_no_think(content: Any) -> bool:
+        if isinstance(content, str):
+            return "/no_think" in content
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != "text":
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and "/no_think" in text:
+                    return True
+        return False
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_thinking_budget_aliases(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        min_thinking = data.get("min_thinking_tokens")
+        max_thinking = data.get("max_thinking_tokens")
+        if min_thinking is None and max_thinking is None:
+            return data
+
+        messages = data.get("messages") or []
+        for message in messages:
+            content = message.get("content", "") if isinstance(message, dict) else ""
+            if cls._message_contains_no_think(content):
+                data = data.copy()
+                data["min_thinking_tokens"] = None
+                data["max_thinking_tokens"] = None
+                return data
+
+        if min_thinking is not None and min_thinking < 1:
+            raise VLLMValidationError(
+                "min_thinking_tokens must be at least 1.",
+                parameter="min_thinking_tokens",
+                value=min_thinking,
+            )
+        if max_thinking is not None and max_thinking < 1:
+            raise VLLMValidationError(
+                "max_thinking_tokens must be at least 1.",
+                parameter="max_thinking_tokens",
+                value=max_thinking,
+            )
+
+        if min_thinking is None and max_thinking is not None:
+            min_thinking = max(int(max_thinking) - 500, 1)
+            data = data.copy()
+            data["min_thinking_tokens"] = min_thinking
+        elif max_thinking is None and min_thinking is not None:
+            max_thinking = int(min_thinking) + 500
+            data = data.copy()
+            data["max_thinking_tokens"] = max_thinking
+
+        if (
+            min_thinking is not None
+            and max_thinking is not None
+            and int(min_thinking) >= int(max_thinking)
+        ):
+            raise VLLMValidationError(
+                "min_thinking_tokens must be less than max_thinking_tokens.",
+                parameter="min_thinking_tokens",
+                value=min_thinking,
+            )
+
+        if data.get("reasoning_budget") is None and min_thinking is not None:
+            data = data.copy()
+            data["reasoning_budget"] = int(min_thinking)
+        if (
+            data.get("reasoning_budget_grace_period") is None
+            and min_thinking is not None
+            and max_thinking is not None
+        ):
+            data = data.copy()
+            data["reasoning_budget_grace_period"] = max(
+                int(max_thinking) - int(min_thinking), 0
             )
 
         return data

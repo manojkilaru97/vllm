@@ -2161,9 +2161,27 @@ class OpenAIServingChat(OpenAIServing):
                             and self.enable_auto_tools
                             and self.tool_parser
                             and tool_parser
-                            and (auto_tools_called or tools_streamed[i])
+                            and request.tools
+                            and tool_choice_auto
                         ):
                             final_tool_text = current_text
+                            if (
+                                tokenizer is not None
+                                and (
+                                    not final_tool_text
+                                    or (
+                                        "<TOOLCALL>" not in final_tool_text
+                                        and "</TOOLCALL>" not in final_tool_text
+                                    )
+                                )
+                            ):
+                                try:
+                                    final_tool_text = tokenizer.decode(
+                                        list(as_list(output.token_ids)),
+                                        skip_special_tokens=False,
+                                    )
+                                except Exception:
+                                    pass
                             if final_tool_text:
                                 try:
                                     reparsed_calls, _ = (
@@ -2177,6 +2195,9 @@ class OpenAIServingChat(OpenAIServing):
                                     )
                                 except Exception:
                                     reparsed_calls = None
+
+                            if reparsed_calls:
+                                auto_tools_called = True
 
                             if (
                                 reparsed_calls
@@ -2303,9 +2324,20 @@ class OpenAIServingChat(OpenAIServing):
                                 if isinstance(reparsed_args, str):
                                     expected_call = reparsed_args
 
+                            have_finish_tool_state = (
+                                bool(reparsed_calls)
+                                or len(tool_parser.prev_tool_call_arr) > index
+                                or len(previous_tool_calls[i]) > index
+                                or len(tool_parser.streamed_args_for_tool) > index
+                            )
+
                             # Fall back to parser streaming state if reparsing
                             # did not produce a concrete argument string.
-                            if expected_call is None:
+                            if (
+                                expected_call is None
+                                and have_finish_tool_state
+                                and len(tool_parser.prev_tool_call_arr) > index
+                            ):
                                 # Tool parsers (e.g. Qwen3Coder) store
                                 # arguments as a JSON string in
                                 # prev_tool_call_arr. Calling json.dumps()
@@ -2325,80 +2357,79 @@ class OpenAIServingChat(OpenAIServing):
                                         args, ensure_ascii=False
                                     )
 
-                            # get what we've streamed so far for arguments
-                            # for the current tool
-                            actual_call = ""
-                            if len(previous_tool_calls[i]) > index:
-                                actual_call = str(
-                                    (
-                                        previous_tool_calls[i][index].get("function")
-                                        or {}
-                                    ).get("arguments")
-                                    or ""
-                                )
-                                if latest_delta_len > 0:
-                                    actual_call = actual_call[:-latest_delta_len]
-                            elif len(tool_parser.streamed_args_for_tool) > index:
-                                actual_call = tool_parser.streamed_args_for_tool[index]
-                                if latest_delta_len > 0:
-                                    actual_call = actual_call[:-latest_delta_len]
-
-                            # check to see if there's anything left to stream
-                            if expected_call.startswith(actual_call):
-                                remaining_call = expected_call[len(actual_call) :]
-                            elif actual_call:
-                                remaining_call = expected_call.replace(
-                                    actual_call, "", 1
-                                )
-                            else:
-                                remaining_call = expected_call
-
-                            fallback_tool_state = (
-                                previous_tool_calls[i][index]
-                                if len(previous_tool_calls[i]) > index
-                                else None
-                            )
-
-                            current_finish_delta = next(
-                                (
-                                    tc
-                                    for tc in (delta_message.tool_calls or [])
-                                    if tc.index == index
-                                ),
-                                None,
-                            ) if (delta_message and delta_message.tool_calls) else None
-                            current_finish_args = (
-                                current_finish_delta.function.arguments
-                                if (
-                                    current_finish_delta
-                                    and current_finish_delta.function is not None
-                                    and isinstance(
-                                        current_finish_delta.function.arguments, str
+                            if expected_call is not None:
+                                # get what we've streamed so far for arguments
+                                # for the current tool
+                                actual_call = ""
+                                if len(previous_tool_calls[i]) > index:
+                                    actual_call = str(
+                                        (
+                                            previous_tool_calls[i][index].get("function")
+                                            or {}
+                                        ).get("arguments")
+                                        or ""
                                     )
-                                )
-                                else ""
-                            )
+                                    if latest_delta_len > 0:
+                                        actual_call = actual_call[:-latest_delta_len]
+                                elif len(tool_parser.streamed_args_for_tool) > index:
+                                    actual_call = tool_parser.streamed_args_for_tool[index]
+                                    if latest_delta_len > 0:
+                                        actual_call = actual_call[:-latest_delta_len]
 
-                            preserve_finish_delta = (
-                                expected_call is not None
-                                and current_finish_args
-                                and current_finish_args == expected_call
-                            )
+                                # check to see if there's anything left to stream
+                                if expected_call.startswith(actual_call):
+                                    remaining_call = expected_call[len(actual_call) :]
+                                elif actual_call:
+                                    remaining_call = expected_call.replace(
+                                        actual_call, "", 1
+                                    )
+                                else:
+                                    remaining_call = expected_call
 
-                            # Do not manufacture a header-only trailing tool at
-                            # finish time. If there is no argument payload left
-                            # to stream and the current finish delta also carries
-                            # no argument fragment, suppress the tool delta.
-                            if preserve_finish_delta:
-                                pass
-                            elif remaining_call or current_finish_args:
-                                delta_message = self._create_remaining_args_delta(
-                                    delta_message,
-                                    remaining_call,
-                                    index,
-                                    fallback_tool_state=fallback_tool_state,
+                                fallback_tool_state = (
+                                    previous_tool_calls[i][index]
+                                    if len(previous_tool_calls[i]) > index
+                                    else None
                                 )
-                                if expected_call is not None:
+
+                                current_finish_delta = next(
+                                    (
+                                        tc
+                                        for tc in (delta_message.tool_calls or [])
+                                        if tc.index == index
+                                    ),
+                                    None,
+                                ) if (delta_message and delta_message.tool_calls) else None
+                                current_finish_args = (
+                                    current_finish_delta.function.arguments
+                                    if (
+                                        current_finish_delta
+                                        and current_finish_delta.function is not None
+                                        and isinstance(
+                                            current_finish_delta.function.arguments, str
+                                        )
+                                    )
+                                    else ""
+                                )
+
+                                preserve_finish_delta = (
+                                    current_finish_args
+                                    and current_finish_args == expected_call
+                                )
+
+                                # Do not manufacture a header-only trailing tool at
+                                # finish time. If there is no argument payload left
+                                # to stream and the current finish delta also carries
+                                # no argument fragment, suppress the tool delta.
+                                if preserve_finish_delta:
+                                    pass
+                                elif remaining_call or current_finish_args:
+                                    delta_message = self._create_remaining_args_delta(
+                                        delta_message,
+                                        remaining_call,
+                                        index,
+                                        fallback_tool_state=fallback_tool_state,
+                                    )
                                     while len(previous_tool_calls[i]) <= index:
                                         previous_tool_calls[i].append(
                                             {
@@ -2431,8 +2462,8 @@ class OpenAIServingChat(OpenAIServing):
                                         ):
                                             fn_state["name"] = original_tc.function.name
                                     fn_state["arguments"] = expected_call
-                            else:
-                                delta_message = None
+                                else:
+                                    delta_message = None
 
                         if tool_choice_auto and delta_message and delta_message.tool_calls:
                             kept_tool_calls: list[DeltaToolCall] = []
