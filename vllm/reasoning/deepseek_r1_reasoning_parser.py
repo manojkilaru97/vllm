@@ -48,15 +48,10 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
             and self.start_token_id not in delta_token_ids
         ):
             if self.end_token_id in delta_token_ids:
-                # end token in delta with more tokens,
-                # extract reasoning content and content
-                end_index = delta_text.find(self.end_token)
-                reasoning = delta_text[:end_index]
-                content = delta_text[end_index + len(self.end_token) :]
-                return DeltaMessage(
-                    reasoning=reasoning,
-                    content=content if content else None,
-                )
+                # Preserve the base parser's full-text boundary split so
+                # streaming matches non-streaming even when </think> lands
+                # inside a decoded piece such as "The</think>ing".
+                return ret
             elif self.end_token_id in previous_token_ids:
                 # end token in previous, thinking content ends
                 return DeltaMessage(content=delta_text)
