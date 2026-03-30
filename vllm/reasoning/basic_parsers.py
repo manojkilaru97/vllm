@@ -87,6 +87,76 @@ class BaseThinkingReasoningParser(ReasoningParser):
         else:
             return input_ids[input_ids.index(self.end_token_id) + 1 :]
 
+    def _split_reasoning_content_from_token_ids(
+        self,
+        token_ids: Sequence[int],
+    ) -> tuple[str | None, str | None]:
+        ids = list(token_ids)
+        if not ids:
+            return None, None
+
+        if self.end_token_id in ids:
+            end_index = ids.index(self.end_token_id)
+            if self.start_token_id in ids[: end_index + 1]:
+                start_index = ids.index(self.start_token_id) + 1
+            else:
+                start_index = 0
+            reasoning_ids = ids[start_index:end_index]
+            content_ids = ids[end_index + 1 :]
+            reasoning = (
+                self.model_tokenizer.decode(reasoning_ids)
+                if reasoning_ids
+                else None
+            )
+            content = (
+                self.model_tokenizer.decode(content_ids)
+                if content_ids
+                else None
+            )
+            return reasoning, content
+
+        if self.start_token_id in ids:
+            start_index = ids.index(self.start_token_id) + 1
+            reasoning_ids = ids[start_index:]
+            reasoning = (
+                self.model_tokenizer.decode(reasoning_ids)
+                if reasoning_ids
+                else None
+            )
+            return reasoning, None
+
+        content = self.model_tokenizer.decode(ids)
+        return None, content or None
+
+    def _split_reasoning_content_from_text(
+        self,
+        text: str,
+    ) -> tuple[str | None, str | None]:
+        # Match the non-streaming parser semantics so streamed and final
+        # responses agree even when the end token lands inside a decoded piece
+        # such as "The</think>ing".
+        model_output_parts = text.partition(self.start_token)
+        model_output = (
+            model_output_parts[2] if model_output_parts[1] else model_output_parts[0]
+        )
+
+        if self.end_token not in model_output:
+            return model_output or None, None
+
+        reasoning, _, content = model_output.partition(self.end_token)
+        return reasoning or None, content or None
+
+    @staticmethod
+    def _suffix_delta(previous_text: str | None, current_text: str | None) -> str | None:
+        prev = previous_text or ""
+        cur = current_text or ""
+        if not cur:
+            return None
+        if cur.startswith(prev):
+            delta = cur[len(prev) :]
+            return delta or None
+        return cur
+
     def extract_reasoning_streaming(
         self,
         previous_text: str,
@@ -106,6 +176,18 @@ class BaseThinkingReasoningParser(ReasoningParser):
             delta_token_ids[0] in [self.start_token_id, self.end_token_id]
         ):
             return None
+
+        if self.end_token_id in delta_token_ids:
+            prev_reasoning, prev_content = self._split_reasoning_content_from_text(
+                previous_text
+            )
+            cur_reasoning, cur_content = self._split_reasoning_content_from_text(
+                current_text
+            )
+            return DeltaMessage(
+                reasoning=self._suffix_delta(prev_reasoning, cur_reasoning),
+                content=self._suffix_delta(prev_content, cur_content),
+            )
 
         # Check if start token is present in previous or delta.
         # Keep compatibility with models that don't generate start tokens.
