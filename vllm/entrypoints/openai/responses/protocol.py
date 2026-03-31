@@ -237,6 +237,11 @@ class ResponsesRequest(OpenAIBaseModel):
             "response object. Currently only supported for non-background."
         ),
     )
+    chat_template_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        description="Internal field used to pass resolved chat template kwargs.",
+        exclude=True,
+    )
     # similar to input_messages / output_messages in ResponsesResponse
     # we take in previous_input_messages (ie in harmony format)
     # this cannot be used in conjunction with previous_response_id
@@ -260,6 +265,110 @@ class ResponsesRequest(OpenAIBaseModel):
     )
     # --8<-- [end:responses-extra-params]
 
+    def _get_reasoning_field(self, field_name: str) -> Any:
+        if self.reasoning is None:
+            return None
+        return getattr(self.reasoning, field_name, None)
+
+    def _get_effective_reasoning_effort(
+        self,
+    ) -> Literal["none", "low", "medium", "high"] | None:
+        enabled = self._get_reasoning_field("enabled")
+        if enabled is False:
+            return "none"
+
+        effort = self._get_reasoning_field("effort")
+        if effort == "minimal":
+            return "low"
+        if effort in ("none", "low", "medium", "high"):
+            return effort
+        if enabled is True:
+            return "medium"
+        return None
+
+    def _get_named_tool_schema(self) -> dict[str, Any] | None:
+        normalized = self.get_normalized_tool_choice()
+        if not isinstance(normalized, dict):
+            return None
+        function = normalized.get("function")
+        if not isinstance(function, dict):
+            return None
+        target_name = function.get("name")
+        if not isinstance(target_name, str) or not self.tools:
+            return None
+
+        for tool in self.tools:
+            if getattr(tool, "type", None) != "function":
+                continue
+            if getattr(tool, "name", None) != target_name:
+                continue
+            params = getattr(tool, "parameters", None)
+            if isinstance(params, dict):
+                return params
+            return {"type": "object", "additionalProperties": True}
+        return None
+
+    def _get_required_tools_schema(self) -> dict[str, Any] | None:
+        if self.tool_choice != "required" or not self.tools:
+            return None
+
+        variants: list[dict[str, Any]] = []
+        for tool in self.tools:
+            if getattr(tool, "type", None) != "function":
+                continue
+            tool_name = getattr(tool, "name", None)
+            if not isinstance(tool_name, str):
+                continue
+            params = getattr(tool, "parameters", None)
+            if not isinstance(params, dict):
+                params = {"type": "object", "additionalProperties": True}
+            variants.append(
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "const": tool_name},
+                        "parameters": params,
+                    },
+                    "required": ["name", "parameters"],
+                    "additionalProperties": False,
+                }
+            )
+
+        if not variants:
+            return None
+
+        return {
+            "type": "array",
+            "minItems": 1,
+            "items": {"oneOf": variants},
+        }
+
+    def get_normalized_tool_choice(self) -> ToolChoice:
+        tool_choice = self.tool_choice
+        if isinstance(tool_choice, dict):
+            if (
+                tool_choice.get("type") == "function"
+                and "name" in tool_choice
+                and "function" not in tool_choice
+            ):
+                return {
+                    "type": "function",
+                    "function": {"name": tool_choice["name"]},
+                }
+            return tool_choice
+
+        if (
+            getattr(tool_choice, "type", None) == "function"
+            and getattr(tool_choice, "name", None) is not None
+            and getattr(tool_choice, "function", None) is None
+        ):
+            return {
+                "type": "function",
+                "function": {"name": getattr(tool_choice, "name")},
+            }
+
+        return tool_choice
+
     def build_chat_params(
         self,
         default_template: str | None,
@@ -272,19 +381,30 @@ class ResponsesRequest(OpenAIBaseModel):
         # user provides an incomplete assistant message to continue from.
         continue_final = should_continue_final_message(self.input)
 
-        reasoning = self.reasoning
+        reasoning_effort = self._get_effective_reasoning_effort()
+        chat_template_kwargs: dict[str, Any] = {}
+        if reasoning_effort == "none":
+            chat_template_kwargs["enable_thinking"] = False
+        elif reasoning_effort == "low":
+            chat_template_kwargs["enable_thinking"] = True
+            chat_template_kwargs["low_effort"] = True
+        elif reasoning_effort in ("medium", "high"):
+            chat_template_kwargs["enable_thinking"] = True
+
+        resolved_chat_template_kwargs = merge_kwargs(
+            chat_template_kwargs,
+            dict(
+                add_generation_prompt=not continue_final,
+                continue_final_message=continue_final,
+                reasoning_effort=reasoning_effort,
+            ),
+        )
+        self.chat_template_kwargs = resolved_chat_template_kwargs
 
         return ChatParams(
             chat_template=default_template,
             chat_template_content_format=default_template_content_format,
-            chat_template_kwargs=merge_kwargs(  # To remove unset values
-                {},
-                dict(
-                    add_generation_prompt=not continue_final,
-                    continue_final_message=continue_final,
-                    reasoning_effort=None if reasoning is None else reasoning.effort,
-                ),
-            ),
+            chat_template_kwargs=resolved_chat_template_kwargs,
             media_io_kwargs=self.media_io_kwargs,
         )
 
@@ -353,10 +473,42 @@ class ResponsesRequest(OpenAIBaseModel):
                     # multiple third party conflicts, so best of both evils
                 )
 
+        if structured_outputs is None:
+            named_tool_schema = self._get_named_tool_schema()
+            if named_tool_schema is not None:
+                structured_outputs = StructuredOutputsParams(json=named_tool_schema)
+            else:
+                required_tools_schema = self._get_required_tools_schema()
+                if required_tools_schema is not None:
+                    structured_outputs = StructuredOutputsParams(
+                        json=required_tools_schema
+                    )
+
         stop = self.stop if self.stop else []
         if isinstance(stop, str):
             stop = [stop]
 
+        extra_args = dict(self.vllm_xargs or {})
+        if self.kv_transfer_params:
+            extra_args["kv_transfer_params"] = self.kv_transfer_params
+        normalized_tool_choice = self.get_normalized_tool_choice()
+        if self.tool_choice == "required" or (
+            isinstance(normalized_tool_choice, dict)
+            and normalized_tool_choice.get("type") == "function"
+        ):
+            extra_args["disable_spec_decode"] = True
+
+        output_kind = (
+            RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+        )
+        if self.stream and (
+            self.tool_choice == "required"
+            or (
+                isinstance(normalized_tool_choice, dict)
+                and normalized_tool_choice.get("type") == "function"
+            )
+        ):
+            output_kind = RequestOutputKind.FINAL_ONLY
         return SamplingParams.from_optional(
             temperature=temperature,
             top_p=top_p,
@@ -368,12 +520,10 @@ class ResponsesRequest(OpenAIBaseModel):
             repetition_penalty=repetition_penalty,
             seed=self.seed,
             ignore_eos=self.ignore_eos,
-            output_kind=(
-                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
-            ),
+            output_kind=output_kind,
             structured_outputs=structured_outputs,
             logit_bias=self.logit_bias,
-            extra_args=self.vllm_xargs or {},
+            extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             skip_special_tokens=self.skip_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,

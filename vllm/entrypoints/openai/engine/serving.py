@@ -3,6 +3,8 @@
 import asyncio
 import contextlib
 import json
+import logging
+import os
 import time
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -120,6 +122,7 @@ from vllm.utils.async_utils import (
 from vllm.utils.mistral import is_mistral_tokenizer
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 _BILLING_REQUESTS_TOTAL = Counter(
     "billing_requests_total",
@@ -128,6 +131,10 @@ _BILLING_REQUESTS_TOTAL = Counter(
 _BILLING_HIGH_PRIORITY_REQUESTS_TOTAL = Counter(
     "billing_high_priority_requests_total",
     "Count of admitted requests using the secret high-priority billing header.",
+)
+_ABORTED_REQUESTS_TOTAL = Counter(
+    "num_aborted_requests_total",
+    "Count of requests aborted after the serving layer admitted them.",
 )
 
 
@@ -1096,6 +1103,37 @@ class OpenAIServing:
             return req_id
 
         return random_uuid() if default is None else default
+
+    @staticmethod
+    def _log_error_response_payload(
+        raw_request: Request | None,
+        error_response: ErrorResponse,
+        endpoint: str,
+    ) -> None:
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
+            return
+        try:
+            rid_hint = OpenAIServing._base_request_id(raw_request, None) or ""
+            payload = error_response.model_dump(mode="json", by_alias=True)
+            payload_logger.info(
+                "openai.response",
+                extra={
+                    "rid": rid_hint,
+                    "endpoint": endpoint,
+                    "payload": payload,
+                    "payload_json": json.dumps(
+                        payload,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ),
+                },
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def record_aborted_request() -> None:
+        _ABORTED_REQUESTS_TOTAL.inc()
 
     def _resolve_request_priority(
         self,

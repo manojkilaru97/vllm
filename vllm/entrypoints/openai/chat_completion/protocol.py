@@ -162,6 +162,13 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class ChatCompletionReasoningParam(OpenAIBaseModel):
+    enabled: bool | None = None
+    effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
+    max_tokens: int | None = None
+    exclude: bool | None = None
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -194,6 +201,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | ChatCompletionNamedToolChoiceParam
         | None
     ) = "none"
+    reasoning: ChatCompletionReasoningParam | None = None
     reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
     thinking_token_budget: int | None = None
     reasoning_budget: Annotated[int, Field(ge=-1, le=_INT64_MAX)] | None = Field(
@@ -399,6 +407,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     # --8<-- [end:chat-completion-extra-params]
 
+    @model_validator(mode="after")
+    def apply_reasoning_compatibility_aliases(self):
+        if self.reasoning is not None:
+            if self.reasoning.max_tokens is not None and self.reasoning_budget is None:
+                self.reasoning_budget = self.reasoning.max_tokens
+            if self.reasoning.exclude is True:
+                self.include_reasoning = False
+        return self
+
     def build_chat_params(
         self,
         default_template: str | None,
@@ -406,8 +423,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
     ) -> ChatParams:
         explicit_reasoning_mode = self._has_explicit_reasoning_chat_template_kwargs()
         resolved_chat_template_kwargs = self.get_resolved_chat_template_kwargs()
-        compatibility_reasoning_effort = self.reasoning_effort
-        if explicit_reasoning_mode or self.reasoning_effort == "none":
+        compatibility_reasoning_effort, reasoning_source = (
+            self._resolve_reasoning_effort()
+        )
+        logger.info(
+            "Resolved reasoning mode for request %s: source=%s, effective=%s, "
+            "chat_template_kwargs=%s, reasoning_effort=%s, reasoning_budget=%s, "
+            "reasoning=%s",
+            self.request_id,
+            reasoning_source,
+            compatibility_reasoning_effort,
+            resolved_chat_template_kwargs,
+            self.reasoning_effort,
+            self.reasoning_budget,
+            self.reasoning.model_dump(exclude_none=True)
+            if self.reasoning is not None
+            else None,
+        )
+        if explicit_reasoning_mode or compatibility_reasoning_effort == "none":
             compatibility_reasoning_effort = None
 
         return ChatParams(
@@ -432,17 +465,39 @@ class ChatCompletionRequest(OpenAIBaseModel):
             or "low_effort" in request_chat_template_kwargs
         )
 
+    def _resolve_reasoning_effort(
+        self,
+    ) -> tuple[Literal["none", "low", "medium", "high"] | None, str]:
+        if self._has_explicit_reasoning_chat_template_kwargs():
+            return None, "chat_template_kwargs"
+
+        if self.reasoning_effort is not None:
+            return self.reasoning_effort, "reasoning_effort"
+
+        if self.reasoning is not None:
+            if self.reasoning.effort == "minimal":
+                return "low", "reasoning.minimal"
+            if self.reasoning.effort is not None:
+                return self.reasoning.effort, "reasoning.effort"
+            if self.reasoning.enabled is False:
+                return "none", "reasoning.enabled"
+            if self.reasoning.enabled is True:
+                return "medium", "reasoning.enabled"
+
+        return None, "default"
+
     def get_resolved_chat_template_kwargs(self) -> dict[str, Any]:
         request_chat_template_kwargs = dict(self.chat_template_kwargs or {})
         if self._has_explicit_reasoning_chat_template_kwargs():
             return request_chat_template_kwargs
 
-        if self.reasoning_effort == "none":
+        effective_reasoning_effort, _ = self._resolve_reasoning_effort()
+        if effective_reasoning_effort == "none":
             request_chat_template_kwargs.setdefault("enable_thinking", False)
-        elif self.reasoning_effort == "low":
+        elif effective_reasoning_effort == "low":
             request_chat_template_kwargs.setdefault("enable_thinking", True)
             request_chat_template_kwargs.setdefault("low_effort", True)
-        elif self.reasoning_effort in ("medium", "high"):
+        elif effective_reasoning_effort in ("medium", "high"):
             request_chat_template_kwargs.setdefault("enable_thinking", True)
 
         return request_chat_template_kwargs
@@ -608,18 +663,29 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.structured_outputs is None:
             named_tool_schema = self._get_named_tool_schema()
             if named_tool_schema is not None:
-                self.structured_outputs = StructuredOutputsParams(json=named_tool_schema)
+                self.structured_outputs = StructuredOutputsParams(
+                    json=named_tool_schema,
+                    disable_any_whitespace=True,
+                )
             else:
                 required_tools_schema = self._get_required_tools_schema()
                 if required_tools_schema is not None:
                     self.structured_outputs = StructuredOutputsParams(
-                        json=required_tools_schema
+                        json=required_tools_schema,
+                        disable_any_whitespace=True,
                     )
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        resolved_chat_template_kwargs = self.get_resolved_chat_template_kwargs()
+        if resolved_chat_template_kwargs.get("enable_thinking", True):
+            # Reasoning-enabled requests are contract-sensitive. Under
+            # speculative decode, stream and non-stream can drift enough to
+            # break parity and token accounting expectations, so keep these
+            # requests on the non-speculative path.
+            extra_args["disable_spec_decode"] = True
         if self.tool_choice == "required" or isinstance(
             self.tool_choice, ChatCompletionNamedToolChoiceParam
         ):
@@ -627,10 +693,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # not use speculative decode. Grammar/tool correctness matters
             # more than speculative throughput for these requests.
             extra_args["disable_spec_decode"] = True
-        output_kind = RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+        output_kind = (
+            RequestOutputKind.DELTA
+            if self.stream
+            else RequestOutputKind.FINAL_ONLY
+        )
         if self.stream and (
             self.tool_choice == "required"
             or isinstance(self.tool_choice, ChatCompletionNamedToolChoiceParam)
+            or resolved_chat_template_kwargs.get("enable_thinking", True)
         ):
             output_kind = RequestOutputKind.FINAL_ONLY
 

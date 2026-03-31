@@ -9,11 +9,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
+    from vllm.sampling_params import StructuredOutputsParams
     from vllm.config import VllmConfig
     from vllm.tokenizers import TokenizerLike
 else:
     VllmConfig = object
     TokenizerLike = object
+    StructuredOutputsParams = object
 
 
 class StructuredOutputOptions(enum.Enum):
@@ -111,7 +113,10 @@ class StructuredOutputBackend(ABC):
 
     @abstractmethod
     def compile_grammar(
-        self, request_type: StructuredOutputOptions, grammar_spec: str
+        self,
+        request_type: StructuredOutputOptions,
+        grammar_spec: str,
+        params: "StructuredOutputsParams | None" = None,
     ) -> StructuredOutputGrammar:
         """
         Compiles a grammar specification into a structured output grammar.

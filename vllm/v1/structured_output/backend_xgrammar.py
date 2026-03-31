@@ -9,6 +9,7 @@ import torch
 
 import vllm.envs
 from vllm.logger import init_logger
+from vllm.sampling_params import StructuredOutputsParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.mistral import is_mistral_tokenizer
@@ -75,15 +76,21 @@ class XgrammarBackend(StructuredOutputBackend):
             )
 
     def compile_grammar(
-        self, request_type: StructuredOutputOptions, grammar_spec: str
+        self,
+        request_type: StructuredOutputOptions,
+        grammar_spec: str,
+        params: StructuredOutputsParams | None = None,
     ) -> StructuredOutputGrammar:
+        disable_any_whitespace = self.disable_any_whitespace
+        if params is not None and params.disable_any_whitespace:
+            disable_any_whitespace = True
         if request_type == StructuredOutputOptions.JSON:
             ctx = self.compiler.compile_json_schema(
-                grammar_spec, any_whitespace=not self.disable_any_whitespace
+                grammar_spec, any_whitespace=not disable_any_whitespace
             )
         elif request_type == StructuredOutputOptions.JSON_OBJECT:
             ctx = self.compiler.compile_json_schema(
-                '{"type": "object"}', any_whitespace=not self.disable_any_whitespace
+                '{"type": "object"}', any_whitespace=not disable_any_whitespace
             )
         elif request_type == StructuredOutputOptions.GRAMMAR:
             ctx = self.compiler.compile_grammar(grammar_spec)

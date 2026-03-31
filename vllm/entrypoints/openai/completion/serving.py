@@ -255,6 +255,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 request_metadata,
             )
         except asyncio.CancelledError:
+            self.record_aborted_request()
             return self.create_error_response("Client disconnected")
 
         # When user requests streaming but we don't stream, we still need to

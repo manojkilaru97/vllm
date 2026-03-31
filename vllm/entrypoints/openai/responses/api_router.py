@@ -18,6 +18,7 @@ from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import (
     load_aware_call,
+    MetricsStreamingResponse,
     with_cancellation,
 )
 from vllm.logger import init_logger
@@ -64,13 +65,18 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
     generator = await handler.create_responses(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
+        handler._log_error_response_payload(
+            raw_request,
+            generator,
+            handler.__class__.__name__,
+        )
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
     elif isinstance(generator, ResponsesResponse):
         return JSONResponse(content=generator.model_dump())
 
-    return StreamingResponse(
+    return MetricsStreamingResponse(
         content=_convert_stream_to_sse_events(generator), media_type="text/event-stream"
     )
 
@@ -94,12 +100,17 @@ async def retrieve_responses(
     )
 
     if isinstance(response, ErrorResponse):
+        handler._log_error_response_payload(
+            raw_request,
+            response,
+            handler.__class__.__name__,
+        )
         return JSONResponse(
             content=response.model_dump(), status_code=response.error.code
         )
     elif isinstance(response, ResponsesResponse):
         return JSONResponse(content=response.model_dump())
-    return StreamingResponse(
+    return MetricsStreamingResponse(
         content=_convert_stream_to_sse_events(response), media_type="text/event-stream"
     )
 
@@ -114,6 +125,11 @@ async def cancel_responses(response_id: str, raw_request: Request):
     response = await handler.cancel_responses(response_id)
 
     if isinstance(response, ErrorResponse):
+        handler._log_error_response_payload(
+            raw_request,
+            response,
+            handler.__class__.__name__,
+        )
         return JSONResponse(
             content=response.model_dump(), status_code=response.error.code
         )

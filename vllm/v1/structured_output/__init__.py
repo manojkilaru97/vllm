@@ -181,7 +181,11 @@ class StructuredOutputManager:
 
         assert self.backend is not None
         try:
-            return self.backend.compile_grammar(request_type, grammar_spec)
+            return self.backend.compile_grammar(
+                request_type,
+                grammar_spec,
+                request.structured_output_request.params,  # type: ignore[union-attr]
+            )
         except Exception:
             # Best-effort fallback: if xgrammar compilation fails, try guidance.
             # This keeps server stability and can recover from backend-specific
@@ -200,7 +204,9 @@ class StructuredOutputManager:
                         vocab_size=self.vllm_config.model_config.get_vocab_size(),
                     )
                     return guidance_backend.compile_grammar(
-                        request_type, grammar_spec
+                        request_type,
+                        grammar_spec,
+                        request.structured_output_request.params,  # type: ignore[union-attr]
                     )
                 except Exception:
                     logger.exception(

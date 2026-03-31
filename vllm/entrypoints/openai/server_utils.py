@@ -3,6 +3,8 @@
 import asyncio
 import hashlib
 import json
+import logging
+import os
 import secrets
 import uuid
 from argparse import Namespace
@@ -33,6 +35,59 @@ from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 logger = init_logger("vllm.entrypoints.openai.server_utils")
+payload_logger = logging.getLogger("vllm.payload")
+
+
+async def _log_error_request_response(
+    request: Request,
+    err: ErrorResponse,
+) -> None:
+    if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
+        return
+    try:
+        headers_obj = {k: v for k, v in request.headers.items()}
+    except Exception:
+        headers_obj = None
+    try:
+        raw_body = await request.body()
+        payload = json.loads(raw_body.decode("utf-8")) if raw_body else None
+    except Exception:
+        payload = None
+    rid = request.headers.get("X-Request-Id", "")
+    try:
+        payload_logger.info(
+            "openai.request",
+            extra={
+                "rid": rid,
+                "endpoint": "validation_exception_handler",
+                "payload": payload,
+                "payload_json": (
+                    json.dumps(payload, sort_keys=True, ensure_ascii=False)
+                    if payload is not None
+                    else None
+                ),
+                "headers": headers_obj,
+            },
+        )
+    except Exception:
+        pass
+    try:
+        response_payload = err.model_dump(mode="json", by_alias=True)
+        payload_logger.info(
+            "openai.response",
+            extra={
+                "rid": rid,
+                "endpoint": "validation_exception_handler",
+                "payload": response_payload,
+                "payload_json": json.dumps(
+                    response_payload,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ),
+            },
+        )
+    except Exception:
+        pass
 
 
 class AuthenticationMiddleware:
@@ -355,6 +410,7 @@ async def engine_error_handler(
         engine=req.app.state.engine_client,
     )
     err = create_error_response(exc)
+    await _log_error_request_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -366,6 +422,7 @@ async def generation_error_handler(req: Request, exc: GenerationError):
     server logs with stack traces.
     """
     err = create_error_response(exc)
+    await _log_error_request_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -379,15 +436,16 @@ async def exception_handler(req: Request, exc: Exception):
         )
 
     err = create_error_response(exc)
+    await _log_error_request_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
-async def http_exception_handler(req: Request, exc: HTTPException):
-    if req.app.state.args.log_error_stack:
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if request.app.state.args.log_error_stack:
         logger.exception(
             "HTTPException caught. Request id: %s",
-            req.state.request_metadata.request_id
-            if hasattr(req.state, "request_metadata")
+            request.state.request_metadata.request_id
+            if hasattr(request.state, "request_metadata")
             else None,
         )
     err = ErrorResponse(
@@ -397,18 +455,18 @@ async def http_exception_handler(req: Request, exc: HTTPException):
             code=exc.status_code,
         )
     )
+    await _log_error_request_response(request, err)
     return JSONResponse(err.model_dump(), status_code=exc.status_code)
 
 
-async def validation_exception_handler(req: Request, exc: RequestValidationError):
-    if req.app.state.args.log_error_stack:
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    if request.app.state.args.log_error_stack:
         logger.exception(
             "RequestValidationError caught. Request id: %s",
-            req.state.request_metadata.request_id
-            if hasattr(req.state, "request_metadata")
+            request.state.request_metadata.request_id
+            if hasattr(request.state, "request_metadata")
             else None,
         )
-
     param = None
     errors = exc.errors()
     for error in errors:
@@ -434,6 +492,7 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
             param=param,
         )
     )
+    await _log_error_request_response(request, err)
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 

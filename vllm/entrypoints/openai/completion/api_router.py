@@ -17,6 +17,7 @@ from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import (
     load_aware_call,
+    MetricsStreamingResponse,
     with_cancellation,
 )
 from vllm.logger import init_logger
@@ -54,6 +55,11 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     generator = await handler.create_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
+        handler._log_error_response_payload(
+            raw_request,
+            generator,
+            handler.__class__.__name__,
+        )
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
@@ -63,8 +69,40 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             headers=metrics_header(metrics_header_format),
         )
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    return MetricsStreamingResponse(content=generator, media_type="text/event-stream")
 
+@router.post(
+    "/v1/completions/render",
+    dependencies=[Depends(validate_json_request)],
+    response_model=list,
+    responses={
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def render_completion(request: CompletionRequest, raw_request: Request):
+    """render completion request and return engine prompts without generating."""
+    handler = completion(raw_request)
+    if handler is None:
+        base_server = raw_request.app.state.openai_serving_tokenization
+        return base_server.create_error_response(
+            message="The model does not support Completions API"
+        )
 
+    try:
+        result = await handler.render_completion_request(request)
+    except Exception as e:
+        result = handler.create_error_response(e)
+
+    if isinstance(result, ErrorResponse):
+        handler._log_error_response_payload(
+            raw_request,
+            result,
+            handler.__class__.__name__,
+        )
+        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+
+    return JSONResponse(content=result)
 def attach_router(app: FastAPI):
     app.include_router(router)

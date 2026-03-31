@@ -713,6 +713,10 @@ def get_otel_meter():
 
 
 def _sanitize_metric_name(name: str) -> str:
+    if name.startswith("vllm:"):
+        name = name[len("vllm:") :]
+    elif name.startswith("vllm_"):
+        name = name[len("vllm_") :]
     return name.replace(":", "_")
 
 
@@ -822,5 +826,4 @@ def start_prom_to_otel_bridge(scrape_url: str, interval_seconds: float = 10.0) -
 
     _PROM_BRIDGE_THREAD = threading.Thread(target=_run, name="vllm-prom-bridge", daemon=True)
     _PROM_BRIDGE_THREAD.start()
-
 

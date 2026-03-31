@@ -14,6 +14,7 @@ import regex as re
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask, BackgroundTasks
+from starlette.types import Receive
 
 from vllm import envs
 from vllm.engine.arg_utils import EngineArgs
@@ -51,6 +52,20 @@ async def listen_for_disconnect(request: Request) -> None:
             ) and hasattr(request.app.state, "server_load_metrics"):
                 request.app.state.server_load_metrics -= 1
             break
+
+
+class MetricsStreamingResponse(StreamingResponse):
+    async def listen_for_disconnect(self, receive: Receive) -> None:
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                try:
+                    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+
+                    OpenAIServing.record_aborted_request()
+                except Exception:
+                    pass
+                break
 
 
 def with_cancellation(handler_func):

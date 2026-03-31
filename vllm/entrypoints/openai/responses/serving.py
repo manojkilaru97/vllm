@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
+import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -39,6 +42,7 @@ from openai.types.responses.response_reasoning_item import (
 from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
 from pydantic import TypeAdapter
+from prometheus_client import REGISTRY, Counter
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -120,6 +124,27 @@ from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
+
+
+def _get_or_create_counter(name: str, doc: str) -> Counter:
+    try:
+        return Counter(name, doc)
+    except ValueError:
+        collector = REGISTRY._names_to_collectors.get(name)
+        if collector is None:
+            raise
+        return collector
+
+
+_RESPONSES_BILLING_REQUESTS_TOTAL = _get_or_create_counter(
+    "billing_requests_total",
+    "Total number of requests seen by billing priority handling.",
+)
+_RESPONSES_BILLING_HIGH_PRIORITY_REQUESTS_TOTAL = _get_or_create_counter(
+    "billing_high_priority_requests_total",
+    "Total number of high-priority requests seen by billing priority handling.",
+)
 
 
 def _extract_allowed_tools_from_mcp_requests(
@@ -162,6 +187,47 @@ def _extract_allowed_tools_from_mcp_requests(
 
 
 class OpenAIServingResponses(OpenAIServing):
+    BILLING_PRIORITY_HEADER: Final[str] = "X-BILLING-Request-Priority"
+    HIGH_BILLING_PRIORITY: Final[int] = -1000
+
+    def _resolve_request_priority(
+        self,
+        request_priority: int,
+        raw_request: Request | None,
+    ) -> int:
+        base_impl = getattr(super(), "_resolve_request_priority", None)
+        if callable(base_impl):
+            return base_impl(request_priority, raw_request)
+
+        if request_priority != 0:
+            raise VLLMValidationError(
+                "Request body field `priority` is not supported.",
+                parameter="priority",
+                value=request_priority,
+            )
+
+        if raw_request is None:
+            _RESPONSES_BILLING_REQUESTS_TOTAL.inc()
+            return 0
+
+        billing_priority = raw_request.headers.get(self.BILLING_PRIORITY_HEADER)
+        if billing_priority is None:
+            _RESPONSES_BILLING_REQUESTS_TOTAL.inc()
+            return 0
+
+        normalized = billing_priority.strip().lower()
+        if normalized == "high":
+            _RESPONSES_BILLING_REQUESTS_TOTAL.inc()
+            _RESPONSES_BILLING_HIGH_PRIORITY_REQUESTS_TOTAL.inc()
+            return self.HIGH_BILLING_PRIORITY
+
+        raise VLLMValidationError(
+            f"Unsupported value for `{self.BILLING_PRIORITY_HEADER}`. "
+            "Only `high` is supported.",
+            parameter=self.BILLING_PRIORITY_HEADER,
+            value=billing_priority,
+        )
+
     def __init__(
         self,
         engine_client: EngineClient,
@@ -349,6 +415,46 @@ class OpenAIServingResponses(OpenAIServing):
         # success status before we actually start generating text :).
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+
+        try:
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                headers_obj = None
+                try:
+                    if raw_request is not None:
+                        headers_obj = {k: v for k, v in raw_request.headers.items()}
+                except Exception:
+                    headers_obj = None
+                try:
+                    if raw_request is not None:
+                        req_dump = json.loads((await raw_request.body()).decode("utf-8"))
+                    else:
+                        req_dump = request.model_dump(
+                            mode="json",
+                            by_alias=True,
+                            exclude_unset=True,
+                        )
+                except Exception:
+                    req_dump = None
+                payload_logger.info(
+                    "openai.request",
+                    extra={
+                        "rid": request.request_id,
+                        "endpoint": self.__class__.__name__,
+                        "payload": req_dump,
+                        "payload_json": (
+                            json.dumps(
+                                req_dump,
+                                sort_keys=True,
+                                ensure_ascii=False,
+                            )
+                            if req_dump is not None
+                            else None
+                        ),
+                        "headers": headers_obj,
+                    },
+                )
+        except Exception:
+            pass
 
         if request.store and not self.enable_store:
             # Disable the store option.
@@ -585,7 +691,12 @@ class OpenAIServingResponses(OpenAIServing):
         request: ResponsesRequest,
         prev_response: ResponsesResponse | None,
     ):
-        tool_dicts = construct_tool_dicts(request.tools, request.tool_choice)
+        normalized_request = request.model_copy(
+            update={"tool_choice": request.get_normalized_tool_choice()}
+        )
+        tool_dicts = construct_tool_dicts(
+            normalized_request.tools, normalized_request.tool_choice
+        )
         # Construct the input messages.
         messages = construct_input_messages(
             request_instructions=request.instructions,
@@ -594,8 +705,8 @@ class OpenAIServingResponses(OpenAIServing):
             prev_response_output=prev_response.output if prev_response else None,
         )
 
-        _, engine_prompts = await self._preprocess_chat(
-            request,
+        _, engine_inputs = await self.openai_serving_render.preprocess_chat(
+            normalized_request,
             messages,
             default_template=self.chat_template,
             default_template_content_format=self.chat_template_content_format,
@@ -603,7 +714,111 @@ class OpenAIServingResponses(OpenAIServing):
             tool_dicts=tool_dicts,
             tool_parser=self.parser.tool_parser_cls if self.parser else None,
         )
-        return messages, engine_prompts
+        request.chat_template_kwargs = normalized_request.chat_template_kwargs
+        return messages, engine_inputs
+
+    async def _render_next_turn(
+        self,
+        request: ResponsesRequest,
+        messages: list[ResponseInputOutputItem],
+        tool_dicts: list[dict[str, Any]] | None,
+        tool_parser: type[ToolParser] | None,
+        chat_template: str | None,
+        chat_template_content_format: ChatTemplateContentFormatOption,
+    ):
+        new_messages = construct_input_messages(
+            request_input=messages,
+        )
+
+        _, engine_inputs = await self.openai_serving_render.preprocess_chat(
+            request,
+            new_messages,
+            default_template=chat_template,
+            default_template_content_format=chat_template_content_format,
+            default_template_kwargs=None,
+            tool_dicts=tool_dicts,
+            tool_parser=tool_parser,
+        )
+        return engine_inputs
+
+    async def _generate_with_builtin_tools(
+        self,
+        request_id: str,
+        engine_input: EngineInput,
+        sampling_params: SamplingParams,
+        context: ConversationContext,
+        lora_request: LoRARequest | None = None,
+        priority: int = 0,
+        trace_headers: Mapping[str, str] | None = None,
+    ):
+        max_model_len = self.model_config.max_model_len
+
+        orig_priority = priority
+        sub_request = 0
+        while True:
+            # Ensure that each sub-request has a unique request id.
+            sub_request_id = f"{request_id}_{sub_request}"
+
+            self._log_inputs(
+                sub_request_id,
+                engine_input,
+                params=sampling_params,
+                lora_request=lora_request,
+            )
+
+            generator = self.engine_client.generate(
+                engine_input,
+                sampling_params,
+                sub_request_id,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+            )
+
+            async for res in generator:
+                context.append_output(res)
+                # NOTE(woosuk): The stop condition is handled by the engine.
+                yield context
+
+            if not context.need_builtin_tool_call():
+                # The model did not ask for a tool call, so we're done.
+                break
+
+            # Call the tool and update the context with the result.
+            tool_output = await context.call_tool()
+            context.append_tool_output(tool_output)
+
+            # TODO: uncomment this and enable tool output streaming
+            # yield context
+
+            # Create inputs for the next turn.
+            # Render the next prompt token ids and update sampling_params.
+            if isinstance(context, (HarmonyContext, StreamingHarmonyContext)):
+                token_ids = context.render_for_completion()
+                engine_input = tokens_input(token_ids)
+
+                sampling_params.max_tokens = max_model_len - len(token_ids)
+            elif isinstance(context, ParsableContext):
+                (engine_input,) = await self._render_next_turn(
+                    context.request,
+                    context.parser.response_messages,
+                    context.tool_dicts,
+                    context.tool_parser_cls,
+                    context.chat_template,
+                    context.chat_template_content_format,
+                )
+
+                sampling_params.max_tokens = get_max_tokens(
+                    max_model_len,
+                    context.request.max_output_tokens,
+                    self._extract_prompt_len(engine_input),
+                    self.default_sampling_params,  # type: ignore
+                    self.override_max_tokens,  # type: ignore
+                )
+
+            # OPTIMIZATION
+            priority = orig_priority - 1
+            sub_request += 1
 
     def _make_request_with_harmony(
         self,
@@ -661,6 +876,7 @@ class OpenAIServingResponses(OpenAIServing):
                 async for _ in result_generator:
                     pass
             except asyncio.CancelledError:
+                self.record_aborted_request()
                 return self.create_error_response("Client disconnected")
 
         # NOTE: Implementation of status is still WIP, but for now
@@ -780,6 +996,25 @@ class OpenAIServingResponses(OpenAIServing):
             usage=usage,
         )
 
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            try:
+                response_dump = response.model_dump(mode="json", by_alias=True)
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": request.request_id,
+                        "endpoint": self.__class__.__name__,
+                        "payload": response_dump,
+                        "payload_json": json.dumps(
+                            response_dump,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+
         if request.store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
@@ -884,6 +1119,18 @@ class OpenAIServingResponses(OpenAIServing):
         final_output: CompletionOutput,
         tokenizer: TokenizerLike,
     ) -> list[ResponseOutputItem]:
+        def _get_named_tool_name() -> str | None:
+            normalized = request.get_normalized_tool_choice()
+            if not isinstance(normalized, dict):
+                return None
+            if normalized.get("type") != "function":
+                return None
+            function = normalized.get("function")
+            if not isinstance(function, dict):
+                return None
+            name = function.get("name")
+            return name if isinstance(name, str) else None
+
         reasoning = None
         content = final_output.text
         if self.parser and self.parser.reasoning_parser_cls is not None:
@@ -930,13 +1177,55 @@ class OpenAIServingResponses(OpenAIServing):
         # Use parser to extract and create response output items
         if self.parser:
             parser = self.parser(tokenizer)
-            return parser.extract_response_outputs(
+            response_items = parser.extract_response_outputs(
                 model_output=final_output.text,
-                request=request,
+                request=request.model_copy(
+                    update={"tool_choice": request.get_normalized_tool_choice()}
+                ),
+                model_output_token_ids=final_output.token_ids,
                 enable_auto_tools=self.enable_auto_tools,
                 tool_call_id_type=self.tool_call_id_type,
                 logprobs=logprobs,
             )
+            named_tool_name = _get_named_tool_name()
+            if named_tool_name is not None:
+                converted_items: list[ResponseOutputItem] = []
+                converted = False
+                for item in response_items:
+                    if (
+                        not converted
+                        and isinstance(item, ResponseOutputMessage)
+                        and item.role == "assistant"
+                    ):
+                        text_parts = [
+                            part.text
+                            for part in item.content
+                            if isinstance(part, ResponseOutputText) and part.text
+                        ]
+                        candidate = "".join(text_parts).strip()
+                        if candidate:
+                            try:
+                                parsed = json.loads(candidate)
+                            except json.JSONDecodeError:
+                                pass
+                            else:
+                                converted_items.append(
+                                    ResponseFunctionToolCall(
+                                        arguments=json.dumps(
+                                            parsed, ensure_ascii=False
+                                        ),
+                                        call_id=f"chatcmpl-tool-{random_uuid()}",
+                                        name=named_tool_name,
+                                        type="function_call",
+                                        id=f"fc_{random_uuid()}",
+                                        status="completed",
+                                    )
+                                )
+                                converted = True
+                                continue
+                    converted_items.append(item)
+                response_items = converted_items
+            return response_items
 
         # Fallback when no parser is configured
         return [
@@ -1904,7 +2193,7 @@ class OpenAIServingResponses(OpenAIServing):
                 output=[],
                 status="in_progress",
                 usage=None,
-            ).model_dump()
+            ).model_dump(mode="json", by_alias=True)
             yield _increment_sequence_number_and_return(
                 ResponseCreatedEvent(
                     type="response.created",

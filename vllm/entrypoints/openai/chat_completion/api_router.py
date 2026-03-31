@@ -17,6 +17,7 @@ from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import (
     load_aware_call,
+    MetricsStreamingResponse,
     with_cancellation,
 )
 from vllm.logger import init_logger
@@ -55,6 +56,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
+        handler._log_error_response_payload(
+            raw_request,
+            generator,
+            handler.__class__.__name__,
+        )
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
@@ -65,8 +71,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             headers=metrics_header(metrics_header_format),
         )
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
-
+    return MetricsStreamingResponse(content=generator, media_type="text/event-stream")
 
 def attach_router(app: FastAPI):
     app.include_router(router)

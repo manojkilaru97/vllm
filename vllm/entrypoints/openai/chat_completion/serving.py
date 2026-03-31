@@ -490,6 +490,24 @@ class OpenAIServingChat(OpenAIServing):
         )
         tokenizer = self.renderer.tokenizer
 
+        resolved_chat_template_kwargs = request.get_resolved_chat_template_kwargs()
+        use_full_response_stream_fallback = request.stream and (
+            request.tool_choice == "required"
+            or isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+            or resolved_chat_template_kwargs.get("enable_thinking", True)
+        )
+        full_request = (
+            request.model_copy(
+                update={
+                    "stream": False,
+                    "stream_options": None,
+                }
+            )
+            if use_full_response_stream_fallback
+            else None
+        )
+        engine_request = full_request or request
+
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -504,29 +522,27 @@ class OpenAIServingChat(OpenAIServing):
 
             max_tokens = get_max_tokens(
                 max_model_len,
-                request.max_completion_tokens
-                if request.max_completion_tokens is not None
-                else request.max_tokens,
+                engine_request.max_completion_tokens
+                if engine_request.max_completion_tokens is not None
+                else engine_request.max_tokens,
                 self._extract_prompt_len(engine_prompt),
                 self.default_sampling_params,
                 self.override_max_tokens,
             )
 
             sampling_params: SamplingParams | BeamSearchParams
-            if request.use_beam_search:
-                sampling_params = request.to_beam_search_params(
+            if engine_request.use_beam_search:
+                sampling_params = engine_request.to_beam_search_params(
                     max_tokens, self.default_sampling_params
                 )
             else:
-                sampling_params = request.to_sampling_params(
+                sampling_params = engine_request.to_sampling_params(
                     max_tokens,
                     self.default_sampling_params,
                 )
-
-            if not request.use_beam_search:
                 self._inject_think_end_token_id(
                     sampling_params=sampling_params,
-                    request=request,
+                    request=engine_request,
                     tokenizer=tokenizer,
                     reasoning_parser=reasoning_parser,
                 )
@@ -575,13 +591,11 @@ class OpenAIServingChat(OpenAIServing):
         assert len(generators) == 1
         (result_generator,) = generators
 
-        if request.stream and (
-            request.tool_choice == "required"
-            or isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
-        ):
+        if use_full_response_stream_fallback:
+            assert full_request is not None
             try:
                 full_response = await self.chat_completion_full_generator(
-                    request,
+                    full_request,
                     result_generator,
                     request_id,
                     model_name,
@@ -2607,6 +2621,7 @@ class OpenAIServingChat(OpenAIServing):
             async for res in result_generator:
                 final_res = res
         except asyncio.CancelledError:
+            self.record_aborted_request()
             return self.create_error_response("Client disconnected")
 
         if final_res is None:
