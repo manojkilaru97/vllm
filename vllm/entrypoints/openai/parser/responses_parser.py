@@ -102,6 +102,13 @@ class ResponsesParser:
                 if content and content.strip() == "":
                     content = None
 
+        if (
+            not content
+            and not function_calls
+            and reasoning_content
+        ):
+            content = reasoning_content
+
         if content:
             self.response_messages.append(
                 ResponseOutputMessage(

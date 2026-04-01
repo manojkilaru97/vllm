@@ -385,6 +385,7 @@ class ResponsesRequest(OpenAIBaseModel):
         chat_template_kwargs: dict[str, Any] = {}
         if reasoning_effort == "none":
             chat_template_kwargs["enable_thinking"] = False
+            chat_template_kwargs["force_nonempty_content"] = True
         elif reasoning_effort == "low":
             chat_template_kwargs["enable_thinking"] = True
             chat_template_kwargs["low_effort"] = True
@@ -625,6 +626,43 @@ class ResponsesRequest(OpenAIBaseModel):
                 processed_input.append(item)
 
         data["input"] = processed_input
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_function_tools(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        tools = data.get("tools")
+        if not isinstance(tools, list):
+            return data
+
+        normalized_tools: list[Any] = []
+        changed = False
+        for tool in tools:
+            if (
+                isinstance(tool, dict)
+                and tool.get("type") == "function"
+                and isinstance(tool.get("function"), dict)
+                and "name" not in tool
+            ):
+                fn = dict(tool["function"])
+                normalized_tools.append(
+                    {
+                        "type": "function",
+                        "name": fn.get("name"),
+                        "description": fn.get("description"),
+                        "parameters": fn.get("parameters"),
+                        "strict": fn.get("strict"),
+                    }
+                )
+                changed = True
+            else:
+                normalized_tools.append(tool)
+
+        if changed:
+            data["tools"] = normalized_tools
         return data
 
 

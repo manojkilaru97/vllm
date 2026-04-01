@@ -2732,6 +2732,8 @@ class OpenAIServingChat(OpenAIServing):
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
             )
+            if not content and reasoning and not tool_calls:
+                content = reasoning
             tool_call_class = (
                 MistralToolCall if is_mistral_tokenizer(tokenizer) else ToolCall
             )
