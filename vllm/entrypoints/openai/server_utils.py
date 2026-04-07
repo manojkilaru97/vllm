@@ -41,6 +41,8 @@ payload_logger = logging.getLogger("vllm.payload")
 async def _log_error_request_response(
     request: Request,
     err: ErrorResponse,
+    *,
+    request_payload_override: object | None = None,
 ) -> None:
     if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
         return
@@ -48,29 +50,46 @@ async def _log_error_request_response(
         headers_obj = {k: v for k, v in request.headers.items()}
     except Exception:
         headers_obj = None
-    try:
-        raw_body = await request.body()
-        payload = json.loads(raw_body.decode("utf-8")) if raw_body else None
-    except Exception:
-        payload = None
+    if request_payload_override is not None:
+        if isinstance(request_payload_override, (dict, list)):
+            payload = request_payload_override
+        elif isinstance(request_payload_override, bytes):
+            try:
+                payload = json.loads(request_payload_override.decode("utf-8"))
+            except Exception:
+                payload = None
+        elif isinstance(request_payload_override, str):
+            try:
+                payload = json.loads(request_payload_override)
+            except Exception:
+                payload = None
+        else:
+            payload = None
+    else:
+        try:
+            raw_body = await request.body()
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else None
+        except Exception:
+            payload = None
     rid = request.headers.get("X-Request-Id", "")
-    try:
-        payload_logger.info(
-            "openai.request",
-            extra={
-                "rid": rid,
-                "endpoint": "validation_exception_handler",
-                "payload": payload,
-                "payload_json": (
-                    json.dumps(payload, sort_keys=True, ensure_ascii=False)
-                    if payload is not None
-                    else None
-                ),
-                "headers": headers_obj,
-            },
-        )
-    except Exception:
-        pass
+    if payload is not None:
+        try:
+            payload_logger.info(
+                "openai.request",
+                extra={
+                    "rid": rid,
+                    "endpoint": "validation_exception_handler",
+                    "payload": payload,
+                    "payload_json": json.dumps(
+                        payload,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ),
+                    "headers": headers_obj,
+                },
+            )
+        except Exception:
+            pass
     try:
         response_payload = err.model_dump(mode="json", by_alias=True)
         payload_logger.info(
@@ -492,7 +511,23 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             param=param,
         )
     )
-    await _log_error_request_response(request, err)
+    request_payload = exc.body
+    if isinstance(request_payload, pydantic.BaseModel):
+        request_payload = request_payload.model_dump(mode="json", by_alias=True)
+    if request_payload is None:
+        for error in errors:
+            candidate = error.get("input")
+            if isinstance(candidate, pydantic.BaseModel):
+                request_payload = candidate.model_dump(mode="json", by_alias=True)
+                break
+            if isinstance(candidate, (dict, list, str, bytes)):
+                request_payload = candidate
+                break
+    await _log_error_request_response(
+        request,
+        err,
+        request_payload_override=request_payload,
+    )
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 

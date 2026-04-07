@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any, ClassVar, Generic, Protocol, TypeAlias, TypeVar
+from typing import Any, Callable, ClassVar, Generic, Protocol, Sequence, TypeAlias, TypeVar
 
 import numpy as np
 from prometheus_client import Counter
@@ -97,6 +97,7 @@ from vllm.inputs.data import (
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.processing import ProcessorInputs
 from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
