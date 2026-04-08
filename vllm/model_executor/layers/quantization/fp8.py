@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -156,6 +157,43 @@ class Fp8Config(QuantizationConfig):
         if self.ignored_layers is not None:
             self.ignored_layers = hf_to_vllm_mapper.apply_list(self.ignored_layers)
 
+    def is_layer_excluded(self, prefix: str) -> bool:
+        """Honor wildcard-style ignored layers in HF FP8 checkpoints.
+
+        Some FP8 checkpoints, including ModelOpt-derived exports converted to HF
+        layout, populate ``modules_to_not_convert`` with wildcard patterns such
+        as ``model.visual*`` or ``...self_attn*``. The generic FP8 path only
+        performed exact matching before, which causes vLLM to quantize layers
+        the checkpoint explicitly meant to keep in BF16.
+        """
+        if not self.ignored_layers:
+            return False
+
+        if is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.ignored_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return True
+
+        for ignored in self.ignored_layers:
+            if fnmatch(prefix, ignored):
+                return True
+            if prefix.startswith("language_model.") and fnmatch(
+                prefix.removeprefix("language_model."), ignored
+            ):
+                return True
+            if ignored != prefix and (
+                ignored in prefix
+                or (
+                    prefix.startswith("language_model.")
+                    and ignored in prefix.removeprefix("language_model.")
+                )
+            ):
+                return True
+
+        return False
+
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "Fp8Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
@@ -178,11 +216,7 @@ class Fp8Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-            ):
+            if self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             if not self.is_checkpoint_fp8_serialized:
                 online_method = Fp8OnlineLinearMethod(self)
@@ -193,11 +227,7 @@ class Fp8Config(QuantizationConfig):
                 offline_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
                 return offline_method
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-            ):
+            if self.is_layer_excluded(prefix):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.is_checkpoint_fp8_serialized:
                 moe_quant_method = Fp8MoEMethod(self, layer)

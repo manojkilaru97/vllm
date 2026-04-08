@@ -110,6 +110,22 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _vision_quant_config_or_none(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Keep Qwen3.5 vision BF16 when checkpoint metadata excludes it."""
+    if quant_config is None:
+        return None
+
+    ignored_layers = getattr(quant_config, "ignored_layers", None) or []
+    for pattern in ignored_layers:
+        if pattern in {"visual", "vision_model"}:
+            return None
+        if pattern.startswith("model.visual") or pattern.startswith("visual."):
+            return None
+    return quant_config
+
+
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
@@ -364,6 +380,12 @@ class Qwen3_5Model(Qwen3NextModel):
         shard_id: str,
         num_experts: int,
     ) -> bool:
+        if name not in params_dict and name.endswith("_weight_scale_inv"):
+            # ModelOpt FP8 MoE experts use *_weight_scale while the generic FP8
+            # path expects *_weight_scale_inv.
+            modelopt_name = name.removesuffix("_inv")
+            if modelopt_name in params_dict:
+                name = modelopt_name
         param = params_dict[name]
         weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
         loaded_local_expert = False
@@ -670,6 +692,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         nn.Module.__init__(self)
         config: Qwen3_5Config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        vision_quant_config = _vision_quant_config_or_none(quant_config)
         multimodal_config = vllm_config.model_config.multimodal_config
 
         self.config = config
@@ -682,7 +705,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             self.visual = Qwen3_VisionTransformer(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
+                quant_config=vision_quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
@@ -880,6 +903,7 @@ class Qwen3_5MoeForConditionalGeneration(
         nn.Module.__init__(self)
         config: Qwen3_5MoeConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        vision_quant_config = _vision_quant_config_or_none(quant_config)
         multimodal_config = vllm_config.model_config.multimodal_config
 
         self.config = config
@@ -892,7 +916,7 @@ class Qwen3_5MoeForConditionalGeneration(
             self.visual = Qwen3_VisionTransformer(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
+                quant_config=vision_quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
