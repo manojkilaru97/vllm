@@ -68,24 +68,29 @@ class StructuredOutputRequest:
 
 
 def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutputKey:
+    suffix = (
+        params.disable_any_whitespace,
+        params.disable_additional_properties,
+        params.whitespace_pattern,
+    )
     if params.json is not None:
         if not isinstance(params.json, str):
             json_str = json.dumps(params.json)
         else:
             json_str = params.json
-        return StructuredOutputOptions.JSON, json_str
+        return StructuredOutputOptions.JSON, json_str, *suffix
     if params.json_object:
-        return StructuredOutputOptions.JSON_OBJECT, ""
+        return StructuredOutputOptions.JSON_OBJECT, "", *suffix
     if params.regex is not None:
-        return StructuredOutputOptions.REGEX, params.regex
+        return StructuredOutputOptions.REGEX, params.regex, *suffix
     if params.choice is not None:
         if not isinstance(params.choice, str):
             json_str = json.dumps(params.choice)
         else:
             json_str = params.choice
-        return StructuredOutputOptions.CHOICE, json_str
+        return StructuredOutputOptions.CHOICE, json_str, *suffix
     if params.grammar is not None:
-        return StructuredOutputOptions.GRAMMAR, params.grammar
+        return StructuredOutputOptions.GRAMMAR, params.grammar, *suffix
     if params.structural_tag is not None:
-        return StructuredOutputOptions.STRUCTURAL_TAG, params.structural_tag
+        return StructuredOutputOptions.STRUCTURAL_TAG, params.structural_tag, *suffix
     raise ValueError("No valid structured output parameter found")

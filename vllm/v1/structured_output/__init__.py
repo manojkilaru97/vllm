@@ -15,6 +15,7 @@ from vllm.v1.structured_output.backend_guidance import GuidanceBackend
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
+    StructuredOutputOptions,
 )
 from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
 
@@ -37,6 +38,8 @@ class StructuredOutputManager:
 
     def __init__(self, vllm_config: VllmConfig):
         self.backend: StructuredOutputBackend | None = None
+        self.backend_name: str | None = None
+        self.backends: dict[str, StructuredOutputBackend] = {}
         self.reasoner: ReasoningParser | None = None
         self.vllm_config = vllm_config
 
@@ -93,6 +96,72 @@ class StructuredOutputManager:
             self.vllm_config.structured_outputs_config.enable_in_reasoning
         )
 
+    def _create_backend(self, backend: str) -> StructuredOutputBackend:
+        vocab_size = self.vllm_config.model_config.get_vocab_size()
+        if backend == "xgrammar":
+            return XgrammarBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        if backend == "guidance":
+            return GuidanceBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        if backend == "outlines":
+            from vllm.v1.structured_output.backend_outlines import OutlinesBackend
+
+            return OutlinesBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        if backend == "lm-format-enforcer":
+            from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
+                LMFormatEnforcerBackend,
+            )
+
+            return LMFormatEnforcerBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        raise ValueError(f"Unsupported structured output backend: {backend}")
+
+    @staticmethod
+    def _uses_structural_tag(request: "Request") -> bool:
+        structured_req = request.structured_output_request
+        if structured_req is None:
+            return False
+        key = structured_req.structured_output_key
+        return bool(key and key[0] == StructuredOutputOptions.STRUCTURAL_TAG)
+
+    def _get_backend_for_request(self, request: "Request") -> StructuredOutputBackend:
+        assert request.sampling_params is not None
+        assert request.sampling_params.structured_outputs is not None
+
+        backend = request.sampling_params.structured_outputs._backend
+        if backend is None:
+            raise ValueError("Structured output backend was not resolved")
+
+        backend_instance = self.backends.get(backend)
+        if backend_instance is None:
+            if self.backend is not None and not self.backends:
+                # Backward compatibility for tests that inject a single mock
+                # backend directly on the manager without populating backends.
+                backend_instance = self.backend
+            else:
+                backend_instance = self._create_backend(backend)
+            self.backends[backend] = backend_instance
+
+        # Keep legacy attributes aligned for tests/debugging, but do not treat
+        # them as the sole source of truth; multiple backends may coexist.
+        self.backend = backend_instance
+        self.backend_name = backend
+        return backend_instance
+
     def grammar_init(self, request: "Request") -> None:
         if request.structured_output_request is None:
             return
@@ -103,47 +172,10 @@ class StructuredOutputManager:
                 and request.sampling_params.structured_outputs is not None
             )
 
-        # Initialize the backend the first time it is needed.
-        #
-        # NOTE: We only support a single backend. We do NOT support different
-        # backends on a per-request basis in V1 (for now, anyway...).
-        # _backend is set in Processor._validate_structured_output
-        if self.backend is None:
-            assert request.sampling_params is not None
-            backend = request.sampling_params.structured_outputs._backend
-            vocab_size = self.vllm_config.model_config.get_vocab_size()
-            if backend == "xgrammar":
-                self.backend = XgrammarBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "guidance":
-                self.backend = GuidanceBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "outlines":
-                from vllm.v1.structured_output.backend_outlines import OutlinesBackend
-
-                self.backend = OutlinesBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "lm-format-enforcer":
-                from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
-                    LMFormatEnforcerBackend,
-                )
-
-                self.backend = LMFormatEnforcerBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            else:
-                raise ValueError(f"Unsupported structured output backend: {backend}")
+        # Requests can legitimately mix backends (for example regex/json via
+        # LMFE and explicit grammars via xgrammar) within the same engine
+        # lifetime, including concurrently. Cache backend instances by name.
+        self._get_backend_for_request(request)
 
         if self._use_async_grammar_compilation:
             grammar = self.executor.submit(self._create_grammar, request)
@@ -159,10 +191,22 @@ class StructuredOutputManager:
         #
         # TODO: we still need to handle xgrammar compilation failures,
         # though it should be unlikely as we test that up front as well.
-        request_type, grammar_spec = key
+        request_type, grammar_spec, _, _, _ = key
 
-        assert self.backend is not None
-        return self.backend.compile_grammar(request_type, grammar_spec)
+        backend = self._get_backend_for_request(request)
+        so_params = request.sampling_params.structured_outputs
+        return backend.compile_grammar(
+            request_type,
+            grammar_spec,
+            disable_any_whitespace=(
+                None if so_params is None else so_params.disable_any_whitespace
+            ),
+            disable_additional_properties=(
+                None
+                if so_params is None
+                else so_params.disable_additional_properties
+            ),
+        )
 
     def _fill_bitmasks(
         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]
@@ -199,13 +243,16 @@ class StructuredOutputManager:
             )
 
         if self._grammar_bitmask is None:
-            assert self.backend is not None
             max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
+            bitmask_backend = (
+                next(iter(self.backends.values()), None) or self.backend
+            )
+            assert bitmask_backend is not None
 
             # Allocate a bitmask for each token needing to be checked:
             # one for each speculative position, and one more for the
             # bonus token / non-speculative token.
-            self._grammar_bitmask = self.backend.allocate_token_bitmask(
+            self._grammar_bitmask = bitmask_backend.allocate_token_bitmask(
                 max_batch_size * (1 + max_num_spec_tokens)
             )
 
@@ -281,6 +328,9 @@ class StructuredOutputManager:
         return bitmask_tensor.numpy()
 
     def should_fill_bitmask(self, request: "Request") -> bool:
+        if self._uses_structural_tag(request):
+            return True
+
         # NOTE (Hanchen) if enable_in_reasoning is True, it means that
         # the model needs to be constrained in reasoning. So we should always
         # enable the bitmask filling.
@@ -302,6 +352,9 @@ class StructuredOutputManager:
     def should_advance(self, request: "Request") -> bool:
         if not request.use_structured_output:
             return False
+
+        if self._uses_structural_tag(request):
+            return True
 
         # To determine whether we can advance the FSM.
         # Supports thinking usage where we skip the reasoning components.
@@ -337,5 +390,11 @@ class StructuredOutputManager:
         return False
 
     def clear_backend(self) -> None:
-        if self.backend is not None:
+        for backend in self.backends.values():
+            backend.destroy()
+        if self.backend is not None and not self.backends:
             self.backend.destroy()
+        self.backends = {}
+        self.backend = None
+        self.backend_name = None
+        self._grammar_bitmask = None

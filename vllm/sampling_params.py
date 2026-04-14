@@ -745,6 +745,8 @@ class SamplingParams(
                     f"was initialised with '{backend}'. This error can be "
                     "resolved by removing '_backend' from the request."
                 )
+            if backend == "auto" and self.structured_outputs._backend_was_auto:
+                backend = _backend
         else:
             self.structured_outputs._backend = backend
 

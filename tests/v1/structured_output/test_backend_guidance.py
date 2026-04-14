@@ -13,7 +13,11 @@ from vllm.config.speculative import SpeculativeConfig
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.structured_output.backend_guidance import GuidanceBackend
+from vllm.v1.structured_output import backend_guidance as backend_guidance_module
+from vllm.v1.structured_output.backend_guidance import (
+    GuidanceBackend,
+    validate_guidance_grammar,
+)
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 
 TOKENIZER = "gpt2"
@@ -64,6 +68,43 @@ def test_backend_guidance_rollback_terminated():
     assert grammar.is_terminated()
     grammar.rollback(-1)
     assert grammar.is_terminated()
+
+
+def test_validate_guidance_grammar_accepts_extended_structured_output_key(monkeypatch):
+    sampling_params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(
+            grammar='root ::= "yes" | "no"',
+            disable_any_whitespace=True,
+            disable_additional_properties=True,
+        ),
+    )
+    calls = {}
+
+    def fake_serialize(request_type, grammar_spec, **kwargs):
+        calls["request_type"] = request_type
+        calls["grammar_spec"] = grammar_spec
+        calls["kwargs"] = kwargs
+        return "serialized"
+
+    monkeypatch.setattr(
+        backend_guidance_module,
+        "serialize_guidance_grammar",
+        fake_serialize,
+    )
+    monkeypatch.setattr(
+        backend_guidance_module.llguidance.LLMatcher,
+        "validate_grammar",
+        staticmethod(lambda grammar, tokenizer: None),
+    )
+
+    validate_guidance_grammar(sampling_params, tokenizer=None)
+
+    assert calls["request_type"] == StructuredOutputOptions.GRAMMAR
+    assert calls["grammar_spec"] == 'root ::= "yes" | "no"'
+    assert calls["kwargs"] == {
+        "disable_any_whitespace": True,
+        "disable_additional_properties": True,
+    }
 
 
 def test_grammar_bitmask_with_specdec():

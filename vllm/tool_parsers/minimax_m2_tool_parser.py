@@ -103,6 +103,13 @@ class MinimaxM2ToolParser(ToolParser):
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
 
+    def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+        request = super().adjust_request(request)
+        if request.tools and request.tool_choice != "none":
+            # Preserve MiniMax reasoning/tool special tokens in decoded output.
+            request.skip_special_tokens = False
+        return request
+
     def _reset_streaming_state(self):
         """Reset all streaming state."""
         self.current_tool_index = 0
@@ -224,6 +231,55 @@ class MinimaxM2ToolParser(ToolParser):
         # Normalize types
         normalized_types = [t.lower() for t in param_types]
 
+        def _parse_expected_json_container(raw: str, expected_kind: str) -> Any | None:
+            stripped = raw.strip()
+            candidates: list[str] = [stripped]
+
+            if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in (
+                '"',
+                "'",
+            ):
+                candidates.append(stripped[1:-1].strip())
+
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            else:
+                if expected_kind == "object" and isinstance(parsed, dict):
+                    return parsed
+                if expected_kind == "array" and isinstance(parsed, list):
+                    return parsed
+                if isinstance(parsed, str):
+                    candidates.append(parsed.strip())
+
+            seen: set[str] = set()
+            for candidate in list(candidates):
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                unescaped = (
+                    candidate.replace('\\"', '"')
+                    .replace("\\'", "'")
+                    .replace("\\n", "\n")
+                )
+                if unescaped not in seen:
+                    candidates.append(unescaped)
+
+            for candidate in candidates:
+                if candidate[:1] not in ("{", "[") or candidate[-1:] not in ("}", "]"):
+                    continue
+                try:
+                    parsed = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                if expected_kind == "object" and isinstance(parsed, dict):
+                    return parsed
+                if expected_kind == "array" and isinstance(parsed, list):
+                    return parsed
+
+            return None
+
         # Try each type in order of preference (most specific first, string as fallback)
         # Priority: integer > number > boolean > object > array > string
         type_priority = [
@@ -265,10 +321,9 @@ class MinimaxM2ToolParser(ToolParser):
                     return False
                 continue
             elif param_type in ["object", "array"]:
-                try:
-                    return json.loads(value)
-                except json.JSONDecodeError:
-                    continue
+                parsed = _parse_expected_json_container(value, param_type)
+                if parsed is not None:
+                    return parsed
 
         # Fallback: try JSON parse, then return as string
         try:

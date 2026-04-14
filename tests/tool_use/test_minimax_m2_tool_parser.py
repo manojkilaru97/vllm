@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -117,3 +118,87 @@ def test_streaming_minimax_m2_multiple_invokes(minimax_m2_tool_parser):
         expected_call = json.dumps(expected_call)
         actual_call = parser.streamed_args_for_tool[index]
         assert expected_call == actual_call
+
+
+def test_convert_param_value_unwraps_nested_json_string(minimax_m2_tool_parser):
+    parser = minimax_m2_tool_parser
+
+    converted = parser._convert_param_value_with_types(
+        '"{\\"city\\": \\"Paris\\"}"',
+        ["object", "string"],
+    )
+
+    assert converted == {"city": "Paris"}
+
+
+def test_convert_param_value_unwraps_escaped_json_object(minimax_m2_tool_parser):
+    parser = minimax_m2_tool_parser
+
+    converted = parser._convert_param_value_with_types(
+        '{\\"city\\": \\"Paris\\"}',
+        ["object", "string"],
+    )
+
+    assert converted == {"city": "Paris"}
+
+
+def test_streaming_minimax_m2_anyof_object_param(minimax_m2_tool_parser):
+    parser = minimax_m2_tool_parser
+    parser._reset_streaming_state()
+
+    request = SimpleNamespace(
+        tools=[
+            SimpleNamespace(
+                function=SimpleNamespace(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "required": ["location"],
+                        "properties": {
+                            "location": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {"city": {"type": "string"}},
+                                        "required": ["city"],
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "lat": {"type": "number"},
+                                            "lon": {"type": "number"},
+                                        },
+                                        "required": ["lat", "lon"],
+                                    },
+                                ]
+                            }
+                        },
+                    },
+                )
+            )
+        ]
+    )
+
+    chunks = [
+        "<minimax:tool_call>",
+        '<invoke name="get_weather">',
+        '<parameter name="location">',
+        '{\\"city\\": \\"Paris\\"}</parameter>',
+        "</invoke></minimax:tool_call>",
+    ]
+    previous = ""
+    for chunk in chunks:
+        current = previous + chunk
+        parser.extract_tool_calls_streaming(
+            previous_text=previous,
+            current_text=current,
+            delta_text=chunk,
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+            request=request,
+        )
+        previous = current
+
+    assert len(parser.prev_tool_call_arr) == 1
+    assert parser.prev_tool_call_arr[0]["arguments"]["location"] == {"city": "Paris"}

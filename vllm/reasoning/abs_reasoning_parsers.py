@@ -44,6 +44,11 @@ class ReasoningParser:
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         self.model_tokenizer = tokenizer
 
+    @property
+    def supports_prompt_reasoning_end_check(self) -> bool:
+        """Whether prompt-side token checks can safely infer reasoning end."""
+        return True
+
     @cached_property
     def vocab(self) -> dict[str, int]:
         # NOTE: Only PreTrainedTokenizerFast is guaranteed to have .vocab

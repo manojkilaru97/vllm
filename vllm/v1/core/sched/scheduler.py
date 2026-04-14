@@ -563,7 +563,10 @@ class Scheduler(SchedulerInterface):
                 # for FSM compilation.
                 if request.status == RequestStatus.WAITING_FOR_FSM:
                     structured_output_req = request.structured_output_request
-                    if structured_output_req and structured_output_req.grammar:
+                    if (
+                        structured_output_req is not None
+                        and structured_output_req.is_grammar_ready
+                    ):
                         request.status = RequestStatus.WAITING
                     else:
                         self.waiting.pop_request()

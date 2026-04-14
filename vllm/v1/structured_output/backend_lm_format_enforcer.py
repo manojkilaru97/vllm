@@ -43,6 +43,31 @@ class LMFormatEnforcerGrammar(StructuredOutputGrammar):
     token_enforcer: lmformatenforcer.TokenEnforcer
     current_tokens_prefix: list[int] = field(default_factory=list)
 
+    def _current_state_parser(self):
+        # Populate/cache the current prefix state before reading parser metadata.
+        self.token_enforcer.get_allowed_tokens(self.current_tokens_prefix)
+        state = self.token_enforcer.prefix_states.get(tuple(self.current_tokens_prefix))
+        return None if state is None else state.parser
+
+    def _parser_can_end(self) -> bool:
+        parser = self._current_state_parser()
+        return bool(parser is not None and parser.can_end())
+
+    def _fill_eos_only_bitmask(
+        self, bitmask: torch.Tensor, batch_index: int
+    ) -> None:
+        bitmask[batch_index].zero_()
+        eos_token_ids = self.token_enforcer.eos_token_id
+        if isinstance(eos_token_ids, list):
+            for token_id in eos_token_ids:
+                element_index = token_id >> 5
+                bit_index = token_id & 0x1F
+                bitmask[batch_index][element_index] |= 1 << bit_index
+        else:
+            element_index = eos_token_ids >> 5
+            bit_index = eos_token_ids & 0x1F
+            bitmask[batch_index][element_index] |= 1 << bit_index
+
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         original_len = len(self.current_tokens_prefix)
         for token in tokens:
@@ -72,6 +97,12 @@ class LMFormatEnforcerGrammar(StructuredOutputGrammar):
         self.current_tokens_prefix = self.current_tokens_prefix[:-num_tokens]
 
     def fill_bitmask(self, bitmask: torch.Tensor, batch_index: int) -> None:
+        # Once the parser is in an accepting state, force EOS rather than
+        # allowing longer-but-still-valid continuations. That keeps regex and
+        # choice requests from drifting until max_tokens.
+        if self._parser_can_end():
+            self._fill_eos_only_bitmask(bitmask, batch_index)
+            return
         allowed_tokens = self.token_enforcer.get_allowed_tokens(
             self.current_tokens_prefix
         )
@@ -97,7 +128,12 @@ class LMFormatEnforcerBackend(StructuredOutputBackend):
         )
 
     def compile_grammar(
-        self, request_type: StructuredOutputOptions, grammar_spec: str
+        self,
+        request_type: StructuredOutputOptions,
+        grammar_spec: str,
+        *,
+        disable_any_whitespace: bool | None = None,
+        disable_additional_properties: bool | None = None,
     ) -> StructuredOutputGrammar:
         character_level_parser: lmformatenforcer.CharacterLevelParser
         if request_type == StructuredOutputOptions.JSON:

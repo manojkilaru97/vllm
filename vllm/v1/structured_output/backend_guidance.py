@@ -97,13 +97,28 @@ class GuidanceBackend(StructuredOutputBackend):
         )
 
     def compile_grammar(
-        self, request_type: StructuredOutputOptions, grammar_spec: str
+        self,
+        request_type: StructuredOutputOptions,
+        grammar_spec: str,
+        *,
+        disable_any_whitespace: bool | None = None,
+        disable_additional_properties: bool | None = None,
     ) -> StructuredOutputGrammar:
+        effective_disable_any_whitespace = (
+            self.disable_any_whitespace
+            if disable_any_whitespace is None
+            else disable_any_whitespace
+        )
+        effective_disable_additional_properties = (
+            self.disable_additional_properties
+            if disable_additional_properties is None
+            else disable_additional_properties
+        )
         self.serialized_grammar = serialize_guidance_grammar(
             request_type,
             grammar_spec,
-            self.disable_any_whitespace,
-            self.disable_additional_properties,
+            effective_disable_any_whitespace,
+            effective_disable_additional_properties,
         )
 
         ll_matcher = llguidance.LLMatcher(
@@ -287,8 +302,15 @@ def validate_guidance_grammar(
     # if structured output is not enabled, there is nothing to validate
     if sampling_params.structured_outputs is None:
         return
-    tp, grm = get_structured_output_key(sampling_params.structured_outputs)
-    guidance_grm = serialize_guidance_grammar(tp, grm)
+    tp, grm, disable_any_whitespace, disable_additional_properties, _ = (
+        get_structured_output_key(sampling_params.structured_outputs)
+    )
+    guidance_grm = serialize_guidance_grammar(
+        tp,
+        grm,
+        disable_any_whitespace=disable_any_whitespace,
+        disable_additional_properties=disable_additional_properties,
+    )
     err = llguidance.LLMatcher.validate_grammar(guidance_grm, tokenizer)
     if err:
         raise ValueError(f"Grammar error: {err}")
