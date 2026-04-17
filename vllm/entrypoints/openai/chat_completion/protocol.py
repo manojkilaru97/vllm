@@ -637,10 +637,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # Set structured output params for response format
             if response_format.type == "json_object":
                 structured_outputs_kwargs["json_object"] = True
+                structured_outputs_kwargs["disable_any_whitespace"] = True
+                structured_outputs_kwargs["disable_additional_properties"] = True
             elif response_format.type == "json_schema":
                 json_schema = response_format.json_schema
                 assert json_schema is not None
                 structured_outputs_kwargs["json"] = json_schema.json_schema
+                structured_outputs_kwargs["disable_any_whitespace"] = True
+                structured_outputs_kwargs["disable_additional_properties"] = True
             elif response_format.type == "structural_tag":
                 structural_tag = response_format
                 assert structural_tag is not None and isinstance(
@@ -668,6 +672,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 self.structured_outputs = StructuredOutputsParams(
                     json=named_tool_schema,
                     disable_any_whitespace=True,
+                    disable_additional_properties=True,
                 )
             else:
                 required_tools_schema = self._get_required_tools_schema()
@@ -675,6 +680,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     self.structured_outputs = StructuredOutputsParams(
                         json=required_tools_schema,
                         disable_any_whitespace=True,
+                        disable_additional_properties=True,
                     )
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}

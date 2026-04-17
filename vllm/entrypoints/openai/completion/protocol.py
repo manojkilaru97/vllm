@@ -264,10 +264,14 @@ class CompletionRequest(OpenAIBaseModel):
             # Set structured output params for response format
             if response_format.type == "json_object":
                 structured_outputs_kwargs["json_object"] = True
+                structured_outputs_kwargs["disable_any_whitespace"] = True
+                structured_outputs_kwargs["disable_additional_properties"] = True
             elif response_format.type == "json_schema":
                 json_schema = response_format.json_schema
                 assert json_schema is not None
                 structured_outputs_kwargs["json"] = json_schema.json_schema
+                structured_outputs_kwargs["disable_any_whitespace"] = True
+                structured_outputs_kwargs["disable_additional_properties"] = True
             elif response_format.type == "structural_tag":
                 structural_tag = response_format
                 assert isinstance(

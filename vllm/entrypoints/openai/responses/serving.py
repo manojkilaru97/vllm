@@ -8,11 +8,11 @@ import os
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from copy import copy
 from http import HTTPStatus
-from typing import Final
+from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import Request
 from openai.types.responses import (
@@ -91,6 +91,7 @@ from vllm.entrypoints.openai.responses.protocol import (
     ResponseCompletedEvent,
     ResponseCreatedEvent,
     ResponseInProgressEvent,
+    ResponseInputOutputItem,
     ResponseInputOutputMessage,
     ResponseReasoningPartAddedEvent,
     ResponseReasoningPartDoneEvent,
@@ -120,12 +121,17 @@ from vllm.inputs.data import ProcessorInputs, token_inputs
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob as SampleLogprob
 from vllm.logprobs import SampleLogprobs
+from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import ParserManager
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tool_parsers import ToolParser
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
+
+if TYPE_CHECKING:
+    from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
@@ -237,6 +243,7 @@ class OpenAIServingResponses(OpenAIServing):
         engine_client: EngineClient,
         models: OpenAIServingModels,
         *,
+        openai_serving_render: "OpenAIServingRender",
         request_logger: RequestLogger | None,
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
@@ -256,6 +263,7 @@ class OpenAIServingResponses(OpenAIServing):
             return_tokens_as_token_ids=return_tokens_as_token_ids,
         )
 
+        self.openai_serving_render = openai_serving_render
         self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
         self.enable_log_outputs = enable_log_outputs
@@ -685,7 +693,7 @@ class OpenAIServingResponses(OpenAIServing):
 
             generator = self._generate_with_builtin_tools(
                 request_id=request.request_id,
-                engine_prompt=engine_prompt,
+                engine_input=engine_prompt,
                 sampling_params=sampling_params,
                 context=context,
                 lora_request=lora_request,
@@ -796,14 +804,14 @@ class OpenAIServingResponses(OpenAIServing):
             prev_response_output=prev_response.output if prev_response else None,
         )
 
-        _, engine_inputs = await self.openai_serving_render.preprocess_chat(
+        _, engine_inputs = await self.openai_serving_render._preprocess_chat(
             normalized_request,
             messages,
             default_template=self.chat_template,
             default_template_content_format=self.chat_template_content_format,
             default_template_kwargs=None,
             tool_dicts=tool_dicts,
-            tool_parser=self.parser.tool_parser_cls if self.parser else None,
+            tool_parser=None,
         )
         request.chat_template_kwargs = normalized_request.chat_template_kwargs
         return messages, engine_inputs
@@ -821,21 +829,21 @@ class OpenAIServingResponses(OpenAIServing):
             request_input=messages,
         )
 
-        _, engine_inputs = await self.openai_serving_render.preprocess_chat(
+        _, engine_inputs = await self.openai_serving_render._preprocess_chat(
             request,
             new_messages,
             default_template=chat_template,
             default_template_content_format=chat_template_content_format,
             default_template_kwargs=None,
             tool_dicts=tool_dicts,
-            tool_parser=tool_parser,
+            tool_parser=None,
         )
         return engine_inputs
 
     async def _generate_with_builtin_tools(
         self,
         request_id: str,
-        engine_input: EngineInput,
+        engine_input: ProcessorInputs,
         sampling_params: SamplingParams,
         context: ConversationContext,
         lora_request: LoRARequest | None = None,
@@ -886,7 +894,7 @@ class OpenAIServingResponses(OpenAIServing):
             # Render the next prompt token ids and update sampling_params.
             if isinstance(context, (HarmonyContext, StreamingHarmonyContext)):
                 token_ids = context.render_for_completion()
-                engine_input = tokens_input(token_ids)
+                engine_input = token_inputs(token_ids)
 
                 sampling_params.max_tokens = max_model_len - len(token_ids)
             elif isinstance(context, ParsableContext):
@@ -1273,7 +1281,6 @@ class OpenAIServingResponses(OpenAIServing):
                 request=request.model_copy(
                     update={"tool_choice": request.get_normalized_tool_choice()}
                 ),
-                model_output_token_ids=final_output.token_ids,
                 enable_auto_tools=self.enable_auto_tools,
                 tool_call_id_type=self.tool_call_id_type,
                 logprobs=logprobs,
@@ -1623,7 +1630,7 @@ class OpenAIServingResponses(OpenAIServing):
             reasoning_parser = self.parser.reasoning_parser_cls(tokenizer)
         tool_parser = None
         if self.parser and self.parser.tool_parser_cls:
-            tool_parser = self.parser.tool_parser_cls(tokenizer, request.tools)
+            tool_parser = self.parser.tool_parser_cls(tokenizer)
         previous_text = ""
         previous_token_ids: list[int] = []
         prompt_is_reasoning_end = None
@@ -1969,7 +1976,6 @@ class OpenAIServingResponses(OpenAIServing):
                     parser = self.parser(tokenizer)
                     response_items = parser.extract_response_outputs(
                         model_output=final_output.text,
-                        model_output_token_ids=final_output.token_ids,
                         request=request.model_copy(
                             update={"tool_choice": request.get_normalized_tool_choice()}
                         ),

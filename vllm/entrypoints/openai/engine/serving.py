@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -1248,6 +1249,51 @@ class OpenAIServing:
             ]
             return parser_tool_calls, tool_call_info.content
 
+        def try_required_json_repair(
+            raw_content: str,
+        ) -> list[FunctionCall] | None:
+            stripped_content = OpenAIServing._strip_non_json_prefix(
+                raw_content, prefer_array=True
+            ).strip()
+            if not stripped_content:
+                return None
+
+            name_match = re.search(r'"name"\s*:\s*"([^"]+)', stripped_content)
+            if not name_match:
+                return None
+
+            params: dict[str, Any] = {}
+            parameters_match = re.search(
+                r'"parameters"\s*:\s*\{(?P<body>.*)', stripped_content, re.DOTALL
+            )
+            if parameters_match:
+                body = parameters_match.group("body")
+                for key, raw_value in re.findall(
+                    r'"([^"]+)"\s*:\s*"([^"]*)', body, re.DOTALL
+                ):
+                    params[key] = raw_value
+                for key, raw_value in re.findall(
+                    r'"([^"]+)"\s*:\s*(-?\d+(?:\.\d+)?|true|false|null)',
+                    body,
+                ):
+                    if raw_value == "true":
+                        params[key] = True
+                    elif raw_value == "false":
+                        params[key] = False
+                    elif raw_value == "null":
+                        params[key] = None
+                    elif "." in raw_value:
+                        params[key] = float(raw_value)
+                    else:
+                        params[key] = int(raw_value)
+
+            return [
+                FunctionCall(
+                    name=name_match.group(1),
+                    arguments=json.dumps(params, ensure_ascii=False),
+                )
+            ]
+
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
             assert content is not None
             # Forced Function Call
@@ -1341,9 +1387,16 @@ class OpenAIServing:
                 )
             except Exception:
                 fallback_calls, _ = try_parser_fallback()
-                if not fallback_calls:
-                    raise
-                function_calls.extend(fallback_calls)
+                if fallback_calls:
+                    function_calls.extend(fallback_calls)
+                else:
+                    repaired_calls = try_required_json_repair(content)
+                    if not repaired_calls:
+                        raise
+                    logger.warning(
+                        "Recovered required tool call from partial JSON output."
+                    )
+                    function_calls.extend(repaired_calls)
             content = None  # Clear content since tool is called.
         elif (
             tool_parser_cls

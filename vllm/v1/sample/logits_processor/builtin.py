@@ -296,17 +296,23 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
     def __init__(
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
     ):
-        reasoning_config = vllm_config.reasoning_config
+        reasoning_config = getattr(vllm_config, "reasoning_config", None)
+        if reasoning_config is None:
+            reasoning_config = getattr(vllm_config, "structured_outputs_config", None)
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
 
-        # Check if thinking is enabled
-        self.is_enabled = reasoning_config is not None
-
-        self.reasoning_start_token_ids = getattr(
-            reasoning_config, "reasoning_start_token_ids", []
+        self.reasoning_start_token_ids = list(
+            getattr(reasoning_config, "reasoning_start_token_ids", []) or []
         )
-        self.reasoning_end_token_ids = getattr(
-            reasoning_config, "reasoning_end_token_ids", []
+        self.reasoning_end_token_ids = list(
+            getattr(reasoning_config, "reasoning_end_token_ids", []) or []
+        )
+        # v0.18.1 keeps reasoning settings under structured_outputs_config and
+        # older configs do not expose explicit start/end token ids.
+        self.is_enabled = bool(
+            reasoning_config
+            and self.reasoning_start_token_ids
+            and self.reasoning_end_token_ids
         )
 
         self.pin_memory = is_pin_memory

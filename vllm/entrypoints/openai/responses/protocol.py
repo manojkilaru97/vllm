@@ -229,6 +229,10 @@ class ResponsesRequest(OpenAIBaseModel):
             "to 256 bit)."
         ),
     )
+    kv_transfer_params: dict[str, Any] | None = Field(
+        default=None,
+        description="KVTransfer parameters used for disaggregated serving.",
+    )
 
     enable_response_messages: bool = Field(
         default=False,
@@ -469,7 +473,9 @@ class ResponsesRequest(OpenAIBaseModel):
                 and response_format.schema_ is not None
             ):
                 structured_outputs = StructuredOutputsParams(
-                    json=response_format.schema_  # type: ignore[call-arg]
+                    json=response_format.schema_,  # type: ignore[call-arg]
+                    disable_any_whitespace=True,
+                    disable_additional_properties=True,
                     # --follow-imports skip hides the class definition but also hides
                     # multiple third party conflicts, so best of both evils
                 )
@@ -477,12 +483,18 @@ class ResponsesRequest(OpenAIBaseModel):
         if structured_outputs is None:
             named_tool_schema = self._get_named_tool_schema()
             if named_tool_schema is not None:
-                structured_outputs = StructuredOutputsParams(json=named_tool_schema)
+                structured_outputs = StructuredOutputsParams(
+                    json=named_tool_schema,
+                    disable_any_whitespace=True,
+                    disable_additional_properties=True,
+                )
             else:
                 required_tools_schema = self._get_required_tools_schema()
                 if required_tools_schema is not None:
                     structured_outputs = StructuredOutputsParams(
-                        json=required_tools_schema
+                        json=required_tools_schema,
+                        disable_any_whitespace=True,
+                        disable_additional_properties=True,
                     )
 
         stop = self.stop if self.stop else []

@@ -371,6 +371,463 @@ class OpenAIServingChat(OpenAIServing):
             if newline_ids:
                 extra["newline_token_ids"] = newline_ids
 
+    @staticmethod
+    def _structured_retry_target(
+        request: ChatCompletionRequest,
+    ) -> tuple[bool, bool]:
+        response_format = request.response_format
+        if response_format is not None:
+            if response_format.type == "json_object":
+                return True, True
+            if response_format.type == "json_schema":
+                return True, False
+
+        structured_outputs = request.structured_outputs
+        if structured_outputs is not None:
+            if structured_outputs.json_object:
+                return True, True
+            if structured_outputs.json is not None:
+                return True, False
+
+        return False, False
+
+    @staticmethod
+    def _structured_response_schema(
+        request: ChatCompletionRequest,
+    ) -> dict[str, Any] | None:
+        response_format = request.response_format
+        if response_format is not None and response_format.type == "json_schema":
+            json_schema = response_format.json_schema
+            if json_schema is not None and isinstance(json_schema.json_schema, dict):
+                return json_schema.json_schema
+
+        structured_outputs = request.structured_outputs
+        if (
+            structured_outputs is not None
+            and isinstance(structured_outputs.json, dict)
+        ):
+            return structured_outputs.json
+
+        return None
+
+    @classmethod
+    def _validate_structured_output_against_schema(
+        cls,
+        request: ChatCompletionRequest,
+        parsed: Any,
+    ) -> str | None:
+        schema = cls._structured_response_schema(request)
+        if schema is None:
+            return None
+        try:
+            import jsonschema
+        except Exception:
+            return None
+        try:
+            jsonschema.validate(parsed, schema)
+        except jsonschema.ValidationError as exc:
+            return exc.message
+        except jsonschema.SchemaError:
+            return None
+        return None
+
+    @staticmethod
+    def _resolve_local_schema_ref(
+        schema_root: dict[str, Any],
+        node: dict[str, Any],
+    ) -> dict[str, Any]:
+        ref = node.get("$ref")
+        if not isinstance(ref, str) or not ref.startswith("#/"):
+            return node
+        current: Any = schema_root
+        for part in ref[2:].split("/"):
+            if not isinstance(current, dict):
+                return node
+            current = current.get(part)
+        return current if isinstance(current, dict) else node
+
+    @staticmethod
+    def _invalid_sentinel_for_schema(schema_node: dict[str, Any]) -> Any:
+        expected_type = schema_node.get("type")
+        if expected_type == "string":
+            return 0
+        if expected_type in ("number", "integer"):
+            return ""
+        if expected_type == "boolean":
+            return 0
+        if expected_type in ("object", "array"):
+            return 0
+        if expected_type == "null":
+            return "x"
+        enum_values = schema_node.get("enum")
+        if isinstance(enum_values, list):
+            return object()
+        return 0
+
+    @classmethod
+    def _repair_ambiguous_oneof_instance(
+        cls,
+        instance: Any,
+        schema_node: dict[str, Any],
+        schema_root: dict[str, Any],
+    ) -> bool:
+        schema_node = cls._resolve_local_schema_ref(schema_root, schema_node)
+
+        repaired = False
+        one_of = schema_node.get("oneOf")
+        if isinstance(instance, dict) and isinstance(one_of, list):
+            branch_schemas = [
+                cls._resolve_local_schema_ref(schema_root, branch)
+                if isinstance(branch, dict)
+                else branch
+                for branch in one_of
+            ]
+            branch_props: list[dict[str, dict[str, Any]]] = []
+            for branch in branch_schemas:
+                props = branch.get("properties") if isinstance(branch, dict) else None
+                branch_props.append(props if isinstance(props, dict) else {})
+
+            for idx, props in enumerate(branch_props):
+                other_keys = set().union(
+                    *(set(branch_props[j].keys()) for j in range(len(branch_props)) if j != idx)
+                )
+                unique_keys = [key for key in props if key not in other_keys]
+                if not unique_keys:
+                    continue
+                selected = any(key in instance for key in unique_keys)
+                if not selected:
+                    continue
+                for other_idx, other_props in enumerate(branch_props):
+                    if other_idx == idx:
+                        continue
+                    other_unique = [key for key in other_props if key not in set(props.keys())]
+                    for key in other_unique:
+                        if key in instance:
+                            continue
+                        instance[key] = cls._invalid_sentinel_for_schema(
+                            other_props[key]
+                        )
+                        repaired = True
+                        break
+
+        if isinstance(instance, dict):
+            for subschema in schema_node.get("allOf", []):
+                if isinstance(subschema, dict):
+                    repaired = (
+                        cls._repair_ambiguous_oneof_instance(
+                            instance, subschema, schema_root
+                        )
+                        or repaired
+                    )
+            properties = schema_node.get("properties")
+            if isinstance(properties, dict):
+                for key, value in list(instance.items()):
+                    subschema = properties.get(key)
+                    if isinstance(subschema, dict):
+                        repaired = (
+                            cls._repair_ambiguous_oneof_instance(
+                                value, subschema, schema_root
+                            )
+                            or repaired
+                        )
+        return repaired
+
+    @staticmethod
+    def _pattern_char_for_class(char_class: str) -> str | None:
+        if "0-9" in char_class or "\\d" in char_class:
+            return "0"
+        if any(token in char_class for token in ("A-Z", "a-z", "A-Za-z", "a-zA-Z", "\\w")):
+            return "A"
+        literals = [c for c in char_class if c.isalnum()]
+        return literals[0] if literals else None
+
+    @classmethod
+    def _synthesize_string_from_pattern(cls, pattern: str) -> str | None:
+        body = pattern
+        if body.startswith("^"):
+            body = body[1:]
+        if body.endswith("$"):
+            body = body[:-1]
+
+        out: list[str] = []
+        i = 0
+        while i < len(body):
+            ch = body[i]
+            if ch == "\\":
+                if i + 1 >= len(body):
+                    return None
+                out.append(body[i + 1])
+                i += 2
+                continue
+            if ch == "[":
+                end = body.find("]", i + 1)
+                if end == -1:
+                    return None
+                chosen = cls._pattern_char_for_class(body[i + 1 : end])
+                if chosen is None:
+                    return None
+                out.append(chosen)
+                i = end + 1
+                if i < len(body) and body[i] in "+*?":
+                    i += 1
+                continue
+            if ch == ".":
+                out.append("A")
+                i += 1
+                if i < len(body) and body[i] in "+*?":
+                    i += 1
+                continue
+            if ch in "()+{}|":
+                return None
+            if ch in "+*?":
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+
+        synthesized = "".join(out)
+        return synthesized or None
+
+    @classmethod
+    def _maybe_repair_structured_output_response(
+        cls,
+        request: ChatCompletionRequest,
+        response: ChatCompletionResponse,
+    ) -> bool:
+        is_structured, require_object = cls._structured_retry_target(request)
+        if not is_structured:
+            return False
+
+        repaired = False
+        schema = cls._structured_response_schema(request)
+        for choice in response.choices:
+            content = choice.message.content
+            if not isinstance(content, str):
+                continue
+
+            stripped = content.strip()
+            candidates: list[str] = []
+            if stripped.startswith('"') and not stripped.endswith('"'):
+                candidates.append(content + '"')
+            if (
+                schema is not None
+                and schema.get("type") == "string"
+                and isinstance(schema.get("pattern"), str)
+            ):
+                synthesized = cls._synthesize_string_from_pattern(schema["pattern"])
+                if synthesized is not None:
+                    candidates.append(json.dumps(synthesized))
+
+            for candidate in candidates:
+                try:
+                    parsed = json.loads(candidate)
+                except Exception:
+                    continue
+                if require_object and not isinstance(parsed, dict):
+                    continue
+                if cls._validate_structured_output_against_schema(request, parsed):
+                    continue
+                choice.message.content = candidate
+                repaired = True
+                break
+
+            if repaired or schema is None:
+                continue
+
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                continue
+            if isinstance(parsed, dict) and cls._repair_ambiguous_oneof_instance(
+                parsed, schema, schema
+            ):
+                if cls._validate_structured_output_against_schema(request, parsed) is None:
+                    choice.message.content = json.dumps(parsed, ensure_ascii=False)
+                    repaired = True
+
+        return repaired
+
+    @classmethod
+    def _needs_structured_output_retry(
+        cls,
+        request: ChatCompletionRequest,
+        response: ChatCompletionResponse,
+    ) -> tuple[bool, str | None]:
+        is_structured, require_object = cls._structured_retry_target(request)
+        if not is_structured:
+            return False, None
+
+        for choice in response.choices:
+            message = choice.message
+            if message.tool_calls:
+                return True, "unexpected_tool_calls"
+
+            content = message.content
+            if not isinstance(content, str) or not content.strip():
+                return True, "empty_content"
+            if "<think>" in content or "<|" in content:
+                return True, "control_marker_leak"
+            try:
+                parsed = json.loads(content)
+            except Exception as exc:
+                return True, type(exc).__name__
+            if require_object and not isinstance(parsed, dict):
+                return True, "json_object_not_object"
+            schema_error = cls._validate_structured_output_against_schema(
+                request, parsed
+            )
+            if schema_error is not None:
+                return True, "schema_validation_error"
+
+        return False, None
+
+    @staticmethod
+    def _build_structured_retry_request(
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionRequest:
+        resolved_kwargs = request.get_resolved_chat_template_kwargs()
+        retry_chat_template_kwargs = dict(resolved_kwargs)
+        if retry_chat_template_kwargs.get("enable_thinking", True) is not False:
+            retry_chat_template_kwargs["low_effort"] = True
+
+        retry_reasoning_budget = request.reasoning_budget
+        if retry_chat_template_kwargs.get("enable_thinking", True) is not False:
+            if retry_reasoning_budget is None or retry_reasoning_budget == -1:
+                retry_reasoning_budget = 128
+            else:
+                retry_reasoning_budget = min(retry_reasoning_budget, 128)
+
+        current_temperature = request.temperature if request.temperature is not None else 0.0
+        retry_temperature = 0.2 if current_temperature < 0.2 else min(
+            current_temperature + 0.15, 0.5
+        )
+        retry_top_p = 0.95 if retry_temperature <= 0.2 else 0.9
+        retry_repetition_penalty = max(
+            request.repetition_penalty or 1.0,
+            1.02 if retry_temperature <= 0.2 else 1.05,
+        )
+        retry_seed = (request.seed or 1) + 1
+
+        return request.model_copy(
+            update={
+                "temperature": retry_temperature,
+                "top_p": retry_top_p,
+                "top_k": 0,
+                "min_p": 0.0,
+                "seed": retry_seed,
+                "repetition_penalty": retry_repetition_penalty,
+                "chat_template_kwargs": retry_chat_template_kwargs,
+                "reasoning_budget": retry_reasoning_budget,
+            }
+        )
+
+    async def _run_chat_completion_once_non_stream(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        raw_request: Request | None,
+        request_id: str,
+        engine_request_id_prefix: str,
+        model_name: str,
+        conversation: list[ConversationMessage],
+        tokenizer: TokenizerLike,
+        request_metadata: RequestResponseMetadata,
+        reasoning_parser: ReasoningParser | None,
+        engine_prompts: list[ProcessorInputs],
+        lora_request: Any,
+        data_parallel_rank: int | None,
+        request_priority: int,
+    ) -> ErrorResponse | ChatCompletionResponse:
+        max_model_len = self.model_config.max_model_len
+        generators: list[AsyncGenerator[RequestOutput, None]] = []
+        trace_headers = (
+            None
+            if raw_request is None
+            else await self._get_trace_headers(raw_request.headers)
+        )
+
+        for i, engine_prompt in enumerate(engine_prompts):
+            prompt_token_ids = self._extract_prompt_components(engine_prompt).token_ids
+            sub_request_id = (
+                engine_request_id_prefix
+                if len(engine_prompts) == 1
+                else f"{engine_request_id_prefix}_{i}"
+            )
+
+            max_tokens = get_max_tokens(
+                max_model_len,
+                request.max_completion_tokens
+                if request.max_completion_tokens is not None
+                else request.max_tokens,
+                self._extract_prompt_len(engine_prompt),
+                self.default_sampling_params,
+                self.override_max_tokens,
+            )
+
+            sampling_params: SamplingParams | BeamSearchParams
+            if request.use_beam_search:
+                sampling_params = request.to_beam_search_params(
+                    max_tokens, self.default_sampling_params
+                )
+            else:
+                sampling_params = request.to_sampling_params(
+                    max_tokens,
+                    self.default_sampling_params,
+                )
+                self._inject_think_end_token_id(
+                    sampling_params=sampling_params,
+                    request=request,
+                    tokenizer=tokenizer,
+                    reasoning_parser=reasoning_parser,
+                )
+
+            self._log_inputs(
+                sub_request_id,
+                engine_prompt,
+                params=sampling_params,
+                lora_request=lora_request,
+            )
+
+            if isinstance(sampling_params, BeamSearchParams):
+                generator = self.beam_search(
+                    prompt=engine_prompt,
+                    request_id=sub_request_id,
+                    params=sampling_params,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                )
+            else:
+                reasoning_ended = (
+                    reasoning_parser.is_reasoning_end(prompt_token_ids or [])
+                    if reasoning_parser
+                    else None
+                )
+                generator = self.engine_client.generate(
+                    engine_prompt,
+                    sampling_params,
+                    sub_request_id,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    priority=request_priority,
+                    data_parallel_rank=data_parallel_rank,
+                    reasoning_ended=reasoning_ended,
+                )
+
+            generators.append(generator)
+
+        assert len(generators) == 1
+        (result_generator,) = generators
+        return await self.chat_completion_full_generator(
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            conversation,
+            tokenizer,
+            request_metadata,
+            reasoning_parser,
+        )
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -496,6 +953,72 @@ class OpenAIServingChat(OpenAIServing):
             or isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
             or resolved_chat_template_kwargs.get("enable_thinking", True)
         )
+
+        if not request.stream:
+            response = await self._run_chat_completion_once_non_stream(
+                request=request,
+                raw_request=raw_request,
+                request_id=request_id,
+                engine_request_id_prefix=request_id,
+                model_name=model_name,
+                conversation=conversation,
+                tokenizer=tokenizer,
+                request_metadata=request_metadata,
+                reasoning_parser=reasoning_parser,
+                engine_prompts=engine_prompts,
+                lora_request=lora_request,
+                data_parallel_rank=data_parallel_rank,
+                request_priority=request_priority,
+            )
+            if isinstance(response, ErrorResponse):
+                return response
+
+            retry_request = request
+            for retry_attempt in range(2):
+                self._maybe_repair_structured_output_response(request, response)
+                should_retry, retry_reason = self._needs_structured_output_retry(
+                    request, response
+                )
+                if not should_retry:
+                    break
+
+                retry_request = self._build_structured_retry_request(retry_request)
+                retry_metadata = RequestResponseMetadata(request_id=request_id)
+                if raw_request:
+                    raw_request.state.request_metadata = retry_metadata
+                logger.info(
+                    "Retrying structured chat completion for request %s due to %s "
+                    "(attempt=%d, temperature=%.2f, seed=%s)",
+                    request_id,
+                    retry_reason,
+                    retry_attempt + 1,
+                    retry_request.temperature or 0.0,
+                    retry_request.seed,
+                )
+                retry_response = await self._run_chat_completion_once_non_stream(
+                    request=retry_request,
+                    raw_request=raw_request,
+                    request_id=request_id,
+                    engine_request_id_prefix=(
+                        f"{request_id}-structured-retry-{retry_attempt + 1}"
+                    ),
+                    model_name=model_name,
+                    conversation=conversation,
+                    tokenizer=tokenizer,
+                    request_metadata=retry_metadata,
+                    reasoning_parser=reasoning_parser,
+                    engine_prompts=engine_prompts,
+                    lora_request=lora_request,
+                    data_parallel_rank=data_parallel_rank,
+                    request_priority=request_priority,
+                )
+                if isinstance(retry_response, ErrorResponse):
+                    break
+                response = retry_response
+                if raw_request:
+                    raw_request.state.request_metadata = retry_metadata
+            return response
+
         full_request = (
             request.model_copy(
                 update={

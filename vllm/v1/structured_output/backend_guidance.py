@@ -31,17 +31,133 @@ else:
 logger = init_logger(__name__)
 
 
-def _walk_json_for_additional_properties(data: object):
+def _walk_json_for_additional_properties(
+    data: object,
+    *,
+    within_allof: bool = False,
+):
     if isinstance(data, dict):
-        for value in data.values():
-            _walk_json_for_additional_properties(value)
-        if "additionalProperties" not in data and (
-            "properties" in data or "patternProperties" in data
+        current_within_allof = within_allof or isinstance(data.get("allOf"), list)
+        for key, value in data.items():
+            child_within_allof = current_within_allof or key == "allOf"
+            _walk_json_for_additional_properties(
+                value,
+                within_allof=child_within_allof,
+            )
+
+        properties = data.get("properties")
+        pattern_properties = data.get("patternProperties")
+        required = data.get("required")
+
+        has_properties = isinstance(properties, dict)
+        has_pattern_properties = isinstance(pattern_properties, dict)
+        if not has_properties and not has_pattern_properties:
+            return
+
+        if "additionalProperties" in data:
+            return
+        if current_within_allof:
+            return
+        if any(
+            isinstance(data.get(keyword), list)
+            for keyword in ("allOf", "anyOf", "oneOf")
         ):
+            return
+        if "$ref" in data:
+            return
+
+        property_keys = set(properties.keys()) if has_properties else set()
+        if has_properties and not property_keys and not has_pattern_properties:
+            return
+        if isinstance(required, list) and any(
+            isinstance(name, str) and name not in property_keys for name in required
+        ):
+            return
+
+        if has_properties or has_pattern_properties:
             data["additionalProperties"] = False
     elif isinstance(data, list):
         for item in data:
-            _walk_json_for_additional_properties(item)
+            _walk_json_for_additional_properties(
+                item,
+                within_allof=within_allof,
+            )
+
+
+def _walk_json_for_oneof_disambiguation(data: object):
+    if isinstance(data, dict):
+        one_of = data.get("oneOf")
+        if isinstance(one_of, list):
+            branch_props: list[set[str]] = []
+            for branch in one_of:
+                if isinstance(branch, dict):
+                    props = branch.get("properties")
+                    if isinstance(props, dict):
+                        branch_props.append(set(props.keys()))
+                    else:
+                        branch_props.append(set())
+                else:
+                    branch_props.append(set())
+
+            for idx, branch in enumerate(one_of):
+                if not isinstance(branch, dict):
+                    continue
+                props = branch.get("properties")
+                if not isinstance(props, dict) or branch.get("required"):
+                    continue
+                other_props = set().union(
+                    *(branch_props[j] for j in range(len(branch_props)) if j != idx)
+                )
+                unique_props = sorted(branch_props[idx] - other_props)
+                # Guidance's oneOf coercion approximates oneOf as anyOf. For
+                # simple object branches, require at least one branch-unique
+                # property so {} does not satisfy every branch.
+                if unique_props:
+                    branch["required"] = unique_props
+                    branch.setdefault("additionalProperties", False)
+
+        for value in data.values():
+            _walk_json_for_oneof_disambiguation(value)
+    elif isinstance(data, list):
+        for item in data:
+            _walk_json_for_oneof_disambiguation(item)
+
+
+def _rewrite_simple_not_types(data: object):
+    if isinstance(data, dict):
+        not_schema = data.get("not")
+        not_type = (
+            not_schema.get("type")
+            if isinstance(not_schema, dict)
+            else None
+        )
+        if isinstance(not_type, str):
+            if not_type == "number":
+                data.pop("not", None)
+                data["anyOf"] = [
+                    {"type": "string"},
+                    {"type": "boolean"},
+                    {"type": "object"},
+                    {"type": "array"},
+                    {"type": "null"},
+                ]
+            elif not_type == "integer":
+                data.pop("not", None)
+                data["anyOf"] = [
+                    {"type": "string"},
+                    {"type": "boolean"},
+                    {"type": "object"},
+                    {"type": "array"},
+                    {"type": "null"},
+                    {"type": "number", "minimum": 0, "exclusiveMinimum": True},
+                    {"type": "number", "maximum": 0, "exclusiveMaximum": True},
+                ]
+
+        for value in data.values():
+            _rewrite_simple_not_types(value)
+    elif isinstance(data, list):
+        for item in data:
+            _rewrite_simple_not_types(item)
 
 
 def has_guidance_unsupported_json_features(schema: dict[str, Any]) -> bool:
@@ -82,6 +198,28 @@ def process_for_additional_properties(
     return guide_json_obj
 
 
+def process_for_oneof_disambiguation(
+    guide_json: str | dict[str, Any],
+) -> dict[str, Any]:
+    if isinstance(guide_json, str):
+        guide_json_obj = json.loads(guide_json)
+    else:
+        guide_json_obj = copy.deepcopy(guide_json)
+    _walk_json_for_oneof_disambiguation(guide_json_obj)
+    return guide_json_obj
+
+
+def process_for_simple_not_types(
+    guide_json: str | dict[str, Any],
+) -> dict[str, Any]:
+    if isinstance(guide_json, str):
+        guide_json_obj = json.loads(guide_json)
+    else:
+        guide_json_obj = copy.deepcopy(guide_json)
+    _rewrite_simple_not_types(guide_json_obj)
+    return guide_json_obj
+
+
 @dataclass
 class GuidanceBackend(StructuredOutputBackend):
     def __post_init__(self):
@@ -103,29 +241,52 @@ class GuidanceBackend(StructuredOutputBackend):
         params: StructuredOutputsParams | None = None,
     ) -> StructuredOutputGrammar:
         disable_any_whitespace = self.disable_any_whitespace
+        disable_additional_properties = self.disable_additional_properties
         if params is not None and params.disable_any_whitespace:
             disable_any_whitespace = True
-        self.serialized_grammar = serialize_guidance_grammar(
-            request_type,
-            grammar_spec,
-            disable_any_whitespace,
-            self.disable_additional_properties,
-        )
+        if params is not None and params.disable_additional_properties:
+            disable_additional_properties = True
 
-        ll_matcher = llguidance.LLMatcher(
-            self.ll_tokenizer,
-            self.serialized_grammar,
-            log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
-        )
+        last_error: Exception | None = None
+        for lenient in (False, True):
+            try:
+                self.serialized_grammar = serialize_guidance_grammar(
+                    request_type,
+                    grammar_spec,
+                    disable_any_whitespace,
+                    disable_additional_properties,
+                    lenient=lenient,
+                )
 
-        r = GuidanceGrammar(
-            ll_matcher=ll_matcher,
-            ll_tokenizer=self.ll_tokenizer,
-            vocab_size=self.vocab_size,
-        )
+                ll_matcher = llguidance.LLMatcher(
+                    self.ll_tokenizer,
+                    self.serialized_grammar,
+                    log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
+                )
 
-        r.check_error()
-        return r
+                r = GuidanceGrammar(
+                    ll_matcher=ll_matcher,
+                    ll_tokenizer=self.ll_tokenizer,
+                    vocab_size=self.vocab_size,
+                )
+
+                err = r.ll_matcher.get_error()
+                if err:
+                    raise ValueError(f"Grammar error: {err}")
+                return r
+            except Exception as exc:
+                last_error = exc
+                if not lenient:
+                    logger.warning(
+                        "Strict guidance grammar compile failed; "
+                        "retrying with lenient guidance options.",
+                        exc_info=True,
+                    )
+                    continue
+                raise
+
+        assert last_error is not None
+        raise last_error
 
     def allocate_token_bitmask(self, max_num_seqs: int):
         return llguidance_torch.allocate_token_bitmask(
@@ -223,16 +384,24 @@ def serialize_guidance_grammar(
     grammar_spec: str | dict[str, Any],
     disable_any_whitespace: bool = False,
     disable_additional_properties: bool = False,
+    lenient: bool = False,
 ) -> str:
     def _process_schema(
         grammar_spec: str | dict[str, Any],
     ) -> str:
         if disable_additional_properties:
             grammar_spec = process_for_additional_properties(grammar_spec)
+        grammar_spec = process_for_oneof_disambiguation(grammar_spec)
+        grammar_spec = process_for_simple_not_types(grammar_spec)
         return llguidance.LLMatcher.grammar_from_json_schema(
             grammar_spec,
             defaults={
                 "whitespace_flexible": not disable_any_whitespace,
+                # llguidance rejects JSON Schema oneOf by default.
+                # Approximate it as anyOf so common OpenAI-style request
+                # schemas keep working instead of returning 400.
+                "coerce_one_of": True,
+                "lenient": lenient,
             },
         )
 
@@ -243,6 +412,8 @@ def serialize_guidance_grammar(
             '{"type": "object"}',
             defaults={
                 "whitespace_flexible": not disable_any_whitespace,
+                "coerce_one_of": True,
+                "lenient": lenient,
             },
         )
     else:
@@ -294,7 +465,29 @@ def validate_guidance_grammar(
     if sampling_params.structured_outputs is None:
         return
     tp, grm = get_structured_output_key(sampling_params.structured_outputs)
-    guidance_grm = serialize_guidance_grammar(tp, grm)
-    err = llguidance.LLMatcher.validate_grammar(guidance_grm, tokenizer)
-    if err:
+    last_error: str | None = None
+    for lenient in (False, True):
+        guidance_grm = serialize_guidance_grammar(
+            tp,
+            grm,
+            disable_any_whitespace=sampling_params.structured_outputs.disable_any_whitespace,
+            disable_additional_properties=(
+                sampling_params.structured_outputs.disable_additional_properties
+            ),
+            lenient=lenient,
+        )
+        err = llguidance.LLMatcher.validate_grammar(guidance_grm, tokenizer)
+        if not err:
+            return
+        last_error = err
+        if not lenient:
+            logger.warning(
+                "Strict guidance grammar validation failed; "
+                "retrying with lenient guidance options: %s",
+                err,
+            )
+            continue
         raise ValueError(f"Grammar error: {err}")
+
+    if last_error:
+        raise ValueError(f"Grammar error: {last_error}")
