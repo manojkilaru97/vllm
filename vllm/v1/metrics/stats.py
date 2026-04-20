@@ -180,6 +180,8 @@ class SchedulerStats:
 
     kv_cache_usage: float = 0.0
     encoder_cache_usage: float = 0.0
+    oldest_waiting_request_age_seconds: float = 0.0
+    oldest_running_request_age_seconds: float = 0.0
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None

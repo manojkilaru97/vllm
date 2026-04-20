@@ -1856,6 +1856,13 @@ class Scheduler(SchedulerInterface):
         """
         self.encoder_cache_manager.reset()
 
+    def _oldest_request_age_seconds(self, requests) -> float:
+        now = time.time()
+        oldest_arrival = min((req.arrival_time for req in requests), default=None)
+        if oldest_arrival is None:
+            return 0.0
+        return max(0.0, now - oldest_arrival)
+
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,

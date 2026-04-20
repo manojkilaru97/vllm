@@ -12,13 +12,14 @@ from vllm.config.parallel import ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.request import Request
-from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output import PassthroughGrammar, StructuredOutputManager
 from vllm.v1.structured_output import backend_guidance as backend_guidance_module
 from vllm.v1.structured_output.backend_guidance import (
     GuidanceBackend,
     validate_guidance_grammar,
 )
-from vllm.v1.structured_output.backend_types import StructuredOutputOptions
+from vllm.v1.structured_output.backend_types import StructuredOutputGrammar, StructuredOutputOptions
+from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
 
 TOKENIZER = "gpt2"
 
@@ -228,3 +229,115 @@ def test_grammar_init_async_and_sync(async_grammar):
 
     # Verify the grammar can accept valid tokens
     assert grammar.accept_tokens(request.request_id, prompt)
+
+
+class DummyGrammar(StructuredOutputGrammar):
+    def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
+        return True
+
+    def validate_tokens(self, tokens: list[int]) -> list[int]:
+        return tokens
+
+    def rollback(self, num_tokens: int) -> None:
+        return None
+
+    def fill_bitmask(self, bitmask, batch_index: int) -> None:
+        bitmask[batch_index].fill_(-1)
+
+    def is_terminated(self) -> bool:
+        return False
+
+    def reset(self):
+        return None
+
+
+def _build_xgrammar_request() -> tuple[StructuredOutputManager, Request]:
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    prompt = tokenizer.encode('{"a": "b"}')
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(tokenizer=TOKENIZER),
+        structured_outputs_config=StructuredOutputsConfig(backend="xgrammar"),
+        parallel_config=ParallelConfig(distributed_executor_backend="external_launcher"),
+    )
+    structured_output_manager = StructuredOutputManager(vllm_config)
+
+    sampling_params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(
+            json='{"type": "object"}',
+        ),
+    )
+    sampling_params.structured_outputs._backend = "xgrammar"
+    sampling_params.update_from_generation_config({}, tokenizer.eos_token_id)
+
+    request = Request(
+        "test_request",
+        prompt_token_ids=prompt,
+        sampling_params=sampling_params,
+        pooling_params=None,
+    )
+    return structured_output_manager, request
+
+
+def test_xgrammar_compile_failure_falls_back_to_guidance(monkeypatch, caplog):
+    structured_output_manager, request = _build_xgrammar_request()
+    dummy_grammar = DummyGrammar()
+
+    def fail_xgrammar(self, request_type, grammar_spec, **kwargs):
+        raise RuntimeError("Lookahead is not supported yet.")
+
+    def succeed_guidance(self, request_type, grammar_spec, **kwargs):
+        return dummy_grammar
+
+    monkeypatch.setattr(XgrammarBackend, "compile_grammar", fail_xgrammar)
+    monkeypatch.setattr(GuidanceBackend, "compile_grammar", succeed_guidance)
+
+    with caplog.at_level("WARNING"):
+        structured_output_manager.grammar_init(request)
+
+    grammar = request.structured_output_request.grammar
+    assert grammar is dummy_grammar
+    assert "falling back to guidance" in caplog.text
+
+
+
+def test_xgrammar_compile_failure_falls_back_to_passthrough_when_guidance_fails(
+    monkeypatch, caplog
+):
+    structured_output_manager, request = _build_xgrammar_request()
+
+    def fail_xgrammar(self, request_type, grammar_spec, **kwargs):
+        raise RuntimeError("Lookahead is not supported yet.")
+
+    def fail_guidance(self, request_type, grammar_spec, **kwargs):
+        raise RuntimeError("guidance compile failed")
+
+    monkeypatch.setattr(XgrammarBackend, "compile_grammar", fail_xgrammar)
+    monkeypatch.setattr(GuidanceBackend, "compile_grammar", fail_guidance)
+
+    with caplog.at_level("WARNING"):
+        structured_output_manager.grammar_init(request)
+
+    grammar = request.structured_output_request.grammar
+    assert isinstance(grammar, PassthroughGrammar)
+    assert "falling back to unconstrained decoding" in caplog.text
+
+
+
+def test_manager_honors_request_level_fallback_backend(monkeypatch):
+    structured_output_manager, request = _build_xgrammar_request()
+    request.sampling_params.structured_outputs._backend = "guidance"
+    dummy_grammar = DummyGrammar()
+
+    def should_not_run_xgrammar(self, request_type, grammar_spec, **kwargs):
+        raise AssertionError("xgrammar backend should not be used for this request")
+
+    def succeed_guidance(self, request_type, grammar_spec, **kwargs):
+        return dummy_grammar
+
+    monkeypatch.setattr(XgrammarBackend, "compile_grammar", should_not_run_xgrammar)
+    monkeypatch.setattr(GuidanceBackend, "compile_grammar", succeed_guidance)
+
+    structured_output_manager.grammar_init(request)
+
+    grammar = request.structured_output_request.grammar
+    assert grammar is dummy_grammar

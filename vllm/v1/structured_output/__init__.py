@@ -10,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.utils.import_utils import LazyLoader
 from vllm.v1.structured_output.backend_guidance import GuidanceBackend
 from vllm.v1.structured_output.backend_types import (
@@ -31,6 +32,29 @@ else:
 
 
 logger = init_logger(__name__)
+
+
+class PassthroughGrammar(StructuredOutputGrammar):
+    """Safety-net grammar that leaves decoding unconstrained."""
+
+    def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
+        return True
+
+    def validate_tokens(self, tokens: list[int]) -> list[int]:
+        return tokens
+
+    def rollback(self, num_tokens: int) -> None:
+        return None
+
+    def fill_bitmask(self, bitmask: "torch.Tensor", batch_index: int) -> None:
+        bitmask[batch_index].fill_(-1)
+
+    def is_terminated(self) -> bool:
+        return False
+
+    def reset(self):
+        return None
+
 
 
 class StructuredOutputManager:
@@ -138,6 +162,15 @@ class StructuredOutputManager:
         key = structured_req.structured_output_key
         return bool(key and key[0] == StructuredOutputOptions.STRUCTURAL_TAG)
 
+    @staticmethod
+    def _request_backend_name(request: "Request") -> str:
+        assert request.sampling_params is not None
+        assert request.sampling_params.structured_outputs is not None
+        backend = request.sampling_params.structured_outputs._backend
+        if backend is None:
+            raise ValueError("Structured output backend was not resolved")
+        return backend
+
     def _get_backend_for_request(self, request: "Request") -> StructuredOutputBackend:
         assert request.sampling_params is not None
         assert request.sampling_params.structured_outputs is not None
@@ -161,6 +194,54 @@ class StructuredOutputManager:
         self.backend = backend_instance
         self.backend_name = backend
         return backend_instance
+
+    def _guidance_fallback_backend_supported(self) -> bool:
+        return not (
+            is_mistral_tokenizer(self.tokenizer)
+            and not getattr(self.tokenizer, "is_tekken", False)
+        )
+
+    def _compile_with_guidance_fallback(
+        self,
+        request: "Request",
+        request_type: StructuredOutputOptions,
+        grammar_spec: str,
+        *,
+        disable_any_whitespace: bool | None,
+        disable_additional_properties: bool | None,
+        original_error: Exception,
+    ) -> StructuredOutputGrammar:
+        if not self._guidance_fallback_backend_supported():
+            logger.warning(
+                "Structured output xgrammar compilation failed for request %s and guidance fallback is unsupported for this tokenizer: %s",
+                request.request_id,
+                original_error,
+            )
+            return PassthroughGrammar()
+
+        try:
+            guidance_backend = self.backends.get("guidance")
+            if guidance_backend is None:
+                guidance_backend = self._create_backend("guidance")
+                self.backends["guidance"] = guidance_backend
+            grammar = guidance_backend.compile_grammar(
+                request_type,
+                grammar_spec,
+                disable_any_whitespace=disable_any_whitespace,
+                disable_additional_properties=disable_additional_properties,
+            )
+            logger.warning(
+                "Structured output xgrammar compilation failed for request %s; falling back to guidance: %s",
+                request.request_id,
+                original_error,
+            )
+            return grammar
+        except Exception:
+            logger.exception(
+                "Structured output grammar compilation failed for request %s in xgrammar and guidance fallback; falling back to unconstrained decoding.",
+                request.request_id,
+            )
+            return PassthroughGrammar()
 
     def grammar_init(self, request: "Request") -> None:
         if request.structured_output_request is None:
@@ -195,18 +276,36 @@ class StructuredOutputManager:
 
         backend = self._get_backend_for_request(request)
         so_params = request.sampling_params.structured_outputs
-        return backend.compile_grammar(
-            request_type,
-            grammar_spec,
-            disable_any_whitespace=(
-                None if so_params is None else so_params.disable_any_whitespace
-            ),
-            disable_additional_properties=(
-                None
-                if so_params is None
-                else so_params.disable_additional_properties
-            ),
+        disable_any_whitespace = (
+            None if so_params is None else so_params.disable_any_whitespace
         )
+        disable_additional_properties = (
+            None if so_params is None else so_params.disable_additional_properties
+        )
+        try:
+            return backend.compile_grammar(
+                request_type,
+                grammar_spec,
+                disable_any_whitespace=disable_any_whitespace,
+                disable_additional_properties=disable_additional_properties,
+            )
+        except Exception as err:
+            backend_name = self._request_backend_name(request)
+            if backend_name == "xgrammar":
+                return self._compile_with_guidance_fallback(
+                    request,
+                    request_type,
+                    grammar_spec,
+                    disable_any_whitespace=disable_any_whitespace,
+                    disable_additional_properties=disable_additional_properties,
+                    original_error=err,
+                )
+            logger.exception(
+                "Structured output grammar compilation failed for request %s with backend %s; falling back to unconstrained decoding for this request.",
+                request.request_id,
+                backend_name,
+            )
+            return PassthroughGrammar()
 
     def _fill_bitmasks(
         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]

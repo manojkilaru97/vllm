@@ -452,6 +452,26 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_scheduler_waiting, engine_indexes, model_name
         )
 
+        gauge_oldest_waiting_request_age = self._gauge_cls(
+            name="vllm:oldest_waiting_request_age_seconds",
+            documentation="Age in seconds of the oldest request currently waiting in the local scheduler queue.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_oldest_waiting_request_age = make_per_engine(
+            gauge_oldest_waiting_request_age, engine_indexes, model_name
+        )
+
+        gauge_oldest_running_request_age = self._gauge_cls(
+            name="vllm:oldest_running_request_age_seconds",
+            documentation="Age in seconds of the oldest request currently running in the local scheduler.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_oldest_running_request_age = make_per_engine(
+            gauge_oldest_running_request_age, engine_indexes, model_name
+        )
+
         gauge_engine_sleep_state = self._gauge_cls(
             name="vllm:engine_sleep_state",
             documentation=(
@@ -1041,6 +1061,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_scheduler_waiting[engine_idx].set(
                 scheduler_stats.num_waiting_reqs
+            )
+            self.gauge_oldest_waiting_request_age[engine_idx].set(
+                scheduler_stats.oldest_waiting_request_age_seconds
+            )
+            self.gauge_oldest_running_request_age[engine_idx].set(
+                scheduler_stats.oldest_running_request_age_seconds
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
 

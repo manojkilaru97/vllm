@@ -778,9 +778,40 @@ class SamplingParams(
         )
         from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
 
+        def _fallback_from_xgrammar(err: ValueError) -> None:
+            so_params = self.structured_outputs
+            assert so_params is not None
+
+            skip_guidance = False
+            if so_params.json:
+                if isinstance(so_params.json, str):
+                    schema = json_mod.loads(so_params.json)
+                else:
+                    schema = so_params.json
+                skip_guidance = has_guidance_unsupported_json_features(schema)
+
+            if is_mistral_tokenizer(tokenizer) or skip_guidance:
+                validate_structured_output_request_outlines(self)
+                so_params._backend = "outlines"
+                logger.warning(
+                    "xgrammar validation/compilation failed (%s); "
+                    "falling back to outlines structured output backend.",
+                    err,
+                )
+            else:
+                validate_guidance_grammar(self, tokenizer=None)
+                so_params._backend = "guidance"
+                logger.warning(
+                    "xgrammar validation/compilation failed (%s); "
+                    "falling back to guidance structured output backend.",
+                    err,
+                )
+
         if backend.startswith("xgrammar"):
-            # xgrammar with no fallback
-            validate_xgrammar_grammar(self)
+            try:
+                validate_xgrammar_grammar(self)
+            except ValueError as err:
+                _fallback_from_xgrammar(err)
         elif backend.startswith("guidance"):
             # TODO: ideally we would have the LLTokenizer here as Lark syntax
             # allows <|special_token|> and similar, see
