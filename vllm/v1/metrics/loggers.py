@@ -452,6 +452,26 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_scheduler_waiting, engine_indexes, model_name
         )
 
+        gauge_worker_local_waiting_queue_depth = self._gauge_cls(
+            name="vllm:worker_local_waiting_queue_depth",
+            documentation="Number of requests currently waiting in the local worker scheduler queue.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_worker_local_waiting_queue_depth = make_per_engine(
+            gauge_worker_local_waiting_queue_depth, engine_indexes, model_name
+        )
+
+        gauge_worker_local_running_queue_depth = self._gauge_cls(
+            name="vllm:worker_local_running_queue_depth",
+            documentation="Number of requests currently running in the local worker scheduler.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_worker_local_running_queue_depth = make_per_engine(
+            gauge_worker_local_running_queue_depth, engine_indexes, model_name
+        )
+
         gauge_oldest_waiting_request_age = self._gauge_cls(
             name="vllm:oldest_waiting_request_age_seconds",
             documentation="Age in seconds of the oldest request currently waiting in the local scheduler queue.",
@@ -1059,7 +1079,13 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_scheduler_running[engine_idx].set(
                 scheduler_stats.num_running_reqs
             )
+            self.gauge_worker_local_running_queue_depth[engine_idx].set(
+                scheduler_stats.num_running_reqs
+            )
             self.gauge_scheduler_waiting[engine_idx].set(
+                scheduler_stats.num_waiting_reqs
+            )
+            self.gauge_worker_local_waiting_queue_depth[engine_idx].set(
                 scheduler_stats.num_waiting_reqs
             )
             self.gauge_oldest_waiting_request_age[engine_idx].set(
