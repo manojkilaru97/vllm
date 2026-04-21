@@ -250,7 +250,7 @@ def _maybe_wait_for_collector():
             return
         retries += 1
         if retries > max_retries:
-            logger.warning("OTEL collector not healthy after %d retries", 
+            logger.warning("OTEL collector not healthy after %d retries",
                            max_retries)
             return
         time.sleep(backoff_s)
@@ -791,7 +791,7 @@ def init_otel(resource_attributes: Optional[dict] = None
     meter = None
     tracer = None
     logging_handler: Optional[logging.Handler] = None
-    
+
     # Track what was initialized for diagnostic output
     initialized_components = []
 
@@ -859,7 +859,7 @@ def init_otel(resource_attributes: Optional[dict] = None
         )
         for comp in initialized_components:
             msg += f"    - {comp}\n"
-        
+
         # Try to send a test log to verify connectivity
         if logging_handler is not None and log_endpoint:
             try:
@@ -877,7 +877,7 @@ def init_otel(resource_attributes: Optional[dict] = None
                 msg += f"Test log sent successfully to collector\n"
             except Exception as e:
                 msg += f"Test log failed (but handler is attached): {e}\n"
-        
+
         print(msg, file=sys.stderr, flush=True)
     else:
         print(

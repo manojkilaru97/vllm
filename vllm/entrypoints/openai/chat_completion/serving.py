@@ -839,7 +839,7 @@ class OpenAIServingChat(OpenAIServing):
 
         # Always track previous_texts for comprehensive output logging
         previous_texts = [""] * num_choices
-        
+
         # Track reasoning, content and tool calls separately for proper logging
         previous_reasoning_texts = [""] * num_choices
         previous_content_texts = [""] * num_choices
@@ -1599,7 +1599,7 @@ class OpenAIServingChat(OpenAIServing):
                         assert all_previous_token_ids is not None
                         previous_texts[i] = current_text
                         all_previous_token_ids[i] = current_token_ids
-                        
+
                         # Track reasoning, content, and tool calls separately for logging
                         if delta_message:
                             if delta_message.reasoning:
@@ -1632,7 +1632,7 @@ class OpenAIServingChat(OpenAIServing):
                         # Update for comprehensive logging even in simple case
                         assert previous_texts is not None
                         previous_texts[i] += delta_text
-                        
+
                         # Track reasoning and content separately for logging
                         if delta_message:
                             if delta_message.reasoning:
@@ -2114,12 +2114,12 @@ class OpenAIServingChat(OpenAIServing):
                     reasoning_text = previous_reasoning_texts[i]
                     content_text = previous_content_texts[i]
                     tool_calls_list = previous_tool_calls[i]
-                    
+
                     logger.debug(
                         "Streaming complete for request %s, choice %d: reasoning_length=%d, content_length=%d, tool_calls=%d",
                         request_id, i, len(reasoning_text), len(content_text), len(tool_calls_list)
                     )
-                    
+
                     if reasoning_text:
                         logger.debug(
                             "Logging reasoning part for request %s: [reasoning] %s...",
@@ -2133,7 +2133,7 @@ class OpenAIServingChat(OpenAIServing):
                             is_streaming=True,
                             delta=False,
                         )
-                    
+
                     if content_text:
                         logger.debug(
                             "Logging content part for request %s: %s...",
@@ -2147,7 +2147,7 @@ class OpenAIServingChat(OpenAIServing):
                             is_streaming=True,
                             delta=False,
                         )
-                    
+
                     # Log tool calls if present (similar to non-streaming mode)
                     if tool_calls_list:
                         tool_call_descriptions = []
@@ -2171,7 +2171,7 @@ class OpenAIServingChat(OpenAIServing):
                                 is_streaming=True,
                                 delta=False,
                             )
-                    
+
                     # If neither reasoning nor content nor tool calls, log a fallback message
                     if not reasoning_text and not content_text and not tool_calls_list:
                         full_text = (
@@ -2628,13 +2628,13 @@ class OpenAIServingChat(OpenAIServing):
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
             for choice in choices:
-                # Log reasoning 
+                # Log reasoning
                 if hasattr(choice.message, 'reasoning') and choice.message.reasoning:
                     self.request_logger.log_outputs(
                         request_id=request_id,
                         outputs=f"[reasoning] {choice.message.reasoning}",
                         output_token_ids=None,
-                        finish_reason=None,  
+                        finish_reason=None,
                         is_streaming=False,
                         delta=False,
                     )

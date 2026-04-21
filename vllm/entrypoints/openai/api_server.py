@@ -700,9 +700,9 @@ async def run_server_worker(
                     if record.name.startswith('vllm.v1.metrics'):
                         return False
                     return True
-            
+
             _otel_handler.addFilter(OtelLogFilter())
-            
+
             # Attach OTEL handler to root vllm logger to capture request/response logs
             vllm_root_logger = logging.getLogger("vllm")
             # Avoid duplicate handlers if reinitialized
@@ -710,7 +710,7 @@ async def run_server_worker(
                       for h in vllm_root_logger.handlers):
                 vllm_root_logger.addHandler(_otel_handler)
                 logger.info("OpenTelemetry logging handler attached to vllm root logger")
-            
+
             # Add filter to console handlers to exclude request/response logs (OTEL only)
             class ConsoleLogFilter(logging.Filter):
                 def filter(self, record):
@@ -721,12 +721,12 @@ async def run_server_worker(
                     if 'Generated response' in msg and 'chatcmpl-' in msg:
                         return False
                     return True
-            
+
             # Apply filter to all existing console/stream handlers
             for handler in vllm_root_logger.handlers:
                 if isinstance(handler, logging.StreamHandler) and not isinstance(handler, type(_otel_handler)):
                     handler.addFilter(ConsoleLogFilter())
-        
+
         # Start Prometheus -> OTEL metrics bridge if meter available/env configured
         if meter is not None or os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"):
             scrape_target = os.getenv("VLLM_SCRAPE_TARGET")
@@ -740,7 +740,7 @@ async def run_server_worker(
             interval_s = float(os.getenv("VLLM_PROM_SCRAPE_INTERVAL", "30"))
             try:
                 start_prom_to_otel_bridge(scrape_url, interval_seconds=interval_s)
-                logger.info("OpenTelemetry Prometheus bridge started (scraping %s every %ds)", 
+                logger.info("OpenTelemetry Prometheus bridge started (scraping %s every %ds)",
                            scrape_url, int(interval_s))
             except Exception as e:
                 logger.warning("Failed to start Prometheus bridge: %s", e)

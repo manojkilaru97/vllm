@@ -21,4 +21,3 @@ def reset_request_id(token: Token[Optional[str]]) -> None:
 
 def get_request_id() -> str | None:
     return _REQUEST_ID.get()
-
