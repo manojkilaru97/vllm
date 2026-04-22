@@ -34,6 +34,7 @@ from vllm.payload_sanitization import (
     maybe_redact_mm_payload,
     prepare_request_payload_for_logging,
 )
+from vllm.entrypoints.openai.request_metrics import summarize_request_payload
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
@@ -65,6 +66,7 @@ async def _log_request_payload(req: Request) -> None:
             payload = json.loads(body)
     except Exception:
         payload = None
+    summary = summarize_request_payload(payload)
     allowed_local_media_path = ""
     try:
         serving_chat = getattr(req.app.state, "openai_serving_chat", None)
@@ -76,18 +78,33 @@ async def _log_request_payload(req: Request) -> None:
     except Exception:
         allowed_local_media_path = ""
     try:
+        extra = {
+            "rid": rid,
+            "endpoint": req.url.path,
+            "input_image_count": summary.image_count,
+            "input_video_count": summary.video_count,
+            "input_audio_count": summary.audio_count,
+            "input_tool_count": summary.tool_count,
+            "has_images": summary.has_images,
+            "has_videos": summary.has_videos,
+            "has_audios": summary.has_audios,
+            "has_tools": summary.has_tools,
+            "has_tool_calls_enabled": summary.has_tool_calls_enabled,
+            "has_structured_output": summary.has_structured_output,
+        }
+        if summary.tool_choice is not None:
+            extra["tool_choice"] = summary.tool_choice
+        if summary.structured_output_kind is not None:
+            extra["structured_output_kind"] = summary.structured_output_kind
+        extra["payload"] = prepare_request_payload_for_logging(
+            payload,
+            headers=headers_obj,
+            allowed_local_media_path=allowed_local_media_path,
+        )
+        extra["headers"] = headers_obj
         payload_logger.info(
             "openai.request",
-            extra={
-                "rid": rid,
-                "endpoint": req.url.path,
-                "payload": prepare_request_payload_for_logging(
-                    payload,
-                    headers=headers_obj,
-                    allowed_local_media_path=allowed_local_media_path,
-                ),
-                "headers": headers_obj,
-            },
+            extra=extra,
         )
     except Exception:
         pass

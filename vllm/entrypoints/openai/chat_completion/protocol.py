@@ -96,6 +96,12 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: list[ChatCompletionLogProbsContent] | None = None
 
 
+class ChatCompletionReasoning(OpenAIBaseModel):
+    enabled: bool | None = None
+    effort: Literal["none", "low", "medium", "high"] | None = None
+    max_tokens: int | None = None
+
+
 class ChatCompletionResponseChoice(OpenAIBaseModel):
     index: int
     message: ChatMessage
@@ -194,7 +200,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | ChatCompletionNamedToolChoiceParam
         | None
     ) = "none"
+    reasoning: ChatCompletionReasoning | None = None
     reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
+    reasoning_budget: int | None = None
+    reasoning_budget_grace_period: int | None = None
     thinking_token_budget: int | None = None
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
@@ -839,9 +848,56 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def set_include_reasoning_for_none_effort(cls, data: Any) -> Any:
-        if data.get("reasoning_effort") == "none":
+    def normalize_reasoning_compatibility_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        reasoning = data.get("reasoning")
+        if isinstance(reasoning, dict):
+            reasoning_enabled = reasoning.get("enabled")
+            reasoning_effort = reasoning.get("effort")
+            reasoning_max_tokens = reasoning.get("max_tokens")
+        else:
+            reasoning_enabled = getattr(reasoning, "enabled", None)
+            reasoning_effort = getattr(reasoning, "effort", None)
+            reasoning_max_tokens = getattr(reasoning, "max_tokens", None)
+
+        if data.get("reasoning_effort") is None and reasoning_effort is not None:
+            data["reasoning_effort"] = reasoning_effort
+
+        if (
+            data.get("reasoning_budget") is None
+            and data.get("thinking_token_budget") is None
+            and reasoning_max_tokens is not None
+        ):
+            data["reasoning_budget"] = reasoning_max_tokens
+
+        chat_template_kwargs = data.get("chat_template_kwargs")
+        if isinstance(chat_template_kwargs, dict):
+            chat_template_kwargs = dict(chat_template_kwargs)
+        elif chat_template_kwargs is None:
+            chat_template_kwargs = {}
+        else:
+            try:
+                chat_template_kwargs = dict(chat_template_kwargs)
+            except Exception:
+                chat_template_kwargs = {}
+
+        has_explicit_enable_thinking = "enable_thinking" in chat_template_kwargs
+        effective_reasoning_effort = data.get("reasoning_effort")
+
+        if has_explicit_enable_thinking:
+            if chat_template_kwargs.get("enable_thinking") is False:
+                data["include_reasoning"] = False
+        else:
+            if reasoning_enabled is False or effective_reasoning_effort == "none":
+                chat_template_kwargs["enable_thinking"] = False
+                data["include_reasoning"] = False
+                data["chat_template_kwargs"] = chat_template_kwargs
+
+        if effective_reasoning_effort == "none":
             data["include_reasoning"] = False
+
         return data
 
 

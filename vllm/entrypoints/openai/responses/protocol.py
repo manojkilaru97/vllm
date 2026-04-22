@@ -166,6 +166,7 @@ class ResponsesRequest(OpenAIBaseModel):
     text: ResponseTextConfig | None = None
     tool_choice: ToolChoice = "auto"
     tools: list[Tool] = Field(default_factory=list)
+    include_reasoning: bool = True
     top_logprobs: int | None = 0
     top_p: float | None = None
     top_k: int | None = None
@@ -447,6 +448,33 @@ class ResponsesRequest(OpenAIBaseModel):
                 "Parameter 'cache_salt' must be a non-empty string if provided.",
                 parameter="cache_salt",
             )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_tools_and_reasoning(cls, data):
+        tools = data.get("tools")
+        if isinstance(tools, list):
+            normalized_tools = []
+            for tool in tools:
+                if (
+                    isinstance(tool, dict)
+                    and tool.get("type") == "function"
+                    and isinstance(tool.get("function"), dict)
+                ):
+                    function_tool = dict(tool["function"])
+                    function_tool.setdefault("type", "function")
+                    if "strict" in tool and "strict" not in function_tool:
+                        function_tool["strict"] = tool["strict"]
+                    normalized_tools.append(function_tool)
+                else:
+                    normalized_tools.append(tool)
+            data["tools"] = normalized_tools
+
+        reasoning = data.get("reasoning")
+        if isinstance(reasoning, dict) and reasoning.get("effort") == "none":
+            data["include_reasoning"] = False
+
         return data
 
     @model_validator(mode="before")

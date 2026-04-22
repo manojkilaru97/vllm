@@ -90,6 +90,7 @@ if TYPE_CHECKING:
 from vllm.entrypoints.openai.request_metrics import (
     classify_chat_request,
     record_aborted_request,
+    summarize_request_payload,
 )
 
 logger = init_logger(__name__)
@@ -387,12 +388,38 @@ class OpenAIServingChat(OpenAIServing):
                 except Exception:
                     allowed_local_media_path = ""
                 try:
+                    summary = summarize_request_payload(req_dump)
                     payload_logger.info(
                         "openai.request",
                         extra={
                             "rid": rid_hint or "",
                             "endpoint": self.__class__.__name__,
-                            # Pass dict directly for proper OTEL structured logging
+                            "input_image_count": summary.image_count,
+                            "input_video_count": summary.video_count,
+                            "input_audio_count": summary.audio_count,
+                            "input_tool_count": summary.tool_count,
+                            "has_images": summary.has_images,
+                            "has_videos": summary.has_videos,
+                            "has_audios": summary.has_audios,
+                            "has_tools": summary.has_tools,
+                            "has_tool_calls_enabled": summary.has_tool_calls_enabled,
+                            "has_structured_output": summary.has_structured_output,
+                            **(
+                                {"tool_choice": summary.tool_choice}
+                                if summary.tool_choice is not None
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "structured_output_kind":
+                                    summary.structured_output_kind
+                                }
+                                if summary.structured_output_kind is not None
+                                else {}
+                            ),
+                            # Keep the large nested payload fields last so
+                            # scalar summary attrs are not first to hit OTEL
+                            # per-record attribute limits.
                             "payload": prepare_request_payload_for_logging(
                                 req_dump,
                                 headers=headers_obj,
@@ -708,6 +735,98 @@ class OpenAIServingChat(OpenAIServing):
             tool_type if isinstance(tool_type, str) else None,
         )
 
+    def _build_final_auto_tool_stream_delta(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        tokenizer: TokenizerLike | None,
+        request_id: str,
+        history_tool_call_cnt: int,
+        current_text: str,
+        previous_tool_calls: list[dict[str, Any]],
+        base_delta_message: DeltaMessage | None,
+    ) -> DeltaMessage | None:
+        if not (
+            request.tools
+            and self.enable_auto_tools
+            and self.tool_parser
+            and current_text
+        ):
+            return None
+
+        parsed_calls, _ = self._parse_tool_calls_from_content(
+            request=request,
+            tokenizer=tokenizer,
+            content=current_text,
+            enable_auto_tools=self.enable_auto_tools,
+            tool_parser_cls=self.tool_parser,
+        )
+        if not parsed_calls:
+            return None
+
+        tool_deltas: list[DeltaToolCall] = []
+        for tc_idx, parsed_call in enumerate(parsed_calls):
+            expected_name = parsed_call.name
+            expected_arguments = parsed_call.arguments or ""
+            (
+                emitted_name,
+                emitted_arguments,
+                emitted_id,
+                emitted_type,
+            ) = self._required_emitted_tool_state(previous_tool_calls, tc_idx)
+
+            name_delta = None
+            if emitted_name != expected_name:
+                name_delta = expected_name
+
+            if emitted_arguments == expected_arguments:
+                remaining_call = ""
+            elif (
+                emitted_arguments
+                and expected_arguments.startswith(emitted_arguments)
+            ):
+                remaining_call = expected_arguments[len(emitted_arguments) :]
+            else:
+                remaining_call = expected_arguments
+
+            if name_delta is None and not remaining_call and emitted_id is not None:
+                continue
+
+            tool_deltas.append(
+                DeltaToolCall(
+                    index=tc_idx,
+                    id=(
+                        emitted_id
+                        or parsed_call.id
+                        or make_tool_call_id(
+                            id_type=self.tool_call_id_type,
+                            func_name=expected_name,
+                            idx=history_tool_call_cnt + tc_idx,
+                        )
+                    ),
+                    type=emitted_type or "function",
+                    function=DeltaFunctionCall(
+                        name=name_delta,
+                        arguments=remaining_call,
+                    ),
+                )
+            )
+
+        if not tool_deltas:
+            return None
+
+        return DeltaMessage(
+            role=base_delta_message.role if base_delta_message else None,
+            content=base_delta_message.content if base_delta_message else None,
+            reasoning=(
+                base_delta_message.reasoning_content
+                or base_delta_message.reasoning
+            )
+            if base_delta_message
+            else None,
+            tool_calls=tool_deltas,
+        )
+
     @staticmethod
     def _accumulate_stream_delta_state(
         *,
@@ -983,6 +1102,7 @@ class OpenAIServingChat(OpenAIServing):
         )
 
         all_previous_token_ids: list[list[int]] | None
+        added_content_delta_arr: list[bool] | None
         function_name_returned = [False] * num_choices
         if self.tool_call_id_type == "kimi_k2":
             history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
@@ -1004,10 +1124,12 @@ class OpenAIServingChat(OpenAIServing):
         if tool_choice_auto or reasoning_parser:
             # These are only required in "auto" tool choice case
             all_previous_token_ids = [[] for _ in range(num_choices)]
+            added_content_delta_arr = [False] * num_choices
             reasoning_end_arr = [False] * num_choices
             prompt_is_reasoning_end_arr: list[bool | None] = [None] * num_choices
         else:
             all_previous_token_ids = None
+            added_content_delta_arr = None
 
         try:
             if self.parser_cls is not None:
@@ -1449,6 +1571,61 @@ class OpenAIServingChat(OpenAIServing):
                             )
                             if delta_message and delta_message.tool_calls:
                                 tools_streamed[i] = True
+                    # handle streaming reasoning/content splits when no tools
+                    elif reasoning_parser:
+                        assert added_content_delta_arr is not None
+                        assert reasoning_end_arr is not None
+                        output_token_ids = as_list(output.token_ids)
+
+                        if (
+                            not reasoning_end_arr[i]
+                            and prompt_is_reasoning_end_arr[i]
+                        ):
+                            reasoning_end_arr[i] = True
+
+                        if not reasoning_end_arr[i]:
+                            delta_message = (
+                                reasoning_parser.extract_reasoning_streaming(
+                                    previous_text,
+                                    current_text,
+                                    delta_text,
+                                    previous_token_ids,
+                                    current_token_ids,
+                                    output_token_ids,
+                                )
+                            )
+                            if reasoning_parser.is_reasoning_end(output_token_ids):
+                                reasoning_end_arr[i] = True
+                                current_token_ids = (
+                                    reasoning_parser.extract_content_ids(
+                                        output_token_ids
+                                    )
+                                )
+                                if delta_message and delta_message.content:
+                                    current_text = delta_message.content
+                                    delta_message.content = None
+                                else:
+                                    current_text = ""
+                                if current_text:
+                                    added_content_delta_arr[i] = True
+                                    delta_message = self._merge_delta_messages(
+                                        delta_message,
+                                        DeltaMessage(content=current_text),
+                                    )
+                        else:
+                            if not added_content_delta_arr[i]:
+                                added_content_delta_arr[i] = True
+                                delta_message = (
+                                    DeltaMessage(content=current_text)
+                                    if current_text
+                                    else None
+                                )
+                            else:
+                                delta_message = (
+                                    DeltaMessage(content=delta_text)
+                                    if delta_text
+                                    else None
+                                )
                     # when only tool calls
                     elif tool_choice_auto:
                         assert tool_parser is not None
@@ -1585,98 +1762,112 @@ class OpenAIServingChat(OpenAIServing):
                             index = 0
 
                         if tool_parser and auto_tools_called:
-                            if (
-                                delta_message is None
-                                or not delta_message.tool_calls
-                            ):
-                                # Some tool parsers finish with an empty/content
-                                # delta after having already streamed most of the
-                                # tool arguments. In that case we still need to
-                                # compare the parser's final expected arguments
-                                # against what was streamed so far and emit the
-                                # missing suffix (commonly the final "}").
-                                delta_message = DeltaMessage(
-                                    tool_calls=[
-                                        DeltaToolCall(
-                                            index=index,
-                                            function=DeltaFunctionCall(arguments=""),
+                            final_auto_delta = (
+                                self._build_final_auto_tool_stream_delta(
+                                    request=request,
+                                    tokenizer=tokenizer,
+                                    request_id=request_id,
+                                    history_tool_call_cnt=history_tool_call_cnt,
+                                    current_text=current_text,
+                                    previous_tool_calls=previous_tool_calls[i],
+                                    base_delta_message=delta_message,
+                                )
+                            )
+                            if final_auto_delta is not None:
+                                delta_message = final_auto_delta
+                            else:
+                                if (
+                                    delta_message is None
+                                    or not delta_message.tool_calls
+                                ):
+                                    # Some tool parsers finish with an empty/content
+                                    # delta after having already streamed most of the
+                                    # tool arguments. In that case we still need to
+                                    # compare the parser's final expected arguments
+                                    # against what was streamed so far and emit the
+                                    # missing suffix (commonly the final "}").
+                                    delta_message = DeltaMessage(
+                                        tool_calls=[
+                                            DeltaToolCall(
+                                                index=index,
+                                                function=DeltaFunctionCall(arguments=""),
+                                            )
+                                        ]
+                                    )
+
+                                if self._should_check_for_unstreamed_tool_arg_tokens(
+                                    delta_message, output
+                                ):
+                                    latest_delta_len = 0
+                                    if (
+                                        isinstance(
+                                            delta_message.tool_calls[0].function,
+                                            DeltaFunctionCall,
                                         )
-                                    ]
-                                )
+                                    ) and isinstance(
+                                        delta_message.tool_calls[0].function.arguments,
+                                        str,
+                                    ):
+                                        latest_delta_len = len(
+                                            delta_message.tool_calls[0].function.arguments
+                                        )
 
-                            if self._should_check_for_unstreamed_tool_arg_tokens(
-                                delta_message, output
-                            ):
-                                latest_delta_len = 0
-                                if (
-                                    isinstance(
-                                        delta_message.tool_calls[0].function,
-                                        DeltaFunctionCall,
+                                # get the expected call based on partial JSON
+                                # parsing which "autocompletes" the JSON.
+                                # Tool parsers (e.g. Qwen3Coder) store
+                                # arguments as a JSON string in
+                                # prev_tool_call_arr. Calling json.dumps()
+                                # on an already-serialized string would
+                                # double-serialize it (e.g. '{"k":1}' becomes
+                                # '"{\\"k\\":1}"'), which then causes the
+                                # replace() below to fail and append the
+                                # entire double-serialized string as a
+                                # spurious final delta.
+                                    args = tool_parser.prev_tool_call_arr[index].get(
+                                        "arguments", {}
                                     )
-                                ) and isinstance(
-                                    delta_message.tool_calls[0].function.arguments,
-                                    str,
-                                ):
-                                    latest_delta_len = len(
-                                        delta_message.tool_calls[0].function.arguments
+                                    if isinstance(args, str):
+                                        expected_call = args
+                                    else:
+                                        expected_call = json.dumps(
+                                            args, ensure_ascii=False
+                                        )
+
+                                # get what we've streamed so far for arguments
+                                # for the current tool
+                                    actual_call_full = (
+                                        tool_parser.streamed_args_for_tool[index]
                                     )
+                                    # Some tool parsers initialize their internal
+                                    # state with a placeholder "{}" and only replace it
+                                    # once they fully parse the closing tag. If that
+                                    # replacement never happens but we already streamed
+                                    # concrete argument text, prefer the streamed text
+                                    # over the placeholder to avoid appending a bogus
+                                    # trailing "{}" on the finish chunk.
+                                    if (
+                                        expected_call == "{}"
+                                        and actual_call_full
+                                        and actual_call_full != "{}"
+                                    ):
+                                        expected_call = actual_call_full
 
-                            # get the expected call based on partial JSON
-                            # parsing which "autocompletes" the JSON.
-                            # Tool parsers (e.g. Qwen3Coder) store
-                            # arguments as a JSON string in
-                            # prev_tool_call_arr. Calling json.dumps()
-                            # on an already-serialized string would
-                            # double-serialize it (e.g. '{"k":1}' becomes
-                            # '"{\\"k\\":1}"'), which then causes the
-                            # replace() below to fail and append the
-                            # entire double-serialized string as a
-                            # spurious final delta.
-                                args = tool_parser.prev_tool_call_arr[index].get(
-                                    "arguments", {}
-                                )
-                                if isinstance(args, str):
-                                    expected_call = args
-                                else:
-                                    expected_call = json.dumps(
-                                        args, ensure_ascii=False
-                                    )
+                                    actual_call = actual_call_full
+                                    if latest_delta_len > 0:
+                                        actual_call = actual_call[:-latest_delta_len]
 
-                            # get what we've streamed so far for arguments
-                            # for the current tool
-                                actual_call_full = (
-                                    tool_parser.streamed_args_for_tool[index]
-                                )
-                                # Some tool parsers initialize their internal
-                                # state with a placeholder "{}" and only replace it
-                                # once they fully parse the closing tag. If that
-                                # replacement never happens but we already streamed
-                                # concrete argument text, prefer the streamed text
-                                # over the placeholder to avoid appending a bogus
-                                # trailing "{}" on the finish chunk.
-                                if (
-                                    expected_call == "{}"
-                                    and actual_call_full
-                                    and actual_call_full != "{}"
-                                ):
-                                    expected_call = actual_call_full
-
-                                actual_call = actual_call_full
-                                if latest_delta_len > 0:
-                                    actual_call = actual_call[:-latest_delta_len]
-
-                            # Only synthesize a final arguments delta when the
-                            # expected full arguments are a clean extension of
-                            # what we had already streamed before this chunk.
-                            # If they diverge, keep the original delta rather
-                            # than appending junk such as a placeholder "{}".
-                                if expected_call.startswith(actual_call):
-                                    remaining_call = expected_call[
-                                        len(actual_call) :
-                                    ]
-                                    delta_message = self._create_remaining_args_delta(
-                                        delta_message, remaining_call, index
-                                    )
+                                # Only synthesize a final arguments delta when the
+                                # expected full arguments are a clean extension of
+                                # what we had already streamed before this chunk.
+                                # If they diverge, keep the original delta rather
+                                # than appending junk such as a placeholder "{}".
+                                    if expected_call.startswith(actual_call):
+                                        remaining_call = expected_call[
+                                            len(actual_call) :
+                                        ]
+                                        delta_message = self._create_remaining_args_delta(
+                                            delta_message, remaining_call, index
+                                        )
                         elif request.tool_choice == "required":
                             final_required_tools = (
                                 self._parse_partial_required_tool_list(current_text)
@@ -2072,17 +2263,30 @@ class OpenAIServingChat(OpenAIServing):
                 choices.append(choice_data)
                 continue
 
+            extracted_reasoning: str | None = None
             if reasoning_parser:
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
-                reasoning, content = reasoning_parser.extract_reasoning(
+                extracted_reasoning, content = reasoning_parser.extract_reasoning(
                     output.text, request=request
                 )
-                if not request.include_reasoning:
-                    reasoning = None
+                reasoning = (
+                    extracted_reasoning if request.include_reasoning else None
+                )
             else:
+                extracted_reasoning = None
                 reasoning = None
                 content = output.text
+
+            reasoning, content = self._duplicate_unclosed_reasoning_into_content(
+                request=request,
+                reasoning=reasoning,
+                raw_reasoning=extracted_reasoning,
+                content=content,
+                finish_reason=output.finish_reason,
+                model_output=output.text,
+                reasoning_parser=reasoning_parser,
+            )
 
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
@@ -2415,6 +2619,39 @@ class OpenAIServingChat(OpenAIServing):
             return new_msg
 
         return [clean_message(m) for m in messages]
+
+    @staticmethod
+    def _duplicate_unclosed_reasoning_into_content(
+        request: ChatCompletionRequest,
+        reasoning: str | None,
+        raw_reasoning: str | None,
+        content: str | None,
+        finish_reason: str | None,
+        model_output: str,
+        reasoning_parser: ReasoningParser | None,
+    ) -> tuple[str | None, str | None]:
+        if content and content.strip():
+            return reasoning, content
+
+        if finish_reason != "stop":
+            return reasoning, content
+
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+        if chat_template_kwargs.get("enable_thinking") is not True:
+            return reasoning, content
+
+        candidate = (raw_reasoning or "").strip()
+        if not candidate:
+            return reasoning, content
+
+        end_token = getattr(reasoning_parser, "end_token", None)
+        if not isinstance(end_token, str) or not end_token:
+            return reasoning, content
+
+        if end_token in model_output:
+            return reasoning, content
+
+        return reasoning, raw_reasoning
 
     def _get_top_logprobs(
         self,

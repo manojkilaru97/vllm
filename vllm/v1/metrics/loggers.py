@@ -539,8 +539,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             multiprocess_mode="mostrecent",
             labelnames=labelnames,
         )
-        self.gauge_gen_throughput = make_per_engine(
-            gauge_gen_throughput, engine_indexes, model_name
+        self.gauge_gen_throughput = create_metric_per_engine(
+            gauge_gen_throughput, per_engine_labelvalues
         )
 
         gauge_engine_startup_time = self._gauge_cls(
@@ -549,8 +549,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             multiprocess_mode="mostrecent",
             labelnames=labelnames,
         )
-        self.gauge_engine_startup_time = make_per_engine(
-            gauge_engine_startup_time, engine_indexes, model_name
+        self.gauge_engine_startup_time = create_metric_per_engine(
+            gauge_engine_startup_time, per_engine_labelvalues
         )
 
         gauge_engine_load_weights_time = self._gauge_cls(
@@ -559,8 +559,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             multiprocess_mode="mostrecent",
             labelnames=labelnames,
         )
-        self.gauge_engine_load_weights_time = make_per_engine(
-            gauge_engine_load_weights_time, engine_indexes, model_name
+        self.gauge_engine_load_weights_time = create_metric_per_engine(
+            gauge_engine_load_weights_time, per_engine_labelvalues
         )
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -793,8 +793,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                      40, 50, 75, 100],
             labelnames=labelnames,
         )
-        self.histogram_num_preemptions_request = make_per_engine(
-            histogram_num_preemptions_request, engine_indexes, model_name
+        self.histogram_num_preemptions_request = create_metric_per_engine(
+            histogram_num_preemptions_request, per_engine_labelvalues
         )
 
         #
@@ -866,8 +866,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 ],
                 labelnames=labelnames,
             )
-            self.histogram_time_per_output_token = make_per_engine(
-                histogram_time_per_output_token, engine_indexes, model_name
+            self.histogram_time_per_output_token = create_metric_per_engine(
+                histogram_time_per_output_token, per_engine_labelvalues
             )
 
         histogram_inter_token_latency = self._histogram_cls(
@@ -1128,8 +1128,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 labelnames=labelnames,
                 multiprocess_mode="mostrecent",
             )
-            self.gauge_lora_pool_utilization = make_per_engine(
-                gauge_lora_pool_utilization, engine_indexes, model_name
+            self.gauge_lora_pool_utilization = create_metric_per_engine(
+                gauge_lora_pool_utilization, per_engine_labelvalues
             )
 
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):

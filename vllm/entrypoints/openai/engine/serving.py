@@ -58,16 +58,17 @@ from vllm.entrypoints.serve.tokenize.protocol import (
 from vllm.tool_parsers.utils import partial_json_loads
 from vllm.entrypoints.utils import create_error_response, get_max_tokens
 from vllm.exceptions import VLLMValidationError
-from vllm.inputs.data import (
-    ProcessorInputs,
+from vllm.inputs import (
+    EngineInput,
     PromptType,
     SingletonPrompt,
     TokensPrompt,
-    token_inputs,
+    tokens_input,
 )
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.processing import ProcessorInputs
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers import ChatParams, TokenizeParams
 from vllm.renderers.inputs.preprocess import (
@@ -615,6 +616,157 @@ class OpenAIServing:
             return None
 
     @staticmethod
+    def _iter_tool_parameter_schemas(
+        request: ResponsesRequest | ChatCompletionRequest,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        schemas: list[tuple[str, dict[str, Any]]] = []
+        for tool in request.tools or []:
+            function = getattr(tool, "function", None)
+            name = getattr(function, "name", None)
+            parameters = getattr(function, "parameters", None)
+            if not isinstance(name, str):
+                name = getattr(tool, "name", None)
+                parameters = getattr(tool, "parameters", None)
+            if isinstance(name, str) and isinstance(parameters, dict):
+                schemas.append((name, parameters))
+        return schemas
+
+    @staticmethod
+    def _schema_allows_json_container(
+        schema: Any,
+        container_type: str,
+    ) -> bool:
+        if not isinstance(schema, dict):
+            return False
+
+        schema_type = schema.get("type")
+        if schema_type == container_type:
+            return True
+        if isinstance(schema_type, list) and container_type in schema_type:
+            return True
+
+        for union_key in ("anyOf", "oneOf", "allOf"):
+            union_schemas = schema.get(union_key)
+            if not isinstance(union_schemas, list):
+                continue
+            if any(
+                OpenAIServing._schema_allows_json_container(
+                    branch, container_type
+                )
+                for branch in union_schemas
+            ):
+                return True
+
+        return False
+
+    @staticmethod
+    def _normalize_stringified_json_containers(
+        value: Any,
+        schema: Any,
+    ) -> Any:
+        if isinstance(value, str):
+            for container_type, expected_python_type in (
+                ("object", dict),
+                ("array", list),
+            ):
+                if not OpenAIServing._schema_allows_json_container(
+                    schema, container_type
+                ):
+                    continue
+                try:
+                    parsed = json.loads(value)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    return value
+                if isinstance(parsed, expected_python_type):
+                    value = parsed
+                break
+
+        if isinstance(value, dict) and isinstance(schema, dict):
+            properties = schema.get("properties")
+            if not isinstance(properties, dict):
+                for union_key in ("anyOf", "oneOf", "allOf"):
+                    union_schemas = schema.get(union_key)
+                    if not isinstance(union_schemas, list):
+                        continue
+                    for branch in union_schemas:
+                        normalized = (
+                            OpenAIServing._normalize_stringified_json_containers(
+                                value, branch
+                            )
+                        )
+                        if normalized != value:
+                            return normalized
+                return value
+
+            normalized_object = dict(value)
+            for key, item in value.items():
+                item_schema = properties.get(key)
+                if item_schema is None:
+                    continue
+                normalized_object[key] = (
+                    OpenAIServing._normalize_stringified_json_containers(
+                        item, item_schema
+                    )
+                )
+            return normalized_object
+
+        if isinstance(value, list) and isinstance(schema, dict):
+            items_schema = schema.get("items")
+            if items_schema is None:
+                for union_key in ("anyOf", "oneOf", "allOf"):
+                    union_schemas = schema.get(union_key)
+                    if not isinstance(union_schemas, list):
+                        continue
+                    for branch in union_schemas:
+                        normalized = (
+                            OpenAIServing._normalize_stringified_json_containers(
+                                value, branch
+                            )
+                        )
+                        if normalized != value:
+                            return normalized
+                return value
+
+            return [
+                OpenAIServing._normalize_stringified_json_containers(
+                    item, items_schema
+                )
+                for item in value
+            ]
+
+        return value
+
+    @staticmethod
+    def _normalize_tool_call_arguments(
+        request: ResponsesRequest | ChatCompletionRequest,
+        function_calls: list[FunctionCall],
+    ) -> None:
+        if not function_calls or not request.tools:
+            return
+
+        schema_by_name = dict(OpenAIServing._iter_tool_parameter_schemas(request))
+        if not schema_by_name:
+            return
+
+        for function_call in function_calls:
+            schema = schema_by_name.get(function_call.name)
+            if schema is None:
+                continue
+            try:
+                arguments = json.loads(function_call.arguments)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            normalized_arguments = (
+                OpenAIServing._normalize_stringified_json_containers(
+                    arguments, schema
+                )
+            )
+            if normalized_arguments != arguments:
+                function_call.arguments = json.dumps(
+                    normalized_arguments, ensure_ascii=False
+                )
+
+    @staticmethod
     def _parse_tool_calls_from_content(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
@@ -717,6 +869,7 @@ class OpenAIServing:
                 # No tool calls.
                 return None, content
 
+        OpenAIServing._normalize_tool_call_arguments(request, function_calls)
         return function_calls, content
 
     @staticmethod
