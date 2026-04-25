@@ -16,6 +16,7 @@ raising, and returns None where appropriate.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import sys
@@ -49,14 +50,18 @@ _PROM_BUCKET_PREV: Dict[Tup[str, Tup[Tup[str, str], ...]], float] = {}
 _PROM_COUNTERS: Dict[str, Any] = {}
 _PROM_GAUGE_VALUES: Dict[str, Dict[Tup[Tup[str, str], ...], float]] = {}
 _PROM_GAUGES: Dict[str, Any] = {}
+_PROM_LOCK = threading.RLock()
 
 # Logging queue/processor globals
 _LOG_QUEUE: Optional[queue.Queue] = None
 _QUEUE_LISTENER: Optional[QueueListener] = None
+_QUEUE_LISTENER_LOCK = threading.Lock()
+_QUEUE_LISTENER_ATEXIT_REGISTERED = False
 
 # Cached bucket per namespace (best-effort)
 _KRATOS_BUCKET_CACHE: Dict[str, str] = {}
 _OFFLOAD_CACHE: Dict[str, str] = {}  # sha256(data) -> uri (best-effort dedup)
+_OFFLOAD_CACHE_LOCK = threading.RLock()
 
 # Media mirroring (HTTP URLs / NVCF assets -> S3 via kratos) is intentionally
 # separate from "log offload" so it can emit a correlation event without
@@ -506,19 +511,21 @@ def _start_media_mirror_worker() -> None:
                 size = len(b)
 
                 digest = hashlib.sha256(b).hexdigest()
-                uri = _OFFLOAD_CACHE.get(digest)
+                with _OFFLOAD_CACHE_LOCK:
+                    uri = _OFFLOAD_CACHE.get(digest)
                 bulk_id = None
                 if uri is None:
                     ext = _guess_ext_from_mime(mime_s) or "bin"
                     fname = f"media_{uuid.uuid4().hex}.{ext}"
                     bulk_id, uri = _kratos_bulk_upload_bytes(b, fname, cfg)
                     if uri:
-                        if len(_OFFLOAD_CACHE) > 2048:
-                            try:
-                                _OFFLOAD_CACHE.pop(next(iter(_OFFLOAD_CACHE)))
-                            except Exception:
-                                _OFFLOAD_CACHE.clear()
-                        _OFFLOAD_CACHE[digest] = uri
+                        with _OFFLOAD_CACHE_LOCK:
+                            if len(_OFFLOAD_CACHE) > 2048:
+                                try:
+                                    _OFFLOAD_CACHE.pop(next(iter(_OFFLOAD_CACHE)))
+                                except Exception:
+                                    _OFFLOAD_CACHE.clear()
+                            _OFFLOAD_CACHE[digest] = uri
 
                 extra = {
                     "rid": rid,
@@ -643,20 +650,22 @@ class _KratosOffloadFilter(logging.Filter):
                 return full
 
             digest = hashlib.sha256(b).hexdigest()
-            uri = _OFFLOAD_CACHE.get(digest)
+            with _OFFLOAD_CACHE_LOCK:
+                uri = _OFFLOAD_CACHE.get(digest)
             bulk_id = None
             if uri is None:
                 ext = _guess_ext_from_mime(mime) or "bin"
                 fname = f"payload_{uuid.uuid4().hex}.{ext}"
                 bulk_id, uri = _kratos_bulk_upload_bytes(b, fname, self.cfg)
                 if uri:
-                    # Trim cache if too large
-                    if len(_OFFLOAD_CACHE) > 1024:
-                        try:
-                            _OFFLOAD_CACHE.pop(next(iter(_OFFLOAD_CACHE)))
-                        except Exception:
-                            _OFFLOAD_CACHE.clear()
-                    _OFFLOAD_CACHE[digest] = uri
+                    with _OFFLOAD_CACHE_LOCK:
+                        # Trim cache if too large
+                        if len(_OFFLOAD_CACHE) > 1024:
+                            try:
+                                _OFFLOAD_CACHE.pop(next(iter(_OFFLOAD_CACHE)))
+                            except Exception:
+                                _OFFLOAD_CACHE.clear()
+                        _OFFLOAD_CACHE[digest] = uri
 
             if not uri:
                 return full
@@ -745,23 +754,43 @@ class _NonBlockingQueueHandler(QueueHandler):
 
 
 def _wrap_with_queue(logging_handler: logging.Handler) -> logging.Handler:
-    global _LOG_QUEUE, _QUEUE_LISTENER
-    if _LOG_QUEUE is not None and _QUEUE_LISTENER is not None:
+    global _LOG_QUEUE, _QUEUE_LISTENER, _QUEUE_LISTENER_ATEXIT_REGISTERED
+    with _QUEUE_LISTENER_LOCK:
+        if _LOG_QUEUE is not None and _QUEUE_LISTENER is not None:
+            return _NonBlockingQueueHandler(_LOG_QUEUE)
+
+        _LOG_QUEUE = queue.Queue(maxsize=_env_int("KRATOS_OFFLOAD_MAX_QUEUE", 1024))
+
+        # Configure offload filter on the downstream handler
+        threshold = _env_int("KRATOS_OFFLOAD_THRESHOLD_BYTES", 131072)
+        enabled = _truthy_env("KRATOS_BULKUPLOAD_ENABLE", "0")
+        cfg = _kratos_defaults()
+        offload_filter = _KratosOffloadFilter(threshold, enabled, cfg)
+        logging_handler.addFilter(offload_filter)
+
+        _QUEUE_LISTENER = QueueListener(
+            _LOG_QUEUE, logging_handler, respect_handler_level=True
+        )
+        _QUEUE_LISTENER.daemon = True
+        _QUEUE_LISTENER.start()
+        if not _QUEUE_LISTENER_ATEXIT_REGISTERED:
+            atexit.register(_stop_queue_listener)
+            _QUEUE_LISTENER_ATEXIT_REGISTERED = True
         return _NonBlockingQueueHandler(_LOG_QUEUE)
 
-    _LOG_QUEUE = queue.Queue(maxsize=_env_int("KRATOS_OFFLOAD_MAX_QUEUE", 0))
 
-    # Configure offload filter on the downstream handler
-    threshold = _env_int("KRATOS_OFFLOAD_THRESHOLD_BYTES", 131072)
-    enabled = _truthy_env("KRATOS_BULKUPLOAD_ENABLE", "0")
-    cfg = _kratos_defaults()
-    offload_filter = _KratosOffloadFilter(threshold, enabled, cfg)
-    logging_handler.addFilter(offload_filter)
-
-    _QUEUE_LISTENER = QueueListener(_LOG_QUEUE, logging_handler, respect_handler_level=True)
-    _QUEUE_LISTENER.daemon = True
-    _QUEUE_LISTENER.start()
-    return _NonBlockingQueueHandler(_LOG_QUEUE)
+def _stop_queue_listener() -> None:
+    global _QUEUE_LISTENER
+    with _QUEUE_LISTENER_LOCK:
+        listener = _QUEUE_LISTENER
+        _QUEUE_LISTENER = None
+    if listener is None:
+        return
+    try:
+        listener.stop()
+    except Exception:
+        # Logging shutdown must never block interpreter exit.
+        return
 
 
 def init_otel(resource_attributes: Optional[dict] = None
@@ -930,9 +959,12 @@ def start_prom_to_otel_bridge(scrape_url: str, interval_seconds: float = 10.0) -
         return
 
     def _ensure_gauge(name: str):
-        if name in _PROM_GAUGES:
-            return
-        values_ref = _PROM_GAUGE_VALUES.setdefault(name, {})
+        with _PROM_LOCK:
+            if name in _PROM_GAUGES:
+                return
+            values_ref = _PROM_GAUGE_VALUES.setdefault(name, {})
+            _PROM_GAUGES[name] = None
+
         def _callback(observer):  # type: ignore[no-redef]
             obs_list = []
             try:
@@ -940,35 +972,43 @@ def start_prom_to_otel_bridge(scrape_url: str, interval_seconds: float = 10.0) -
             except Exception:
                 # Older SDKs may not have Observation in this namespace
                 return []
-            for label_items, val in list(values_ref.items()):
+            with _PROM_LOCK:
+                values_snapshot = list(values_ref.items())
+            for label_items, val in values_snapshot:
                 attrs = {k: v for k, v in label_items}
                 obs_list.append(Observation(val, attrs))
             return obs_list
         try:
             inst = meter.create_observable_gauge(name, callbacks=[_callback])
-            _PROM_GAUGES[name] = inst
         except Exception:
             # If instrument creation fails, skip gauges for this name
-            _PROM_GAUGES[name] = None
+            inst = None
+        with _PROM_LOCK:
+            _PROM_GAUGES[name] = inst
 
     def _ensure_counter(name: str):
-        if name in _PROM_COUNTERS:
-            return
-        try:
-            _PROM_COUNTERS[name] = meter.create_counter(name)
-        except Exception:
+        with _PROM_LOCK:
+            if name in _PROM_COUNTERS:
+                return
             _PROM_COUNTERS[name] = None
+        try:
+            inst = meter.create_counter(name)
+        except Exception:
+            inst = None
+        with _PROM_LOCK:
+            _PROM_COUNTERS[name] = inst
 
     def _add_counter_delta(name: str, labels: Dict[str, str], value: float, prev_map: Dict[Tup[str, Tup[Tup[str, str], ...]], float]):
         key = (name, tuple(sorted(labels.items())))
-        prev = prev_map.get(key, 0.0)
-        delta = value - prev
-        if delta < 0:
-            delta = value
-        prev_map[key] = value
+        with _PROM_LOCK:
+            prev = prev_map.get(key, 0.0)
+            delta = value - prev
+            if delta < 0:
+                delta = value
+            prev_map[key] = value
+            inst = _PROM_COUNTERS.get(name)
         if delta <= 0:
             return
-        inst = _PROM_COUNTERS.get(name)
         if inst is None:
             return
         try:
@@ -994,8 +1034,11 @@ def start_prom_to_otel_bridge(scrape_url: str, interval_seconds: float = 10.0) -
                     _add_counter_delta(name, labels, value, _PROM_COUNTER_PREV)
                 elif ftype == "gauge":
                     _ensure_gauge(name)
-                    if name in _PROM_GAUGE_VALUES:
-                        _PROM_GAUGE_VALUES[name][tuple(sorted(labels.items()))] = value
+                    with _PROM_LOCK:
+                        if name in _PROM_GAUGE_VALUES:
+                            _PROM_GAUGE_VALUES[name][
+                                tuple(sorted(labels.items()))
+                            ] = value
                 elif ftype == "histogram":
                     # Export _count and _sum as counters; buckets as counters with 'le'
                     if raw_name.endswith("_count"):

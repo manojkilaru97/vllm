@@ -3,6 +3,7 @@
 # ruff: noqa: E501
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -102,6 +103,38 @@ def test_extract_tool_calls_no_tools(kimi_k2_tool_parser):
     assert not extracted_tool_calls.tools_called
     assert extracted_tool_calls.tool_calls == []
     assert extracted_tool_calls.content == model_output
+
+
+def test_extract_tool_calls_honors_tool_choice_none(kimi_k2_tool_parser):
+    model_output = (
+        "plain text<|tool_calls_section_begin|><|tool_call_begin|>"
+        "functions.get_weather:0<|tool_call_argument_begin|>{\"city\":\"LA\"}"
+        "<|tool_call_end|><|tool_calls_section_end|>"
+    )
+    extracted_tool_calls = kimi_k2_tool_parser.extract_tool_calls(
+        model_output, request=SimpleNamespace(tool_choice="none")
+    )
+
+    assert not extracted_tool_calls.tools_called
+    assert extracted_tool_calls.tool_calls == []
+    assert extracted_tool_calls.content == model_output
+
+
+def test_extract_tool_calls_streaming_honors_tool_choice_none(kimi_k2_tool_parser):
+    delta_text = "<|tool_calls_section_begin|>"
+    result = kimi_k2_tool_parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=delta_text,
+        delta_text=delta_text,
+        previous_token_ids=[],
+        current_token_ids=[1],
+        delta_token_ids=[1],
+        request=SimpleNamespace(tool_choice="none"),
+    )
+
+    assert result is not None
+    assert result.content == delta_text
+    assert result.tool_calls == []
 
 
 @pytest.mark.parametrize(

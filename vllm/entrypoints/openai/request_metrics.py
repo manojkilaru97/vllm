@@ -274,21 +274,27 @@ def _normalize_tool_choice(tool_choice: Any) -> str | None:
     if tool_choice is None:
         return None
     if isinstance(tool_choice, str):
-        return tool_choice
+        return tool_choice if tool_choice in ("none", "auto", "required") else "unknown"
     if isinstance(tool_choice, dict):
         function = tool_choice.get("function")
         if isinstance(function, dict) and function.get("name"):
             return "named"
         choice_type = tool_choice.get("type")
-        return str(choice_type) if choice_type is not None else "named"
+        if choice_type in ("none", "auto", "required"):
+            return str(choice_type)
+        if choice_type == "function":
+            return "named"
+        return "unknown" if choice_type is not None else "named"
     choice_type = getattr(tool_choice, "type", None)
     function = getattr(tool_choice, "function", None)
     function_name = _get_obj_value(function, "name")
     if function_name:
         return "named"
-    if isinstance(choice_type, str) and choice_type:
+    if isinstance(choice_type, str) and choice_type in ("none", "auto", "required"):
         return choice_type
-    return str(tool_choice)
+    if isinstance(choice_type, str) and choice_type == "function":
+        return "named"
+    return "unknown"
 
 
 def _detect_structured_output_kind(request: Any) -> str | None:

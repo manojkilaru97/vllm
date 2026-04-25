@@ -178,6 +178,9 @@ class KimiK2ReasoningParser(ReasoningParser):
         if self._identity_parser is not None:
             return self._identity_parser.extract_reasoning(model_output, request)
 
+        tool_choice = getattr(request, "tool_choice", None)
+        ignore_tool_markers = tool_choice == "none"
+
         # thinking does not require a think start token but consume it if present
         start_token_index = model_output.find(self._start_token)
         start_token_index = 0 if start_token_index != 0 else len(self._start_token)
@@ -187,6 +190,12 @@ class KimiK2ReasoningParser(ReasoningParser):
             return (
                 model_output[start_token_index:end_token_index],
                 model_output[end_token_index + len(self._end_token) :] or None,
+            )
+
+        if ignore_tool_markers:
+            return (
+                model_output[start_token_index:],
+                None,
             )
 
         tool_section_index = model_output.find(self._tool_section_start_token)

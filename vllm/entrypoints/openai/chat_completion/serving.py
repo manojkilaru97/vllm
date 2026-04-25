@@ -3061,110 +3061,6 @@ class OpenAIServingChat(OpenAIServing):
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
-            # once the final token is handled, if stream_options.include_usage
-            # is sent, send the usage
-            if include_usage:
-                completion_tokens = sum(previous_num_tokens)
-                final_usage = UsageInfo(
-                    prompt_tokens=num_prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=num_prompt_tokens + completion_tokens,
-                )
-                if self.enable_prompt_tokens_details and num_cached_tokens:
-                    final_usage.prompt_tokens_details = PromptTokenUsageInfo(
-                        cached_tokens=num_cached_tokens
-                    )
-
-                final_usage_chunk = ChatCompletionStreamResponse(
-                    id=request_id,
-                    object=chunk_object_type,
-                    created=created_time,
-                    choices=[],
-                    model=model_name,
-                    usage=final_usage,
-                )
-                final_usage_data = final_usage_chunk.model_dump_json(
-                    exclude_unset=True, exclude_none=True
-                )
-                yield f"data: {final_usage_data}\n\n"
-
-            # report to FastAPI middleware aggregate usage across all choices
-            num_completion_tokens = sum(previous_num_tokens)
-            request_metadata.final_usage_info = UsageInfo(
-                prompt_tokens=num_prompt_tokens,
-                completion_tokens=num_completion_tokens,
-                total_tokens=num_prompt_tokens + num_completion_tokens,
-            )
-
-            # Emit a single streaming summary payload log
-            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
-                try:
-                    usage_dict = (
-                        request_metadata.final_usage_info.model_dump()
-                        if request_metadata.final_usage_info
-                        else None
-                    )
-                except Exception:
-                    usage_dict = None
-                # Build choices with actual content, reasoning, and tool_calls
-                choices_list = []
-                for i in range(num_choices):
-                    choice_data = {
-                        "index": i,
-                        "message": {
-                            "role": "assistant",
-                        },
-                        "finish_reason": "stop",
-                    }
-                    # Add reasoning if present
-                    if previous_reasoning_texts[i]:
-                        choice_data["message"]["reasoning_content"] = previous_reasoning_texts[i]
-                    # Add content if present
-                    if previous_content_texts[i]:
-                        choice_data["message"]["content"] = previous_content_texts[i]
-                    else:
-                        choice_data["message"]["content"] = None
-                    # Add tool_calls if present
-                    if previous_tool_calls[i]:
-                        tool_calls_list = []
-                        for tc in previous_tool_calls[i]:
-                            if tc.function and tc.function.name:
-                                tool_calls_list.append({
-                                    "id": tc.id,
-                                    "type": tc.type or "function",
-                                    "function": {
-                                        "name": tc.function.name,
-                                        "arguments": tc.function.arguments or "",
-                                    },
-                                })
-                        if tool_calls_list:
-                            choice_data["message"]["tool_calls"] = tool_calls_list
-                            choice_data["finish_reason"] = "tool_calls"
-                    choices_list.append(choice_data)
-                resp_summary = {
-                    "id": request_id,
-                    "object": "chat.completion",
-                    "created": created_time,
-                    "model": model_name,
-                    "choices": choices_list,
-                    "usage": usage_dict,
-                    "stream": True,
-                }
-                try:
-                    payload_logger.info(
-                        "openai.response",
-                        extra={
-                            "rid": rid_hint,
-                            "endpoint": self.__class__.__name__,
-                            "payload": resp_summary,
-                            "payload_json": json.dumps(
-                                resp_summary, ensure_ascii=False
-                            ),
-                        },
-                    )
-                except Exception:
-                    pass
-
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
                 # Log the complete response for each choice
@@ -3249,6 +3145,107 @@ class OpenAIServingChat(OpenAIServing):
                             is_streaming=True,
                             delta=False,
                         )
+
+            num_completion_tokens = sum(previous_num_tokens)
+            final_usage = UsageInfo(
+                prompt_tokens=num_prompt_tokens,
+                completion_tokens=num_completion_tokens,
+                total_tokens=num_prompt_tokens + num_completion_tokens,
+            )
+            if self.enable_prompt_tokens_details and num_cached_tokens:
+                final_usage.prompt_tokens_details = PromptTokenUsageInfo(
+                    cached_tokens=num_cached_tokens
+                )
+
+            # Send the final usage chunk before marking aggregate usage as
+            # complete, so an abort while writing the usage chunk is still
+            # accounted as aborted instead of completed.
+            if include_usage:
+                final_usage_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    object=chunk_object_type,
+                    created=created_time,
+                    choices=[],
+                    model=model_name,
+                    usage=final_usage,
+                )
+                final_usage_data = final_usage_chunk.model_dump_json(
+                    exclude_unset=True, exclude_none=True
+                )
+                yield f"data: {final_usage_data}\n\n"
+
+            # Report aggregate usage immediately before [DONE], minimizing the
+            # completed-vs-aborted race window.
+            request_metadata.final_usage_info = final_usage
+
+            # Emit a single streaming summary payload log after final usage is
+            # committed, so completed-response logs do not race ahead of abort
+            # accounting.
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                try:
+                    usage_dict = final_usage.model_dump()
+                except Exception:
+                    usage_dict = None
+                # Build choices with actual content, reasoning, and tool_calls
+                choices_list = []
+                for i in range(num_choices):
+                    choice_data = {
+                        "index": i,
+                        "message": {
+                            "role": "assistant",
+                        },
+                        "finish_reason": "stop",
+                    }
+                    # Add reasoning if present
+                    if previous_reasoning_texts[i]:
+                        choice_data["message"]["reasoning_content"] = (
+                            previous_reasoning_texts[i]
+                        )
+                    # Add content if present
+                    if previous_content_texts[i]:
+                        choice_data["message"]["content"] = previous_content_texts[i]
+                    else:
+                        choice_data["message"]["content"] = None
+                    # Add tool_calls if present
+                    if previous_tool_calls[i]:
+                        tool_calls_list = []
+                        for tc in previous_tool_calls[i]:
+                            if tc.function and tc.function.name:
+                                tool_calls_list.append({
+                                    "id": tc.id,
+                                    "type": tc.type or "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments or "",
+                                    },
+                                })
+                        if tool_calls_list:
+                            choice_data["message"]["tool_calls"] = tool_calls_list
+                            choice_data["finish_reason"] = "tool_calls"
+                    choices_list.append(choice_data)
+                resp_summary = {
+                    "id": request_id,
+                    "object": "chat.completion",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": choices_list,
+                    "usage": usage_dict,
+                    "stream": True,
+                }
+                try:
+                    payload_logger.info(
+                        "openai.response",
+                        extra={
+                            "rid": rid_hint,
+                            "endpoint": self.__class__.__name__,
+                            "payload": resp_summary,
+                            "payload_json": json.dumps(
+                                resp_summary, ensure_ascii=False
+                            ),
+                        },
+                    )
+                except Exception:
+                    pass
 
         except (asyncio.CancelledError, GeneratorExit):
             await self.engine_client.abort(request_id)

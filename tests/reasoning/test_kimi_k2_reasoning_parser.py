@@ -76,6 +76,23 @@ def test_extract_reasoning_tool_section_ends_reasoning(kimi_k2_tokenizer):
     assert content == "<|tool_calls_section_begin|>tool call data"
 
 
+def test_extract_reasoning_tool_choice_none_keeps_tool_markers_in_reasoning(
+    kimi_k2_tokenizer,
+):
+    parser = KimiK2ReasoningParser(kimi_k2_tokenizer)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[],
+        temperature=1.0,
+        tool_choice="none",
+    )
+
+    text = "some reasoning<|tool_calls_section_begin|>tool call data"
+    reasoning, content = parser.extract_reasoning(text, request)
+    assert reasoning == text
+    assert content is None
+
+
 def test_streaming_reasoning_then_content(kimi_k2_tokenizer):
     """Token-by-token streaming: reasoning tokens then content after </think>."""
     parser = KimiK2ReasoningParser(kimi_k2_tokenizer)

@@ -202,6 +202,11 @@ class KimiK2ToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        if getattr(request, "tool_choice", None) == "none":
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
+
         # sanity check; avoid unnecessary processing
         if self.tool_calls_start_token not in model_output:
             return ExtractedToolCallInformation(
@@ -258,6 +263,9 @@ class KimiK2ToolParser(ToolParser):
     ) -> DeltaMessage | None:
         logger.debug("delta_text: %s", delta_text)
         logger.debug("delta_token_ids: %s", delta_token_ids)
+
+        if getattr(request, "tool_choice", None) == "none":
+            return DeltaMessage(content=delta_text) if delta_text else None
 
         # Flag to defer section exit until after tool parsing completes
         deferred_section_exit = False
