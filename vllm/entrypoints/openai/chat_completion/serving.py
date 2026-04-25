@@ -1016,6 +1016,34 @@ class OpenAIServingChat(OpenAIServing):
             return False
         return tool_choice not in (None, "none", "auto")
 
+    @staticmethod
+    def _apply_kimi_thinking_request_kwargs(
+        request: ChatCompletionRequest,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Map Moonshot/Kimi thinking controls to chat-template kwargs.
+
+        Kimi K2.6 exposes preserved historical thinking as top-level
+        ``thinking.keep="all"``. vLLM already supports template kwargs, so keep
+        this as a compatibility shim rather than a separate rendering path.
+        """
+        thinking = getattr(request, "thinking", None)
+        if not isinstance(thinking, dict):
+            return kwargs
+
+        mapped = dict(kwargs)
+        thinking_type = thinking.get("type")
+        if thinking_type == "enabled":
+            mapped.setdefault("thinking", True)
+        elif thinking_type == "disabled":
+            mapped.setdefault("thinking", False)
+            mapped.setdefault("enable_thinking", False)
+
+        if thinking.get("keep") == "all":
+            mapped.setdefault("preserve_thinking", True)
+
+        return mapped
+
     @classmethod
     def _effective_chat_template_kwargs_for_request(
         cls,
@@ -1026,6 +1054,7 @@ class OpenAIServingChat(OpenAIServing):
             request.chat_template_kwargs,
             default_chat_template_kwargs,
         )
+        kwargs = cls._apply_kimi_thinking_request_kwargs(request, kwargs)
 
         # Structured-output requests should prioritize emitting the constrained
         # answer rather than burning the decode budget on hidden reasoning.

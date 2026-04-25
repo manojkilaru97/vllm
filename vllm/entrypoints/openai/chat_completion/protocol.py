@@ -345,6 +345,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | ChatCompletionNamedToolChoiceParam
         | None
     ) = "none"
+    thinking: dict[str, Any] | None = None
     reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
     thinking_token_budget: int | None = None
     include_reasoning: bool = True
@@ -528,11 +529,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_template: str | None,
         default_template_content_format: ChatTemplateContentFormatOption,
     ) -> ChatParams:
+        thinking_kwargs: dict[str, Any] = {}
+        if isinstance(self.thinking, dict):
+            thinking_type = self.thinking.get("type")
+            if thinking_type == "enabled":
+                thinking_kwargs["thinking"] = True
+            elif thinking_type == "disabled":
+                thinking_kwargs["thinking"] = False
+                thinking_kwargs["enable_thinking"] = False
+            if self.thinking.get("keep") == "all":
+                thinking_kwargs["preserve_thinking"] = True
+
         return ChatParams(
             chat_template=self.chat_template or default_template,
             chat_template_content_format=default_template_content_format,
             chat_template_kwargs=merge_kwargs(
-                self.chat_template_kwargs,
+                merge_kwargs(thinking_kwargs, self.chat_template_kwargs),
                 dict(
                     add_generation_prompt=self.add_generation_prompt,
                     continue_final_message=self.continue_final_message,

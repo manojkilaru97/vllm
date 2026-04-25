@@ -579,26 +579,32 @@ class OpenAIServingResponses(OpenAIServing):
                 headers_obj = None
             try:
                 if raw_request is not None:
-                    req_dump = await raw_request.json()
+                    body = await raw_request.body()
+                    if body:
+                        req_dump = json.loads(body)
             except Exception:
                 req_dump = None
             try:
                 if req_dump is None:
-                    req_dump = request.model_dump()
+                    req_dump = request.model_dump(mode="json")
             except Exception:
                 req_dump = None
             try:
+                payload_json = (
+                    json.dumps(req_dump, ensure_ascii=False, default=str)
+                    if req_dump is not None
+                    else None
+                )
                 payload_logger.info(
                     "openai.request",
                     extra={
                         "rid": request.request_id,
                         "endpoint": self.__class__.__name__,
-                        "payload": req_dump,
-                        "payload_json": (
-                            json.dumps(req_dump, ensure_ascii=False)
-                            if req_dump is not None
-                            else None
-                        ),
+                        # Some Responses replay inputs contain mixed nested
+                        # function_call/function_call_output objects. The OTEL
+                        # log attribute converter can drop the whole record for
+                        # those payload attrs, so keep exact fidelity in JSON.
+                        "payload_json": payload_json,
                         "headers": headers_obj,
                         **_payload_logging_extras(req_dump),
                     },

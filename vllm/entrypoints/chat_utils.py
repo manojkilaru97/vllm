@@ -296,6 +296,9 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     reasoning: str | None
     """The reasoning content for interleaved thinking."""
 
+    reasoning_content: str | None
+    """OpenAI-compatible alias for reasoning content."""
+
     tools: list[ChatCompletionFunctionToolParam] | None
     """The tools for developer role."""
 
@@ -1510,6 +1513,8 @@ def _parse_chat_message_content(
     role = message["role"]
     content = message.get("content")
     reasoning = message.get("reasoning")
+    if reasoning is None:
+        reasoning = message.get("reasoning_content")
 
     if content is None:
         content = []
