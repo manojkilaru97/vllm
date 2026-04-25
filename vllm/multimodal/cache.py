@@ -652,6 +652,13 @@ class MultiModalReceiverCache(BaseMultiModalReceiverCache):
         mm_hash: str,
         mm_item: MultiModalKwargsItem | None = None,
     ) -> None:
+        if mm_item is not None and mm_hash not in self._cache:
+            # Prime the receiver cache before the update pass. This keeps
+            # duplicate multimodal hashes safe even when a later duplicate has
+            # the concrete payload and an earlier duplicate was elided by P0.
+            self._cache[mm_hash] = mm_item
+            return
+
         self._cache.touch(mm_hash)
 
     @override

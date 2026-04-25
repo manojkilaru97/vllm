@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
+import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -9,6 +12,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Se
 from contextlib import AsyncExitStack
 from copy import copy
 from http import HTTPStatus
+from json import JSONDecodeError
 from typing import Any, Final
 
 from fastapi import Request
@@ -38,7 +42,7 @@ from openai.types.responses.response_reasoning_item import (
 )
 from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -51,8 +55,11 @@ from vllm.entrypoints.chat_utils import (
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import ToolServer
 from vllm.entrypoints.openai.engine.protocol import (
+    DeltaFunctionCall,
     DeltaMessage,
+    DeltaToolCall,
     ErrorResponse,
+    FunctionDefinition,
     RequestResponseMetadata,
 )
 from vllm.entrypoints.openai.request_metrics import classify_responses_request
@@ -118,6 +125,7 @@ from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import ParserManager
+from vllm.parser.abstract_parser import Parser as BaseParser
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
@@ -125,6 +133,81 @@ from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
+
+
+def _normalize_payload_tool_choice(tool_choice: Any) -> str | None:
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            return "named"
+        choice_type = tool_choice.get("type")
+        return str(choice_type) if choice_type is not None else "named"
+    return str(tool_choice)
+
+
+def _detect_payload_structured_output_kind(
+    payload: dict[str, Any],
+) -> str | None:
+    response_format = payload.get("response_format")
+    if isinstance(response_format, dict):
+        response_format_type = response_format.get("type")
+        if response_format_type in ("json_schema", "json_object", "structural_tag"):
+            return str(response_format_type)
+
+    structured_outputs = payload.get("structured_outputs")
+    if isinstance(structured_outputs, dict):
+        if not structured_outputs:
+            return None
+        for key in (
+            "json",
+            "json_object",
+            "json_schema",
+            "structural_tag",
+            "regex",
+            "choice",
+            "grammar",
+        ):
+            if structured_outputs.get(key) is not None:
+                return "json_schema" if key == "json" else key
+        return "structured_outputs"
+    if structured_outputs is not None:
+        return "structured_outputs"
+
+    text = payload.get("text")
+    if isinstance(text, dict):
+        text_format = text.get("format")
+        if isinstance(text_format, dict):
+            text_format_type = text_format.get("type")
+            if text_format_type in ("json_schema", "json_object"):
+                return str(text_format_type)
+    return None
+
+
+def _payload_logging_extras(req_dump: Any) -> dict[str, Any]:
+    if not isinstance(req_dump, dict):
+        return {}
+
+    tools = req_dump.get("tools")
+    tool_count = len(tools) if isinstance(tools, list) else 0
+    tool_choice = _normalize_payload_tool_choice(req_dump.get("tool_choice"))
+    structured_output_kind = _detect_payload_structured_output_kind(req_dump)
+
+    extras: dict[str, Any] = {
+        "input_tool_count": tool_count,
+        "has_tools": tool_count > 0,
+        "has_tool_calls_enabled": tool_count > 0 and tool_choice != "none",
+        "has_structured_output": structured_output_kind is not None,
+    }
+    if tool_choice is not None:
+        extras["tool_choice"] = tool_choice
+    if structured_output_kind is not None:
+        extras["structured_output_kind"] = structured_output_kind
+    return extras
 
 
 def _extract_allowed_tools_from_mcp_requests(
@@ -268,6 +351,148 @@ class OpenAIServingResponses(OpenAIServing):
 
         self.tool_server = tool_server
 
+    @staticmethod
+    def _should_bypass_harmony(request: ResponsesRequest) -> bool:
+        # Kimi-compatible parser/render path is more capable for these cases:
+        # - named/required function tool choice in the Responses API
+        # - reasoning.effort="none", which should suppress thinking at the
+        #   chat-template level instead of relying on Harmony effort tags
+        if request.tool_choice != "auto":
+            return True
+        return request.reasoning is not None and request.reasoning.effort == "none"
+
+    @staticmethod
+    def _normalize_delta_for_request(
+        request: ResponsesRequest,
+        delta_message: DeltaMessage | None,
+    ) -> DeltaMessage | None:
+        if delta_message is None:
+            return None
+        if request.reasoning is None or request.reasoning.effort != "none":
+            return delta_message
+        if delta_message.reasoning is None:
+            return delta_message
+
+        return DeltaMessage(
+            content=f"{delta_message.reasoning}{delta_message.content or ''}" or None,
+            tool_calls=delta_message.tool_calls,
+        )
+
+    @staticmethod
+    def _forced_tool_name(request: ResponsesRequest) -> str | None:
+        tool_choice = request.tool_choice
+        name = getattr(tool_choice, "name", None)
+        if isinstance(name, str) and name:
+            return name
+        function = getattr(tool_choice, "function", None)
+        function_name = getattr(function, "name", None)
+        if isinstance(function_name, str) and function_name:
+            return function_name
+        return None
+
+    @classmethod
+    def _parse_non_auto_tool_calls_from_content(
+        cls, request: ResponsesRequest, content: str
+    ) -> list[tuple[str, str]]:
+        return cls._parse_non_auto_tool_calls_from_content_impl(
+            request, content, allow_recovery=True
+        )
+
+    @classmethod
+    def _parse_non_auto_tool_calls_from_content_impl(
+        cls,
+        request: ResponsesRequest,
+        content: str,
+        *,
+        allow_recovery: bool,
+    ) -> list[tuple[str, str]]:
+        forced_tool_name = cls._forced_tool_name(request)
+        parsed_calls: list[tuple[str, str]] = []
+
+        if forced_tool_name is not None:
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict) and "name" not in parsed:
+                parsed_calls.append(
+                    (forced_tool_name, json.dumps(parsed, ensure_ascii=False))
+                )
+                return parsed_calls
+
+        if request.tool_choice == "required" or forced_tool_name is not None:
+            try:
+                tool_defs = TypeAdapter(list[FunctionDefinition]).validate_json(content)
+                for tool_def in tool_defs:
+                    name = tool_def.name or forced_tool_name
+                    if not name:
+                        continue
+                    parsed_calls.append(
+                        (name, json.dumps(tool_def.parameters or {}, ensure_ascii=False))
+                    )
+                if parsed_calls:
+                    return parsed_calls
+            except (ValidationError, JSONDecodeError, ValueError):
+                if allow_recovery:
+                    recovered_calls = BaseParser._recover_required_tool_calls(
+                        request, content
+                    )
+                    if recovered_calls:
+                        return [(call.name, call.arguments) for call in recovered_calls]
+
+        return parsed_calls
+
+    @classmethod
+    def _extract_non_auto_tool_delta(
+        cls,
+        request: ResponsesRequest,
+        previous_text: str,
+        current_text: str,
+    ) -> DeltaMessage | None:
+        if not request.tools or request.tool_choice == "auto":
+            return None
+
+        current_calls = cls._parse_non_auto_tool_calls_from_content_impl(
+            request, current_text, allow_recovery=False
+        )
+        if not current_calls:
+            return None
+
+        previous_calls = cls._parse_non_auto_tool_calls_from_content_impl(
+            request, previous_text, allow_recovery=False
+        )
+        current_name, current_arguments = current_calls[0]
+        previous_name = previous_arguments = None
+        if previous_calls:
+            previous_name, previous_arguments = previous_calls[0]
+
+        delta_name: str | None = None
+        if previous_name != current_name:
+            delta_name = current_name
+
+        delta_arguments = current_arguments
+        if (
+            previous_name == current_name
+            and previous_arguments is not None
+            and current_arguments.startswith(previous_arguments)
+        ):
+            delta_arguments = current_arguments[len(previous_arguments) :]
+
+        if delta_name is None and not delta_arguments:
+            return None
+
+        return DeltaMessage(
+            tool_calls=[
+                DeltaToolCall(
+                    index=0,
+                    function=DeltaFunctionCall(
+                        name=delta_name,
+                        arguments=delta_arguments or None,
+                    ),
+                )
+            ]
+        )
+
     def _validate_generator_input(
         self,
         engine_input: EngineInput,
@@ -340,6 +565,46 @@ class OpenAIServingResponses(OpenAIServing):
         maybe_validation_error = self._validate_create_responses_input(request)
         if maybe_validation_error is not None:
             return maybe_validation_error
+        maybe_priority_error = self._validate_priority(request.priority)
+        if maybe_priority_error is not None:
+            return maybe_priority_error
+
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            headers_obj = None
+            req_dump = None
+            try:
+                if raw_request is not None:
+                    headers_obj = {k: v for k, v in raw_request.headers.items()}
+            except Exception:
+                headers_obj = None
+            try:
+                if raw_request is not None:
+                    req_dump = await raw_request.json()
+            except Exception:
+                req_dump = None
+            try:
+                if req_dump is None:
+                    req_dump = request.model_dump()
+            except Exception:
+                req_dump = None
+            try:
+                payload_logger.info(
+                    "openai.request",
+                    extra={
+                        "rid": request.request_id,
+                        "endpoint": self.__class__.__name__,
+                        "payload": req_dump,
+                        "payload_json": (
+                            json.dumps(req_dump, ensure_ascii=False)
+                            if req_dump is not None
+                            else None
+                        ),
+                        "headers": headers_obj,
+                        **_payload_logging_extras(req_dump),
+                    },
+                )
+            except Exception:
+                pass
 
         classify_responses_request(request)
 
@@ -371,7 +636,11 @@ class OpenAIServingResponses(OpenAIServing):
         lora_request = self._maybe_get_adapters(request)
         model_name = self.models.model_name(lora_request)
 
-        if self.use_harmony:
+        use_harmony_for_request = self.use_harmony and not self._should_bypass_harmony(
+            request
+        )
+
+        if use_harmony_for_request:
             messages, engine_inputs = self._make_request_with_harmony(
                 request, prev_response
             )
@@ -440,13 +709,23 @@ class OpenAIServingResponses(OpenAIServing):
             )
 
             context: ConversationContext
-            if self.use_harmony:
+            if use_harmony_for_request:
                 if request.stream:
                     context = StreamingHarmonyContext(messages, available_tools)
                 else:
                     context = HarmonyContext(messages, available_tools)
             else:
-                if envs.VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT:
+                use_parser_context = (
+                    envs.VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT
+                    or bool(request.tools)
+                    or request.text is not None
+                    or request.structured_outputs is not None
+                    or (
+                        request.reasoning is not None
+                        and request.reasoning.effort == "none"
+                    )
+                )
+                if use_parser_context:
                     # This is a feature in development for parsing
                     # tokens during generation instead of at the end
                     context = ParsableContext(
@@ -885,6 +1164,23 @@ class OpenAIServingResponses(OpenAIServing):
                 # If the response is already cancelled, don't update it.
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
+
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            try:
+                response_payload = response.model_dump()
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": request.request_id,
+                        "endpoint": self.__class__.__name__,
+                        "payload": response_payload,
+                        "payload_json": json.dumps(
+                            response_payload, ensure_ascii=False
+                        ),
+                    },
+                )
+            except Exception:
+                pass
         return response
 
     def _topk_logprobs(
@@ -1356,9 +1652,12 @@ class OpenAIServingResponses(OpenAIServing):
         previous_token_ids: list[int] = []
         prompt_is_reasoning_end = None
         first_delta_sent = False
+        current_item_type: str | None = None
+        current_tool_call_id = ""
+        current_tool_call_name = ""
         previous_delta_messages: list[DeltaMessage] = []
         async for ctx in result_generator:
-            assert isinstance(ctx, SimpleContext)
+            assert isinstance(ctx, (SimpleContext, ParsableContext))
             if ctx.last_output is None:
                 continue
             if reasoning_parser and prompt_is_reasoning_end is None:
@@ -1437,6 +1736,23 @@ class OpenAIServingResponses(OpenAIServing):
                     delta_message = DeltaMessage(
                         content=output.text,
                     )
+                delta_message = self._normalize_delta_for_request(
+                    request, delta_message
+                )
+                non_auto_tool_delta = self._extract_non_auto_tool_delta(
+                    request,
+                    previous_text,
+                    current_text,
+                )
+                if non_auto_tool_delta is not None:
+                    delta_message = non_auto_tool_delta
+                elif (
+                    request.tools
+                    and request.tool_choice != "auto"
+                    and delta_message is not None
+                    and not delta_message.tool_calls
+                ):
+                    delta_message = None
                 previous_text = current_text
                 previous_token_ids = current_token_ids
                 if not delta_message:
@@ -1457,6 +1773,7 @@ class OpenAIServingResponses(OpenAIServing):
                         current_tool_call_name = delta_message.tool_calls[
                             0
                         ].function.name
+                        current_item_type = "function_call"
                         yield _increment_sequence_number_and_return(
                             ResponseOutputItemAddedEvent(
                                 type="response.output_item.added",
@@ -1475,6 +1792,7 @@ class OpenAIServingResponses(OpenAIServing):
                             )
                         )
                     elif delta_message.reasoning:
+                        current_item_type = "reasoning"
                         yield _increment_sequence_number_and_return(
                             ResponseOutputItemAddedEvent(
                                 type="response.output_item.added",
@@ -1502,6 +1820,7 @@ class OpenAIServingResponses(OpenAIServing):
                             )
                         )
                     elif not delta_message.tool_calls:
+                        current_item_type = "message"
                         yield _increment_sequence_number_and_return(
                             ResponseOutputItemAddedEvent(
                                 type="response.output_item.added",
@@ -1538,7 +1857,10 @@ class OpenAIServingResponses(OpenAIServing):
                 if (
                     previous_delta_messages
                     and previous_delta_messages[-1].reasoning is not None
-                    and delta_message.content is not None
+                    and (
+                        delta_message.content is not None
+                        or delta_message.tool_calls
+                    )
                 ):
                     # from reasoning to normal content, send done
                     # event for reasoning
@@ -1613,38 +1935,138 @@ class OpenAIServingResponses(OpenAIServing):
                     )
                     current_output_index += 1
                     current_item_id = str(uuid.uuid4())
-                    yield _increment_sequence_number_and_return(
-                        ResponseOutputItemAddedEvent(
-                            type="response.output_item.added",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item=ResponseOutputMessage(
-                                id=current_item_id,
-                                type="message",
-                                role="assistant",
-                                content=[],
-                                status="in_progress",
-                            ),
+                    if delta_message.tool_calls:
+                        assert len(delta_message.tool_calls) == 1, (
+                            "Multiple tool calls in one delta is not supported"
                         )
-                    )
-                    yield _increment_sequence_number_and_return(
-                        ResponseContentPartAddedEvent(
-                            type="response.content_part.added",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                            content_index=current_content_index,
-                            part=ResponseOutputText(
-                                type="output_text",
-                                text="",
-                                annotations=[],
-                                logprobs=[],
-                            ),
+                        assert delta_message.tool_calls[0].function is not None, (
+                            "Tool call without function is not supported"
                         )
-                    )
+                        assert delta_message.tool_calls[0].function.name is not None, (
+                            "Tool call without function name is not supported"
+                        )
+                        current_tool_call_name = delta_message.tool_calls[
+                            0
+                        ].function.name
+                        current_tool_call_id = f"call_{random_uuid()}"
+                        current_item_type = "function_call"
+                        yield _increment_sequence_number_and_return(
+                            ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item=ResponseFunctionToolCallItem(
+                                    type="function_call",
+                                    id=current_item_id,
+                                    call_id=current_tool_call_id,
+                                    name=current_tool_call_name,
+                                    arguments="",
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                        current_content_index = 1
+                    else:
+                        current_item_type = "message"
+                        yield _increment_sequence_number_and_return(
+                            ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item=ResponseOutputMessage(
+                                    id=current_item_id,
+                                    type="message",
+                                    role="assistant",
+                                    content=[],
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                        yield _increment_sequence_number_and_return(
+                            ResponseContentPartAddedEvent(
+                                type="response.content_part.added",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item_id=current_item_id,
+                                content_index=current_content_index,
+                                part=ResponseOutputText(
+                                    type="output_text",
+                                    text="",
+                                    annotations=[],
+                                    logprobs=[],
+                                ),
+                            )
+                        )
                     # reset previous delta messages
                     previous_delta_messages = []
                 if delta_message.tool_calls and delta_message.tool_calls[0].function:
+                    if delta_message.tool_calls[0].function.name is not None:
+                        current_tool_call_name = delta_message.tool_calls[
+                            0
+                        ].function.name
+                    if current_item_type != "function_call":
+                        if current_item_type == "message":
+                            yield _increment_sequence_number_and_return(
+                                ResponseTextDoneEvent(
+                                    type="response.output_text.done",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    content_index=current_content_index,
+                                    text="",
+                                    logprobs=[],
+                                    item_id=current_item_id,
+                                )
+                            )
+                            yield _increment_sequence_number_and_return(
+                                ResponseContentPartDoneEvent(
+                                    type="response.content_part.done",
+                                    sequence_number=-1,
+                                    item_id=current_item_id,
+                                    output_index=current_output_index,
+                                    content_index=current_content_index,
+                                    part=ResponseOutputText(
+                                        type="output_text",
+                                        text="",
+                                        annotations=[],
+                                        logprobs=[],
+                                    ),
+                                )
+                            )
+                            yield _increment_sequence_number_and_return(
+                                ResponseOutputItemDoneEvent(
+                                    type="response.output_item.done",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    item=ResponseOutputMessage(
+                                        id=current_item_id,
+                                        type="message",
+                                        role="assistant",
+                                        content=[],
+                                        status="completed",
+                                    ),
+                                )
+                            )
+                            current_output_index += 1
+                        if not current_tool_call_id:
+                            current_tool_call_id = f"call_{random_uuid()}"
+                        current_item_id = random_uuid()
+                        current_item_type = "function_call"
+                        yield _increment_sequence_number_and_return(
+                            ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item=ResponseFunctionToolCallItem(
+                                    type="function_call",
+                                    id=current_item_id,
+                                    call_id=current_tool_call_id,
+                                    name=current_tool_call_name,
+                                    arguments="",
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                        current_content_index = 1
                     if delta_message.tool_calls[0].function.arguments:
                         yield _increment_sequence_number_and_return(
                             ResponseFunctionCallArgumentsDeltaEvent(
@@ -1800,6 +2222,7 @@ class OpenAIServingResponses(OpenAIServing):
                         item=function_call_item,
                     )
                 )
+                current_item_type = "function_call"
 
             elif previous_delta_messages[-1].reasoning is not None:
                 reason_content = "".join(
@@ -1982,7 +2405,7 @@ class OpenAIServingResponses(OpenAIServing):
                 output=[],
                 status="in_progress",
                 usage=None,
-            ).model_dump()
+            )
             yield _increment_sequence_number_and_return(
                 ResponseCreatedEvent(
                     type="response.created",

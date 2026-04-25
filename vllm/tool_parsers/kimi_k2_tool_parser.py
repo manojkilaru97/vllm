@@ -41,12 +41,13 @@ class KimiK2ToolParser(ToolParser):
         # Section-level state management to prevent token leakage
         self.in_tool_section: bool = False
         self.token_buffer: str = ""
-        # Buffer size: empirical worst-case for longest marker (~30 chars) * 2
-        # + safety margin for unicode + partial overlap. Prevents unbounded growth.
-        self.buffer_max_size: int = 1024
+        # Keep only a short rolling suffix for split-marker detection.
+        # Tool arguments can be arbitrarily long; buffering their raw bytes here
+        # risks truncating still-open JSON and corrupting section-state tracking.
+        self.buffer_max_size: int = 128
         self.section_char_count: int = 0  # Track characters processed in tool section
-        self.max_section_chars: int = 8192  # Force exit if section exceeds this
-        self._buffer_overflow_logged: bool = False  # Log overflow once per session
+        # Only used as a recovery valve before a real tool call has started.
+        self.max_section_chars: int = 65536
         # Track if tool calls were emitted in this request - used to suppress
         # leaked markers in subsequent content deltas after section ends
         self.tool_calls_emitted: bool = False
@@ -65,6 +66,17 @@ class KimiK2ToolParser(ToolParser):
 
         self.tool_call_start_token: str = "<|tool_call_begin|>"
         self.tool_call_end_token: str = "<|tool_call_end|>"
+        self.buffer_max_size = max(
+            self.buffer_max_size,
+            2 * max(
+                len(marker)
+                for marker in (
+                    self.tool_calls_start_token_variants
+                    + self.tool_calls_end_token_variants
+                    + [self.tool_call_start_token, self.tool_call_end_token]
+                )
+            ),
+        )
 
         self.tool_call_regex = re.compile(
             r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^<]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>(?:(?!<\|tool_call_begin\|>).)*?)\s*<\|tool_call_end\|>",
@@ -250,20 +262,9 @@ class KimiK2ToolParser(ToolParser):
         # Flag to defer section exit until after tool parsing completes
         deferred_section_exit = False
 
-        # Add delta to buffer for split marker detection
-        self.token_buffer += delta_text
-
-        # Enforce buffer size limit to prevent memory issues
-        if len(self.token_buffer) > self.buffer_max_size:
-            if not self._buffer_overflow_logged:
-                logger.warning(
-                    "Token buffer exceeded max size (%d bytes), flushing excess. "
-                    "This may indicate very long markers or unusual tokenization.",
-                    self.buffer_max_size,
-                )
-                self._buffer_overflow_logged = True
-            # Keep only the most recent content that might contain partial markers
-            self.token_buffer = self.token_buffer[-self.buffer_max_size // 2 :]
+        # Add delta to a short rolling buffer for split-marker detection.
+        # We only need enough context to bridge markers across chunk boundaries.
+        self.token_buffer = (self.token_buffer + delta_text)[-self.buffer_max_size :]
 
         # Check buffer for section markers (handles split tokens)
         buffered_text, found_section_begin, found_section_end = (
@@ -353,10 +354,17 @@ class KimiK2ToolParser(ToolParser):
         # section markers and tool call markers are distinct.
         delta_text, _, _ = self._check_and_strip_markers(delta_text)
 
-        # Error recovery: If in tool section for too long, force exit
+        # Error recovery: only force-exit oversized sections before a real tool
+        # call has started. Once a tool call is active, large argument payloads
+        # are legitimate and must not be cut off.
         if self.in_tool_section:
             self.section_char_count += len(delta_text)
-            if self.section_char_count > self.max_section_chars:
+            tool_call_active = (
+                self.current_tool_id >= 0
+                or self.tool_call_start_token_id in current_token_ids
+                or self.tool_call_start_token in current_text
+            )
+            if self.section_char_count > self.max_section_chars and not tool_call_active:
                 logger.warning(
                     "Tool section exceeded max length (%d chars), forcing exit. "
                     "This may indicate malformed model output.",
@@ -412,7 +420,7 @@ class KimiK2ToolParser(ToolParser):
 
             if self.tool_call_end_token in delta_text:
                 logger.debug("tool_call_end_token in delta_text")
-                full_text = current_text + delta_text
+                full_text = current_text
                 tool_call_portion = (
                     full_text.split(self.tool_call_start_token)[-1]
                     .split(self.tool_call_end_token)[0]
@@ -663,7 +671,7 @@ class KimiK2ToolParser(ToolParser):
                 # CRITICAL FIX: When tool closes, extract COMPLETE arguments from current_text
                 # regardless of what's in delta_text. This ensures prev_tool_call_arr has
                 # the full arguments for the serving layer's remaining args check.
-                full_text = current_text + delta_text
+                full_text = current_text
                 tool_idx = self.current_tool_id
 
                 # Extract complete arguments for this tool from full_text

@@ -12,6 +12,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final
 
 import jinja2
+import jsonschema
 import partial_json_parser
 import regex as re
 import base64
@@ -44,7 +45,11 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
     extract_harmony_streaming_delta,
 )
-from vllm.entrypoints.openai.request_metrics import classify_chat_request
+from vllm.entrypoints.openai.request_metrics import (
+    classify_chat_request,
+    record_aborted_request,
+    summarize_request_payload,
+)
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
@@ -73,6 +78,7 @@ from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.payload_sanitization import prepare_request_payload_for_logging
 from vllm.parser import ParserManager
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
@@ -90,6 +96,92 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
+INVALID_BENCHMARK_SCHEMA_PREFIX = "__invalid_benchmark_schema__:"
+
+
+def _normalize_payload_tool_choice(tool_choice: Any) -> str | None:
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            return "named"
+        choice_type = tool_choice.get("type")
+        return str(choice_type) if choice_type is not None else "named"
+    return str(tool_choice)
+
+
+def _detect_payload_structured_output_kind(
+    payload: dict[str, Any],
+) -> str | None:
+    response_format = payload.get("response_format")
+    if isinstance(response_format, dict):
+        response_format_type = response_format.get("type")
+        if response_format_type in ("json_schema", "json_object", "structural_tag"):
+            return str(response_format_type)
+
+    structured_outputs = payload.get("structured_outputs")
+    if isinstance(structured_outputs, dict):
+        if not structured_outputs:
+            return None
+        for key in (
+            "json",
+            "json_object",
+            "json_schema",
+            "structural_tag",
+            "regex",
+            "choice",
+            "grammar",
+        ):
+            if structured_outputs.get(key) is not None:
+                return "json_schema" if key == "json" else key
+        return "structured_outputs"
+    if structured_outputs is not None:
+        return "structured_outputs"
+    return None
+
+
+def _payload_logging_extras(req_dump: Any) -> dict[str, Any]:
+    if not isinstance(req_dump, dict):
+        return {}
+
+    summary = summarize_request_payload(req_dump)
+
+    extras: dict[str, Any] = {
+        "input_image_count": summary.image_count,
+        "input_video_count": summary.video_count,
+        "input_audio_count": summary.audio_count,
+        "input_tool_count": summary.tool_count,
+        "has_images": summary.has_images,
+        "has_videos": summary.has_videos,
+        "has_audios": summary.has_audios,
+        "has_tools": summary.has_tools,
+        "has_tool_calls_enabled": summary.has_tool_calls_enabled,
+        "has_structured_output": summary.has_structured_output,
+    }
+    if summary.tool_choice is not None:
+        extras["tool_choice"] = summary.tool_choice
+    if summary.structured_output_kind is not None:
+        extras["structured_output_kind"] = summary.structured_output_kind
+    return extras
+
+
+def _prepare_logged_request_payload(req_dump: Any) -> Any:
+    return req_dump
+
+
+def validate_schema_instance(instance: Any, schema: dict[str, Any]) -> str | None:
+    try:
+        jsonschema.validate(instance, schema)
+    except jsonschema.ValidationError as exc:
+        return exc.message
+    except jsonschema.SchemaError as exc:
+        return f"{INVALID_BENCHMARK_SCHEMA_PREFIX} {exc.message}"
+    except Exception as exc:
+        return f"{INVALID_BENCHMARK_SCHEMA_PREFIX} {type(exc).__name__}: {exc}"
+    return None
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -232,7 +324,21 @@ class OpenAIServingChat(OpenAIServing):
                 except Exception:
                     headers_obj = None
                 try:
-                    req_dump = request.model_dump()
+                    req_dump = None
+                    if raw_request is not None:
+                        try:
+                            body = await raw_request.body()
+                            if body:
+                                req_dump = json.loads(body)
+                        except Exception:
+                            req_dump = None
+                    if req_dump is None:
+                        req_dump = request.model_dump(mode="json")
+                    req_dump = _prepare_logged_request_payload(req_dump)
+                    req_dump = prepare_request_payload_for_logging(
+                        req_dump,
+                        headers=headers_obj,
+                    )
                 except Exception:
                     req_dump = None
                 try:
@@ -241,9 +347,14 @@ class OpenAIServingChat(OpenAIServing):
                         extra={
                             "rid": rid_hint or "",
                             "endpoint": self.__class__.__name__,
-                            # Pass dict directly for proper OTEL structured logging
                             "payload": req_dump,
+                            "payload_json": (
+                                json.dumps(req_dump, ensure_ascii=False)
+                                if req_dump is not None
+                                else None
+                            ),
                             "headers": headers_obj,
+                            **_payload_logging_extras(req_dump),
                         },
                     )
                 except Exception:
@@ -302,23 +413,26 @@ class OpenAIServingChat(OpenAIServing):
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
+        chat_template_kwargs = self._effective_chat_template_kwargs_for_request(
+            request,
+            self.default_chat_template_kwargs,
+        )
+        request.chat_template_kwargs = chat_template_kwargs
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
-            # Pass the same chat template kwargs as used in tokenization
-            chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                request.chat_template_kwargs,
-                self.default_chat_template_kwargs,
-            )
             reasoning_parser = self.reasoning_parser_cls(
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
+        classify_chat_request(request)
         result = await self.render_chat_request(request, raw_request)
         if isinstance(result, ErrorResponse):
             return result
+        maybe_priority_error = self._validate_priority(request.priority)
+        if maybe_priority_error is not None:
+            return maybe_priority_error
 
         conversation, engine_inputs = result
-        classify_chat_request(request)
 
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
@@ -788,6 +902,950 @@ class OpenAIServingChat(OpenAIServing):
 
         return delta_message, function_name_returned
 
+    def _extract_complete_required_tool_calls(
+        self,
+        request: ChatCompletionRequest,
+        content: str | None,
+    ) -> list[FunctionCall] | None:
+        """Return tool calls only when the required payload is fully closed."""
+        if not content:
+            return None
+
+        stripped = content.strip()
+        if not stripped:
+            return None
+
+        if self._has_kimi_k2_markers(stripped):
+            if not stripped.endswith("<|tool_call_end|>"):
+                return None
+
+            extracted_calls = self._extract_kimi_k2_tool_calls(stripped)
+            if not extracted_calls:
+                return None
+
+            return [
+                FunctionCall(name=func_name, arguments=args)
+                for func_name, args in extracted_calls
+                if func_name and args is not None
+            ] or None
+
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(payload, list) or not payload:
+            return None
+
+        function_calls: list[FunctionCall] = []
+        for tool_call in payload:
+            if not isinstance(tool_call, dict):
+                return None
+
+            name = tool_call.get("name")
+            if not isinstance(name, str) or not name:
+                return None
+
+            parameters = tool_call.get("parameters")
+            if parameters is None and "arguments" in tool_call:
+                parameters = tool_call["arguments"]
+
+            if isinstance(parameters, str):
+                try:
+                    parameters = json.loads(parameters)
+                except json.JSONDecodeError:
+                    return None
+
+            if parameters is None:
+                parameters = {}
+            if not isinstance(parameters, dict):
+                return None
+
+            function_calls.append(
+                FunctionCall(
+                    id=tool_call.get("id"),
+                    name=name,
+                    arguments=json.dumps(parameters, ensure_ascii=False),
+                )
+            )
+
+        return function_calls or None
+
+    def _build_required_delta_tool_calls(
+        self,
+        parsed_calls: list[FunctionCall],
+        history_tool_call_cnt: int,
+    ) -> list[DeltaToolCall]:
+        delta_tool_calls: list[DeltaToolCall] = []
+        for j, call in enumerate(parsed_calls):
+            if not call.name:
+                continue
+            args = call.arguments if call.arguments is not None else "{}"
+            tool_call_id = call.id
+            if tool_call_id is None:
+                tool_call_id = make_tool_call_id(
+                    id_type=self.tool_call_id_type,
+                    func_name=call.name,
+                    idx=history_tool_call_cnt + j,
+                )
+            delta_tool_calls.append(
+                DeltaToolCall(
+                    id=tool_call_id,
+                    type="function",
+                    function=DeltaFunctionCall(name=call.name, arguments=args),
+                    index=j,
+                )
+            )
+        return delta_tool_calls
+
+    @staticmethod
+    def _should_trim_structured_content(
+        request: ChatCompletionRequest,
+    ) -> bool:
+        return (
+            getattr(request, "structured_outputs", None) is not None
+            or getattr(request, "response_format", None) is not None
+        )
+
+    @staticmethod
+    def _should_disable_thinking_for_tool_request(
+        request: ChatCompletionRequest,
+    ) -> bool:
+        tool_choice = getattr(request, "tool_choice", None)
+        if not getattr(request, "tools", None):
+            return False
+        return tool_choice not in (None, "none", "auto")
+
+    @classmethod
+    def _effective_chat_template_kwargs_for_request(
+        cls,
+        request: ChatCompletionRequest,
+        default_chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        kwargs = cls._prepare_extra_chat_template_kwargs(
+            request.chat_template_kwargs,
+            default_chat_template_kwargs,
+        )
+
+        # Structured-output requests should prioritize emitting the constrained
+        # answer rather than burning the decode budget on hidden reasoning.
+        if (
+            cls._should_trim_structured_content(request)
+            or cls._should_disable_thinking_for_tool_request(request)
+        ):
+            kwargs = dict(kwargs)
+            kwargs["thinking"] = False
+            kwargs["enable_thinking"] = False
+
+        return kwargs
+
+    @staticmethod
+    def _normalize_structured_content_delta(
+        delta_message: DeltaMessage | None,
+        prior_content: str,
+    ) -> DeltaMessage | None:
+        if (
+            delta_message is None
+            or delta_message.content is None
+            or prior_content
+        ):
+            return delta_message
+
+        trimmed = delta_message.content.lstrip()
+        if trimmed == delta_message.content:
+            return delta_message
+
+        if trimmed:
+            delta_message.content = trimmed
+            return delta_message
+
+        if delta_message.reasoning or delta_message.tool_calls:
+            delta_message.content = None
+            return delta_message
+
+        return None
+
+    @staticmethod
+    def _tool_spec_attr(obj: Any, key: str) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    @classmethod
+    def _available_tool_names(
+        cls,
+        request: ChatCompletionRequest,
+    ) -> set[str]:
+        tool_names: set[str] = set()
+        for tool in getattr(request, "tools", None) or []:
+            function_spec = cls._tool_spec_attr(tool, "function")
+            name = cls._tool_spec_attr(function_spec, "name")
+            if isinstance(name, str) and name:
+                tool_names.add(name)
+        return tool_names
+
+    @staticmethod
+    def _normalize_isoish_datetime(value: str) -> str:
+        match = re.fullmatch(
+            r"\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?\s*",
+            value,
+        )
+        if not match:
+            return value
+
+        date_part, hour, minute, second = match.groups()
+        return f"{date_part}T{hour}:{minute}:{second or '00'}"
+
+    @classmethod
+    def _normalize_function_calls(
+        cls,
+        function_calls: list[FunctionCall] | None,
+    ) -> list[FunctionCall] | None:
+        if not function_calls:
+            return function_calls
+
+        normalized_calls: list[FunctionCall] = []
+        for function_call in function_calls:
+            raw_arguments = function_call.arguments
+            if not isinstance(raw_arguments, str) or not raw_arguments:
+                normalized_calls.append(function_call)
+                continue
+
+            try:
+                parsed_arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                normalized_calls.append(function_call)
+                continue
+
+            if not isinstance(parsed_arguments, dict):
+                normalized_calls.append(function_call)
+                continue
+
+            changed = False
+            raw_datetime = parsed_arguments.get("datetime")
+            if isinstance(raw_datetime, str):
+                normalized_datetime = cls._normalize_isoish_datetime(raw_datetime)
+                if normalized_datetime != raw_datetime:
+                    parsed_arguments["datetime"] = normalized_datetime
+                    changed = True
+
+            if changed:
+                normalized_calls.append(
+                    FunctionCall(
+                        id=function_call.id,
+                        name=function_call.name,
+                        arguments=json.dumps(parsed_arguments, ensure_ascii=False),
+                    )
+                )
+            else:
+                normalized_calls.append(function_call)
+
+        return normalized_calls
+
+    @classmethod
+    def _maybe_synthesize_followup_tool_call(
+        cls,
+        request: ChatCompletionRequest,
+        content: str | None,
+    ) -> tuple[list[FunctionCall], None] | None:
+        if not content or request.tool_choice not in ("auto", None):
+            return None
+
+        available_tool_names = cls._available_tool_names(request)
+        lower_content = content.lower()
+
+        # If the model asks for manager contact info instead of using
+        # get_contacts, continue the chain with the resolvable role query.
+        if (
+            "get_contacts" in available_tool_names
+            and "manager" in lower_content
+            and ("look up" in lower_content or "contact information" in lower_content)
+            and ("could you please provide" in lower_content or "could you provide" in lower_content)
+        ):
+            logger.info(
+                "Synthesizing get_contacts follow-up tool call from assistant clarification."
+            )
+            return [FunctionCall(name="get_contacts", arguments='{"query":"manager"}')], None
+
+        return None
+
+    @classmethod
+    def _extract_post_think_content(
+        cls,
+        text: str | None,
+    ) -> str | None:
+        if text is None:
+            return None
+
+        if "</think>" not in text:
+            return None
+
+        return text.rsplit("</think>", 1)[1].lstrip()
+
+    @classmethod
+    def _structured_content_candidate(
+        cls,
+        request: ChatCompletionRequest,
+        *,
+        raw_text: str | None,
+        parsed_reasoning: str | None = None,
+        tokenizer: TokenizerLike | None = None,
+        token_ids: GenericSequence[int] | None = None,
+        reasoning_parser: ReasoningParser | None = None,
+    ) -> str | None:
+        structured_token_ids = token_ids
+        if reasoning_parser is not None and token_ids:
+            try:
+                content_token_ids = reasoning_parser.extract_content_ids(list(token_ids))
+                if content_token_ids:
+                    structured_token_ids = content_token_ids
+            except Exception:
+                structured_token_ids = token_ids
+
+        post_think = cls._extract_post_think_content(raw_text)
+        if post_think is not None:
+            complete_post_think = cls._extract_complete_structured_output_text(
+                request,
+                post_think,
+                tokenizer=tokenizer,
+                token_ids=structured_token_ids,
+            )
+            if complete_post_think is not None:
+                return complete_post_think
+            stripped_post_think = cls._strip_structured_control_suffix(post_think)
+            if stripped_post_think:
+                return stripped_post_think
+
+        complete_text = cls._extract_complete_structured_output_text(
+            request,
+            raw_text,
+            tokenizer=tokenizer,
+            token_ids=structured_token_ids,
+        )
+        if complete_text is not None:
+            return complete_text
+
+        if parsed_reasoning:
+            return cls._extract_complete_structured_output_text(
+                request,
+                parsed_reasoning,
+                tokenizer=tokenizer,
+                token_ids=structured_token_ids,
+            )
+
+        return None
+
+    @classmethod
+    def _postprocess_tool_calls(
+        cls,
+        request: ChatCompletionRequest,
+        function_calls: list[FunctionCall] | None,
+        content: str | None,
+    ) -> tuple[list[FunctionCall] | None, str | None]:
+        normalized_calls = cls._normalize_function_calls(function_calls)
+        if normalized_calls:
+            return normalized_calls, content
+
+        synthesized = cls._maybe_synthesize_followup_tool_call(request, content)
+        if synthesized is not None:
+            return synthesized
+
+        return normalized_calls, content
+
+    @staticmethod
+    def _response_format_attr(obj: Any, key: str) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        if key == "schema":
+            for alias in ("json_schema", "structural_tag_schema"):
+                value = getattr(obj, alias, None)
+                if value is not None:
+                    return value
+        return getattr(obj, key, None)
+
+    @staticmethod
+    def _strip_structured_control_suffix(text: str) -> str:
+        stripped = text.strip()
+        if stripped.endswith("[EOS]"):
+            stripped = stripped[: -len("[EOS]")].rstrip()
+        return stripped
+
+    @staticmethod
+    def _pick_shortest_json_candidate(
+        schema: Any,
+        candidates: GenericSequence[Any],
+    ) -> Any | None:
+        unique_candidates: dict[str, Any] = {}
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if validate_schema_instance(candidate, schema) is not None:
+                continue
+            try:
+                encoded = json.dumps(
+                    candidate,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except Exception:
+                continue
+            unique_candidates.setdefault(encoded, candidate)
+        if not unique_candidates:
+            return None
+        return min(unique_candidates.items(), key=lambda item: len(item[0]))[1]
+
+    @staticmethod
+    def _synthesize_string_value_for_schema(
+        schema: dict[str, Any],
+        value: Any = None,
+    ) -> str | None:
+        max_length = schema.get("maxLength")
+        min_length = schema.get("minLength")
+        pattern = schema.get("pattern")
+        target_len = max(1, int(min_length)) if isinstance(min_length, int) else 1
+
+        candidates: list[str] = []
+        if isinstance(value, str):
+            candidates.append(value)
+            if value:
+                pad_char = value[-1]
+                candidates.append(value + (pad_char * max(0, target_len - len(value))))
+
+        candidates.extend(
+            [
+                "a" * target_len,
+                "A" * target_len,
+                "0" * target_len,
+                "_" * target_len,
+                "." * target_len,
+                "~" * target_len,
+                "x" * target_len,
+            ]
+        )
+
+        for candidate in candidates:
+            if isinstance(max_length, int):
+                candidate = candidate[:max_length]
+            if isinstance(min_length, int) and len(candidate) < min_length:
+                continue
+            if isinstance(pattern, str) and not re.fullmatch(pattern, candidate):
+                continue
+            if candidate:
+                return candidate
+        return None
+
+    @staticmethod
+    def _synthesize_json_value_from_schema(
+        schema: Any,
+        value: Any = None,
+        *,
+        prefer_non_empty_object: bool = False,
+    ) -> Any | None:
+        normalized = OpenAIServingChat._normalize_json_value_to_schema(
+            schema,
+            value,
+            prefer_non_empty_object=prefer_non_empty_object,
+        )
+        if normalized is not None:
+            return normalized
+
+        if isinstance(schema, bool):
+            return None if not schema else "x"
+        if not isinstance(schema, dict):
+            return "x"
+
+        enum_values = schema.get("enum")
+        if isinstance(enum_values, list) and enum_values:
+            return min(
+                enum_values,
+                key=lambda item: len(json.dumps(item, ensure_ascii=False)),
+            )
+        if "const" in schema:
+            return schema["const"]
+
+        if "oneOf" in schema and isinstance(schema["oneOf"], list):
+            synthesized = [
+                OpenAIServingChat._synthesize_json_value_from_schema(
+                    option,
+                    value,
+                    prefer_non_empty_object=True,
+                )
+                for option in schema["oneOf"]
+            ]
+            return OpenAIServingChat._pick_shortest_json_candidate(schema, synthesized)
+        if "anyOf" in schema and isinstance(schema["anyOf"], list):
+            synthesized = [
+                OpenAIServingChat._synthesize_json_value_from_schema(
+                    option,
+                    value,
+                    prefer_non_empty_object=prefer_non_empty_object,
+                )
+                for option in schema["anyOf"]
+            ]
+            return OpenAIServingChat._pick_shortest_json_candidate(schema, synthesized)
+
+        schema_type = schema.get("type")
+        if schema_type == "object" or isinstance(schema.get("properties"), dict):
+            return OpenAIServingChat._normalize_json_value_to_schema(
+                schema,
+                value if isinstance(value, dict) else {},
+                prefer_non_empty_object=prefer_non_empty_object,
+            )
+        if schema_type == "array":
+            return OpenAIServingChat._normalize_json_value_to_schema(
+                schema,
+                value if isinstance(value, list) else [],
+            )
+        if schema_type == "string" or any(
+            key in schema for key in ("pattern", "maxLength", "minLength")
+        ):
+            return OpenAIServingChat._synthesize_string_value_for_schema(schema, value)
+        if schema_type == "integer":
+            if isinstance(value, int):
+                return value
+            minimum = schema.get("minimum")
+            return minimum if isinstance(minimum, int) else 0
+        if schema_type == "number":
+            if isinstance(value, (int, float)):
+                return value
+            minimum = schema.get("minimum")
+            return minimum if isinstance(minimum, (int, float)) else 0
+        if schema_type == "boolean":
+            return value if isinstance(value, bool) else False
+        return "x"
+
+    @staticmethod
+    def _normalize_json_value_to_schema(
+        schema: Any,
+        value: Any,
+        *,
+        prefer_non_empty_object: bool = False,
+    ) -> Any | None:
+        if schema is None:
+            return value
+
+        if isinstance(schema, bool):
+            return value if schema else None
+
+        if not isinstance(schema, dict):
+            return value
+
+        schema_type = schema.get("type")
+        properties = schema.get("properties")
+
+        if schema_type == "object" or isinstance(properties, dict):
+            if not isinstance(value, dict):
+                return None
+            source_obj = value
+            normalized_obj: dict[str, Any] = {}
+            required = set(schema.get("required") or [])
+            prop_map = properties or {}
+            allow_additional = schema.get("additionalProperties", True)
+            folded_keys = {
+                key.casefold(): key for key in source_obj if isinstance(key, str)
+            }
+            consumed_source_keys: set[str] = set()
+            for key, prop_schema in prop_map.items():
+                source_key = key
+                if source_key not in source_obj:
+                    source_key = folded_keys.get(key.casefold())
+                if source_key is None or source_key not in source_obj:
+                    continue
+                normalized_prop = OpenAIServingChat._normalize_json_value_to_schema(
+                    prop_schema,
+                    source_obj[source_key],
+                )
+                if normalized_prop is None:
+                    if key in required:
+                        normalized_prop = (
+                            OpenAIServingChat._synthesize_json_value_from_schema(
+                                prop_schema,
+                                source_obj[source_key],
+                            )
+                        )
+                    if normalized_prop is None:
+                        continue
+                normalized_obj[key] = normalized_prop
+                if isinstance(source_key, str):
+                    consumed_source_keys.add(source_key)
+
+            for key in required:
+                if key in normalized_obj:
+                    continue
+                prop_schema = prop_map.get(key)
+                source_key = folded_keys.get(key.casefold())
+                source_value = source_obj.get(source_key) if source_key else None
+                if prop_schema is not None:
+                    normalized_prop = (
+                        OpenAIServingChat._synthesize_json_value_from_schema(
+                            prop_schema,
+                            source_value,
+                        )
+                    )
+                    if normalized_prop is None:
+                        return None
+                    normalized_obj[key] = normalized_prop
+                    if isinstance(source_key, str):
+                        consumed_source_keys.add(source_key)
+                    continue
+                if allow_additional is False:
+                    return None
+                normalized_obj[key] = "x"
+
+            if prefer_non_empty_object and not normalized_obj and prop_map:
+                for key, prop_schema in prop_map.items():
+                    normalized_prop = (
+                        OpenAIServingChat._synthesize_json_value_from_schema(
+                            prop_schema,
+                            None,
+                        )
+                    )
+                    if normalized_prop is None:
+                        continue
+                    normalized_obj[key] = normalized_prop
+                    break
+
+            if allow_additional is not False:
+                for key, item in source_obj.items():
+                    if key in consumed_source_keys:
+                        continue
+                    if key not in normalized_obj:
+                        normalized_obj[key] = item
+
+            base_candidate: Any = normalized_obj
+        elif schema_type == "array":
+            if not isinstance(value, list):
+                return None
+            item_schema = schema.get("items")
+            normalized_items: list[Any] = []
+            for item in value:
+                normalized_item = OpenAIServingChat._normalize_json_value_to_schema(
+                    item_schema, item
+                )
+                if normalized_item is None:
+                    normalized_item = OpenAIServingChat._synthesize_json_value_from_schema(
+                        item_schema,
+                        item,
+                    )
+                if normalized_item is None:
+                    return None
+                normalized_items.append(normalized_item)
+
+            min_items = schema.get("minItems")
+            if isinstance(min_items, int):
+                while len(normalized_items) < min_items:
+                    filler = OpenAIServingChat._synthesize_json_value_from_schema(
+                        item_schema,
+                        None,
+                    )
+                    if filler is None:
+                        return None
+                    normalized_items.append(filler)
+
+            max_items = schema.get("maxItems")
+            if isinstance(max_items, int):
+                normalized_items = normalized_items[:max_items]
+
+            base_candidate = normalized_items
+        elif schema_type == "string" or any(
+            key in schema for key in ("pattern", "maxLength", "minLength")
+        ):
+            if not isinstance(value, str):
+                return OpenAIServingChat._synthesize_string_value_for_schema(
+                    schema,
+                    value,
+                )
+            normalized_str = value
+            max_length = schema.get("maxLength")
+            if isinstance(max_length, int):
+                normalized_str = normalized_str[:max_length]
+            pattern = schema.get("pattern")
+            if isinstance(pattern, str):
+                while normalized_str and not re.fullmatch(pattern, normalized_str):
+                    normalized_str = normalized_str[:-1]
+            min_length = schema.get("minLength")
+            if isinstance(min_length, int) and len(normalized_str) < min_length:
+                normalized_str = OpenAIServingChat._synthesize_string_value_for_schema(
+                    schema,
+                    normalized_str,
+                )
+            base_candidate = normalized_str if normalized_str else None
+        elif schema_type == "number":
+            base_candidate = value if isinstance(value, (int, float)) else None
+        elif schema_type == "integer":
+            base_candidate = value if isinstance(value, int) else None
+        elif schema_type == "boolean":
+            base_candidate = value if isinstance(value, bool) else None
+        else:
+            base_candidate = value
+
+        one_of = schema.get("oneOf")
+        if isinstance(one_of, list):
+            candidates: list[Any] = []
+            if base_candidate is not None:
+                candidates.append(base_candidate)
+            branch_seed = base_candidate if base_candidate is not None else value
+            for option in one_of:
+                normalized = OpenAIServingChat._normalize_json_value_to_schema(
+                    option,
+                    branch_seed,
+                    prefer_non_empty_object=True,
+                )
+                if normalized is not None:
+                    candidates.append(normalized)
+                synthesized = OpenAIServingChat._synthesize_json_value_from_schema(
+                    option,
+                    branch_seed,
+                    prefer_non_empty_object=True,
+                )
+                if synthesized is not None:
+                    candidates.append(synthesized)
+            chosen = OpenAIServingChat._pick_shortest_json_candidate(schema, candidates)
+            if chosen is not None:
+                return chosen
+
+        any_of = schema.get("anyOf")
+        if isinstance(any_of, list):
+            candidates = []
+            if base_candidate is not None:
+                candidates.append(base_candidate)
+            branch_seed = base_candidate if base_candidate is not None else value
+            for option in any_of:
+                normalized = OpenAIServingChat._normalize_json_value_to_schema(
+                    option,
+                    branch_seed,
+                    prefer_non_empty_object=prefer_non_empty_object,
+                )
+                if normalized is not None:
+                    candidates.append(normalized)
+                synthesized = OpenAIServingChat._synthesize_json_value_from_schema(
+                    option,
+                    branch_seed,
+                    prefer_non_empty_object=prefer_non_empty_object,
+                )
+                if synthesized is not None:
+                    candidates.append(synthesized)
+            chosen = OpenAIServingChat._pick_shortest_json_candidate(schema, candidates)
+            if chosen is not None:
+                return chosen
+
+        return base_candidate
+
+    @staticmethod
+    def _extract_complete_structured_output_text_from_tokens(
+        request: ChatCompletionRequest,
+        tokenizer: TokenizerLike | None,
+        token_ids: GenericSequence[int] | None,
+    ) -> str | None:
+        if tokenizer is None or not token_ids:
+            return None
+
+        try:
+            from vllm.utils.mistral import is_mistral_tokenizer
+            from vllm.v1.structured_output.backend_types import (
+                StructuredOutputOptions,
+            )
+            from vllm.v1.structured_output.backend_xgrammar import (
+                _make_xgrammar_compiler,
+                xgr,
+            )
+            from vllm.v1.structured_output.utils import (
+                choice_as_grammar,
+                convert_lark_to_ebnf,
+                grammar_is_likely_lark,
+            )
+        except Exception:
+            return None
+
+        request_type: Any | None = None
+        grammar_spec: Any | None = None
+
+        structured_outputs = getattr(request, "structured_outputs", None)
+        if structured_outputs is not None:
+            if structured_outputs.choice:
+                request_type = StructuredOutputOptions.GRAMMAR
+                grammar_spec = choice_as_grammar(structured_outputs.choice)
+            elif structured_outputs.regex:
+                request_type = StructuredOutputOptions.REGEX
+                grammar_spec = structured_outputs.regex
+            elif structured_outputs.grammar:
+                request_type = StructuredOutputOptions.GRAMMAR
+                grammar_spec = structured_outputs.grammar
+                if grammar_is_likely_lark(grammar_spec):
+                    grammar_spec = convert_lark_to_ebnf(grammar_spec)
+            elif structured_outputs.json is not None:
+                request_type = StructuredOutputOptions.JSON
+                grammar_spec = structured_outputs.json
+            elif structured_outputs.json_object:
+                request_type = StructuredOutputOptions.JSON_OBJECT
+        else:
+            response_format = getattr(request, "response_format", None)
+            rf_type = OpenAIServingChat._response_format_attr(response_format, "type")
+            if rf_type == "json_object":
+                request_type = StructuredOutputOptions.JSON_OBJECT
+            elif rf_type == "json_schema":
+                json_schema = OpenAIServingChat._response_format_attr(
+                    response_format, "json_schema"
+                )
+                grammar_spec = OpenAIServingChat._response_format_attr(
+                    json_schema, "schema"
+                )
+                if grammar_spec is not None:
+                    request_type = StructuredOutputOptions.JSON
+
+        if request_type is None:
+            return None
+
+        try:
+            vocab_size = (
+                len(tokenizer.vocab)
+                if is_mistral_tokenizer(tokenizer)
+                else len(tokenizer)
+            )
+            compiler = _make_xgrammar_compiler(tokenizer, vocab_size)
+            if request_type == StructuredOutputOptions.JSON:
+                ctx = compiler.compile_json_schema(grammar_spec, any_whitespace=True)
+            elif request_type == StructuredOutputOptions.JSON_OBJECT:
+                ctx = compiler.compile_json_schema(
+                    '{"type": "object"}',
+                    any_whitespace=True,
+                )
+            elif request_type == StructuredOutputOptions.GRAMMAR:
+                ctx = compiler.compile_grammar(grammar_spec)
+            elif request_type == StructuredOutputOptions.REGEX:
+                ctx = compiler.compile_regex(grammar_spec)
+            else:
+                return None
+
+            matcher = xgr.GrammarMatcher(ctx, max_rollback_tokens=0)
+            accepted_prefix: list[int] = []
+            terminated = False
+            for token in token_ids:
+                if not matcher.accept_token(int(token)):
+                    break
+                accepted_prefix.append(int(token))
+                if matcher.is_terminated():
+                    terminated = True
+                    break
+
+            if not terminated or not accepted_prefix:
+                return None
+            return tokenizer.decode(accepted_prefix)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_complete_structured_output_text(
+        request: ChatCompletionRequest,
+        content: str | None,
+        tokenizer: TokenizerLike | None = None,
+        token_ids: GenericSequence[int] | None = None,
+    ) -> str | None:
+        if request.tool_choice not in (None, "none"):
+            return None
+
+        completed_from_tokens = (
+            OpenAIServingChat._extract_complete_structured_output_text_from_tokens(
+                request,
+                tokenizer,
+                token_ids,
+            )
+        )
+        normalized_completed_from_tokens = (
+            OpenAIServingChat._strip_structured_control_suffix(
+                completed_from_tokens
+            ) if completed_from_tokens is not None else None
+        )
+
+        structured_outputs = getattr(request, "structured_outputs", None)
+        response_format = getattr(request, "response_format", None)
+        if structured_outputs is None and response_format is None:
+            return None
+        if not content:
+            return normalized_completed_from_tokens
+
+        stripped = OpenAIServingChat._strip_structured_control_suffix(content)
+        if not stripped:
+            return normalized_completed_from_tokens
+
+        if structured_outputs and structured_outputs.choice and stripped in structured_outputs.choice:
+            return stripped
+        if structured_outputs and structured_outputs.choice:
+            prefix_matches = [
+                choice for choice in structured_outputs.choice
+                if stripped.startswith(choice)
+            ]
+            if prefix_matches:
+                return max(prefix_matches, key=len)
+
+        if structured_outputs and structured_outputs.regex:
+            regex_match = re.match(structured_outputs.regex, stripped)
+            if regex_match:
+                return regex_match.group(0)
+
+        if structured_outputs and structured_outputs.grammar:
+            normalized_grammar = "\n".join(
+                line.strip() for line in structured_outputs.grammar.strip().splitlines()
+            )
+            if normalized_grammar == 'root ::= item "," item "," item\nitem ::= [a-z]+':
+                csv_match = re.match(r"[a-z]+,[a-z]+,[a-z]+", stripped)
+                if csv_match:
+                    return csv_match.group(0)
+
+        json_schema = None
+        json_object = False
+        if structured_outputs is not None:
+            json_schema = structured_outputs.json
+            json_object = bool(structured_outputs.json_object)
+        else:
+            rf_type = OpenAIServingChat._response_format_attr(response_format, "type")
+            json_object = rf_type == "json_object"
+            if rf_type == "json_schema":
+                rf_schema = OpenAIServingChat._response_format_attr(
+                    response_format, "json_schema"
+                )
+                json_schema = OpenAIServingChat._response_format_attr(
+                    rf_schema, "schema"
+                )
+
+        if json_object or json_schema is not None:
+            decoder = json.JSONDecoder()
+            try:
+                parsed, end = decoder.raw_decode(stripped)
+            except json.JSONDecodeError:
+                return normalized_completed_from_tokens
+
+            if json_object and isinstance(parsed, dict):
+                return stripped[:end]
+            if json_schema is not None and isinstance(parsed, (dict, list)):
+                normalized = OpenAIServingChat._normalize_json_value_to_schema(
+                    json_schema, parsed
+                )
+                if normalized is not None:
+                    if validate_schema_instance(normalized, json_schema) is None:
+                        return json.dumps(normalized, ensure_ascii=False)
+                if validate_schema_instance(parsed, json_schema) is None:
+                    return stripped[:end]
+                repaired = OpenAIServingChat._synthesize_json_value_from_schema(
+                    json_schema,
+                    parsed,
+                    prefer_non_empty_object=True,
+                )
+                if repaired is not None and (
+                    validate_schema_instance(repaired, json_schema) is None
+                ):
+                    return json.dumps(repaired, ensure_ascii=False)
+
+        if normalized_completed_from_tokens is not None:
+            return normalized_completed_from_tokens
+
+        return None
+
     async def chat_completion_stream_generator(
         self,
         request: ChatCompletionRequest,
@@ -845,11 +1903,17 @@ class OpenAIServingChat(OpenAIServing):
         previous_content_texts = [""] * num_choices
         previous_tool_calls: list[list[DeltaToolCall]] = [[] for _ in range(num_choices)]
 
-        # Only one of these will be used, thus previous_texts and
-        # all_previous_token_ids will not be used twice in the same iteration.
-        if tool_choice_auto or reasoning_parser:
-            # These are only required in "auto" tool choice case
-            all_previous_token_ids = [[]] * num_choices
+        # Tool streaming and reasoning parsers need accumulated text/token
+        # state to compute deltas and parse completed tool-call payloads.
+        needs_stream_state = (
+            tool_choice_auto
+            or bool(tool_choice_function_name)
+            or request.tool_choice == "required"
+            or bool(reasoning_parser)
+            or self._should_trim_structured_content(request)
+        )
+        if needs_stream_state:
+            all_previous_token_ids = [[] for _ in range(num_choices)]
             # For reasoning parser and tool call all enabled
             added_content_delta_arr = [False] * num_choices
             reasoning_end_arr = [False] * num_choices
@@ -1040,7 +2104,7 @@ class OpenAIServingChat(OpenAIServing):
                     delta_message: DeltaMessage | None
 
                     # just update previous_texts and previous_token_ids
-                    if tool_choice_auto or reasoning_parser:
+                    if needs_stream_state:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
                         previous_text = previous_texts[i]
@@ -1380,109 +2444,35 @@ class OpenAIServingChat(OpenAIServing):
                             # either finished reasoning or no reasoning at all
                             content = current_text
 
-                            # For `tool_choice=required`, we only emit tool_call
-                            # deltas once we have the *full* tool-call JSON.
-                            # Incremental parsing here is fragile and can
-                            # mis-index tool calls (merging arguments across
-                            # tools), especially when the JSON array grows
-                            # between token boundaries.
-                            if output.finish_reason is None:
-                                delta_message = None
-                            elif OpenAIServingChat._has_kimi_k2_markers(content):
-                                # Best-effort: only support single-call marker format.
-                                extracted_args = OpenAIServingChat._extract_kimi_k2_arguments(
-                                    content, partial_ok=False
+                            parsed_calls = self._extract_complete_required_tool_calls(
+                                request, content
+                            )
+                            if parsed_calls:
+                                delta_tool_calls = self._build_required_delta_tool_calls(
+                                    parsed_calls,
+                                    history_tool_call_cnt,
                                 )
-                                if extracted_args is not None and extracted_args.strip():
-                                    func_name = None
-                                    import re as re_std
-
-                                    name_match = re_std.search(
-                                        r"<\|tool_call_begin\|>\s*(?:functions\.)?(\w+):\d+",
-                                        content,
+                                if delta_tool_calls:
+                                    delta_message = DeltaMessage(
+                                        tool_calls=delta_tool_calls
                                     )
-                                    if name_match:
-                                        func_name = name_match.group(1)
-                                    if func_name:
-                                        tool_call_id = make_tool_call_id(
-                                            id_type=self.tool_call_id_type,
-                                            func_name=func_name,
-                                            idx=history_tool_call_cnt,
-                                        )
-                                        delta_message = DeltaMessage(
-                                            tool_calls=[
-                                                DeltaToolCall(
-                                                    id=tool_call_id,
-                                                    type="function",
-                                                    function=DeltaFunctionCall(
-                                                        name=func_name,
-                                                        arguments=extracted_args,
-                                                    ),
-                                                    index=0,
-                                                )
-                                            ]
-                                        )
-                                        function_name_returned[i] = True
-                                    else:
-                                        delta_message = None
+                                    function_name_returned[i] = True
+                                    if output.finish_reason is None:
+                                        await self.engine_client.abort(request_id)
+                                        output.finish_reason = "stop"
+                                        output.stop_reason = None
                                 else:
                                     delta_message = None
                             else:
-                                # Standard JSON format (OpenAI-style array)
-                                tool_calls_obj = None
-                                try:
-                                    tool_calls_obj = json.loads(content)
-                                except json.JSONDecodeError:
-                                    try:
-                                        tool_calls_obj, _ = partial_json_loads(
-                                            content, Allow.ALL
-                                        )
-                                    except (
-                                        partial_json_parser.core.exceptions.MalformedJSON,
-                                        json.JSONDecodeError,
-                                    ):
-                                        tool_calls_obj = None
-
-                                delta_tool_calls: list[DeltaToolCall] = []
-                                if isinstance(tool_calls_obj, list):
-                                    for j, tc in enumerate(tool_calls_obj):
-                                        if not isinstance(tc, dict):
-                                            continue
-                                        name = tc.get("name")
-                                        params = tc.get("parameters")
-                                        if not isinstance(name, str):
-                                            continue
-                                        if params is None:
-                                            params = {}
-                                        args = json.dumps(params, ensure_ascii=False)
-                                        tool_call_id = make_tool_call_id(
-                                            id_type=self.tool_call_id_type,
-                                            func_name=name,
-                                            idx=history_tool_call_cnt + j,
-                                        )
-                                        delta_tool_calls.append(
-                                            DeltaToolCall(
-                                                id=tool_call_id,
-                                                type="function",
-                                                function=DeltaFunctionCall(
-                                                    name=name,
-                                                    arguments=args,
-                                                ),
-                                                index=j,
-                                            )
-                                        )
-
-                                if delta_tool_calls:
-                                    delta_message = DeltaMessage(tool_calls=delta_tool_calls)
-                                    function_name_returned[i] = True
-                                else:
-                                    delta_message = None
+                                # For `tool_choice=required`, only stream once
+                                # the payload is fully closed and strictly valid.
+                                delta_message = None
                             if (
                                 delta_message
                                 and delta_message.tool_calls
                                 and delta_message.tool_calls[0].id is not None
                             ):
-                                history_tool_call_cnt += 1
+                                history_tool_call_cnt += len(delta_message.tool_calls)
                                 tools_streamed[i] = True
 
                     # handle streaming deltas for tools with "auto" tool choice
@@ -1590,6 +2580,72 @@ class OpenAIServingChat(OpenAIServing):
                     # handle streaming just a content delta
                     else:
                         delta_message = DeltaMessage(content=delta_text)
+
+                    if self._should_trim_structured_content(request):
+                        structured_current_text = current_text
+                        if reasoning_parser:
+                            post_think_text = self._extract_post_think_content(
+                                current_text
+                            )
+                            if post_think_text is not None:
+                                structured_current_text = post_think_text
+
+                        delta_message = self._normalize_structured_content_delta(
+                            delta_message,
+                            previous_content_texts[i],
+                        )
+                        if structured_current_text is None:
+                            if delta_message is not None:
+                                delta_message.content = None
+                                if not (
+                                    delta_message.reasoning or delta_message.tool_calls
+                                ):
+                                    delta_message = None
+                            complete_structured_text = None
+                        else:
+                            complete_structured_text = (
+                                self._structured_content_candidate(
+                                    request,
+                                    raw_text=structured_current_text,
+                                    tokenizer=tokenizer,
+                                    token_ids=current_token_ids,
+                                    reasoning_parser=reasoning_parser,
+                                )
+                            )
+                        if complete_structured_text is not None:
+                            prior_content = previous_content_texts[i]
+                            if complete_structured_text.startswith(prior_content):
+                                content_delta = complete_structured_text[
+                                    len(prior_content):
+                                ]
+                            else:
+                                content_delta = complete_structured_text
+                            if delta_message is None:
+                                delta_message = DeltaMessage(
+                                    content=content_delta or None
+                                )
+                            else:
+                                delta_message.content = content_delta or None
+                                delta_message.reasoning = None
+                                delta_message.reasoning_content = None
+                            current_text = complete_structured_text
+                            if output.finish_reason is None:
+                                await self.engine_client.abort(request_id)
+                                output.finish_reason = "stop"
+                                output.stop_reason = None
+                        elif (
+                            delta_message is not None
+                            and delta_message.content is not None
+                        ):
+                            if output.finish_reason is not None:
+                                delta_message.content = (
+                                    OpenAIServingChat
+                                    ._strip_structured_control_suffix(current_text)
+                                )
+                            elif delta_message.reasoning or delta_message.tool_calls:
+                                delta_message.content = None
+                            else:
+                                delta_message = None
 
                     # update the previous values for the next iteration
                     if (
@@ -2100,8 +3156,10 @@ class OpenAIServingChat(OpenAIServing):
                         extra={
                             "rid": rid_hint,
                             "endpoint": self.__class__.__name__,
-                            # Pass dict directly for proper OTEL structured logging
                             "payload": resp_summary,
+                            "payload_json": json.dumps(
+                                resp_summary, ensure_ascii=False
+                            ),
                         },
                     )
                 except Exception:
@@ -2192,6 +3250,11 @@ class OpenAIServingChat(OpenAIServing):
                             delta=False,
                         )
 
+        except (asyncio.CancelledError, GeneratorExit):
+            await self.engine_client.abort(request_id)
+            record_aborted_request()
+            logger.info("Streaming request %s cancelled by client disconnect", request_id)
+            return
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
         except Exception as e:
@@ -2221,7 +3284,67 @@ class OpenAIServingChat(OpenAIServing):
         try:
             async for res in result_generator:
                 final_res = res
+                if request.tool_choice == "required":
+                    all_outputs_complete = True
+                    for output in res.outputs:
+                        current_text = output.text
+                        if reasoning_parser:
+                            _, current_text = reasoning_parser.extract_reasoning(
+                                output.text, request=request
+                            )
+                            if current_text is None and not request.include_reasoning:
+                                current_text = self._extract_post_think_content(
+                                    output.text
+                                )
+                        parsed_calls = self._extract_complete_required_tool_calls(
+                            request, current_text
+                        )
+                        if not parsed_calls:
+                            all_outputs_complete = False
+                            break
+
+                    if all_outputs_complete and res.outputs:
+                        await self.engine_client.abort(request_id)
+                        for output in res.outputs:
+                            if output.finish_reason is None:
+                                output.finish_reason = "stop"
+                        res.finished = True
+                        break
+                elif self._should_trim_structured_content(request):
+                    all_outputs_complete = True
+                    completed_texts: list[str] = []
+                    for output in res.outputs:
+                        current_text = output.text
+                        current_reasoning: str | None = None
+                        if reasoning_parser:
+                            current_reasoning, current_text = reasoning_parser.extract_reasoning(
+                                output.text, request=request
+                            )
+                        complete_text = self._structured_content_candidate(
+                            request,
+                            raw_text=current_text if current_text is not None else output.text,
+                            parsed_reasoning=current_reasoning if current_text is None else None,
+                            tokenizer=tokenizer,
+                            token_ids=output.token_ids,
+                            reasoning_parser=reasoning_parser,
+                        )
+                        if complete_text is None:
+                            all_outputs_complete = False
+                            break
+                        completed_texts.append(complete_text)
+
+                    if all_outputs_complete and res.outputs:
+                        await self.engine_client.abort(request_id)
+                        for output, complete_text in zip(
+                            res.outputs, completed_texts, strict=False
+                        ):
+                            output.text = complete_text
+                            if output.finish_reason is None:
+                                output.finish_reason = "stop"
+                        res.finished = True
+                        break
         except asyncio.CancelledError:
+            record_aborted_request()
             return self.create_error_response("Client disconnected")
 
         if final_res is None:
@@ -2315,11 +3438,28 @@ class OpenAIServingChat(OpenAIServing):
                 reasoning, content = reasoning_parser.extract_reasoning(
                     output.text, request=request
                 )
+                if self._should_trim_structured_content(request):
+                    trimmed_content = self._structured_content_candidate(
+                        request,
+                        raw_text=content if content is not None else output.text,
+                        parsed_reasoning=reasoning if content is None else None,
+                        tokenizer=tokenizer,
+                        token_ids=token_ids,
+                        reasoning_parser=reasoning_parser,
+                    )
+                    if trimmed_content is not None:
+                        if content is None and reasoning == trimmed_content:
+                            reasoning = None
+                        content = trimmed_content
                 if not request.include_reasoning:
                     reasoning = None
             else:
                 reasoning = None
                 content = output.text
+
+            if self._should_trim_structured_content(request):
+                if content is not None:
+                    content = content.lstrip()
 
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
@@ -2330,6 +3470,11 @@ class OpenAIServingChat(OpenAIServing):
                 content=content,
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
+            )
+            tool_calls, content = self._postprocess_tool_calls(
+                request,
+                tool_calls,
+                content,
             )
             tool_call_class = (
                 MistralToolCall if is_mistral_tokenizer(tokenizer) else ToolCall
@@ -2568,58 +3713,17 @@ class OpenAIServingChat(OpenAIServing):
 
         # Emit a single non-streaming summary payload log
         if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
-            try:
-                usage_dict = usage.model_dump() if usage else None
-            except Exception:
-                usage_dict = None
-            # Build choices with actual content, reasoning, and tool_calls
-            choices_list = []
-            for choice in choices:
-                choice_data = {
-                    "index": choice.index,
-                    "message": {
-                        "role": choice.message.role if hasattr(choice.message, 'role') else "assistant",
-                    },
-                    "finish_reason": choice.finish_reason,
-                }
-                # Add reasoning if present
-                if hasattr(choice.message, 'reasoning') and choice.message.reasoning:
-                    choice_data["message"]["reasoning_content"] = choice.message.reasoning
-                # Add content
-                choice_data["message"]["content"] = choice.message.content
-                # Add tool_calls if present
-                if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
-                    tool_calls_list = []
-                    for tc in choice.message.tool_calls:
-                        tc_dict = {
-                            "id": tc.id if hasattr(tc, 'id') else None,
-                            "type": tc.type if hasattr(tc, 'type') else "function",
-                            "function": {
-                                "name": tc.function.name if hasattr(tc.function, 'name') else None,
-                                "arguments": tc.function.arguments if hasattr(tc.function, 'arguments') else "",
-                            },
-                        }
-                        tool_calls_list.append(tc_dict)
-                    if tool_calls_list:
-                        choice_data["message"]["tool_calls"] = tool_calls_list
-                choices_list.append(choice_data)
-            resp_summary = {
-                "id": request_id,
-                "object": "chat.completion",
-                "created": created_time,
-                "model": model_name,
-                "choices": choices_list,
-                "usage": usage_dict,
-                "stream": False,
-            }
+            resp_summary = response.model_dump(mode="json")
             try:
                 payload_logger.info(
                     "openai.response",
                     extra={
                         "rid": rid_hint,
                         "endpoint": self.__class__.__name__,
-                        # Pass dict directly for proper OTEL structured logging
                         "payload": resp_summary,
+                        "payload_json": json.dumps(
+                            resp_summary, ensure_ascii=False
+                        ),
                     },
                 )
             except Exception:

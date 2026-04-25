@@ -305,14 +305,23 @@ class InputProcessor:
             mm_features = []
             for modality, idx in sorted_mm_idxs:
                 base_mm_hash = decoder_mm_hashes[modality][idx]
+                identifier = self._get_mm_identifier(
+                    base_mm_hash,
+                    lora_request,
+                )
+                if modality == "vision_chunk":
+                    # Kimi video is represented as multiple vision_chunk
+                    # inputs. Reusing encoder outputs for these chunks across
+                    # requests currently corrupts some video generations, even
+                    # though the cold path is correct. The encoder cache uses
+                    # identifier, while the P0/P1 multimodal processor caches
+                    # use mm_hash and must stay on the stable base hash.
+                    identifier = f"{request_id}:vision_chunk:{idx}:{identifier}"
                 mm_features.append(
                     MultiModalFeatureSpec(
                         data=decoder_mm_inputs[modality][idx],
                         modality=modality,
-                        identifier=self._get_mm_identifier(
-                            base_mm_hash,
-                            lora_request,
-                        ),
+                        identifier=identifier,
                         mm_position=decoder_mm_positions[modality][idx],
                         mm_hash=base_mm_hash,
                     )

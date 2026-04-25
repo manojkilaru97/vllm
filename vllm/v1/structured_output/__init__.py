@@ -59,6 +59,8 @@ class StructuredOutputManager:
 
     def __init__(self, vllm_config: VllmConfig):
         self.backend: StructuredOutputBackend | None = None
+        self.backend_name: str | None = None
+        self.guidance_fallback_backend: StructuredOutputBackend | None = None
         self.reasoner: ReasoningParser | None = None
         self.vllm_config = vllm_config
 
@@ -134,45 +136,78 @@ class StructuredOutputManager:
         if self.backend is None:
             assert request.sampling_params is not None
             backend = request.sampling_params.structured_outputs._backend
-            vocab_size = self.vllm_config.model_config.get_vocab_size()
-            if backend == "xgrammar":
-                self.backend = XgrammarBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "guidance":
-                self.backend = GuidanceBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "outlines":
-                from vllm.v1.structured_output.backend_outlines import OutlinesBackend
-
-                self.backend = OutlinesBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "lm-format-enforcer":
-                from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
-                    LMFormatEnforcerBackend,
-                )
-
-                self.backend = LMFormatEnforcerBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            else:
-                raise ValueError(f"Unsupported structured output backend: {backend}")
+            self.backend = self._init_backend(backend)
+            self.backend_name = backend
 
         if self._use_async_grammar_compilation:
             grammar = self.executor.submit(self._create_grammar, request)
         else:
             grammar = self._create_grammar(request)  # type: ignore[assignment]
         request.structured_output_request.grammar = grammar  # type: ignore[assignment]
+
+    def _init_backend(self, backend: str) -> StructuredOutputBackend:
+        vocab_size = self.vllm_config.model_config.get_vocab_size()
+        if backend == "xgrammar":
+            return XgrammarBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        if backend == "guidance":
+            return GuidanceBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        if backend == "outlines":
+            from vllm.v1.structured_output.backend_outlines import OutlinesBackend
+
+            return OutlinesBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        if backend == "lm-format-enforcer":
+            from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
+                LMFormatEnforcerBackend,
+            )
+
+            return LMFormatEnforcerBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        raise ValueError(f"Unsupported structured output backend: {backend}")
+
+    def _compile_guidance_fallback(
+        self,
+        request_type,
+        grammar_spec: str,
+        request_id: str,
+    ) -> StructuredOutputGrammar | None:
+        if self.backend_name == "guidance":
+            return None
+
+        try:
+            if self.guidance_fallback_backend is None:
+                self.guidance_fallback_backend = self._init_backend("guidance")
+            grammar = self.guidance_fallback_backend.compile_grammar(
+                request_type, grammar_spec
+            )
+        except Exception:
+            logger.exception(
+                "Structured output guidance fallback failed for request %s.",
+                request_id,
+            )
+            return None
+
+        logger.warning(
+            "Structured output request %s is using guidance fallback after %s "
+            "grammar compilation failed.",
+            request_id,
+            self.backend_name or self.backend.__class__.__name__,
+        )
+        return grammar
 
     def _create_grammar(self, request: "Request") -> StructuredOutputGrammar:
         key = request.structured_output_request.structured_output_key  # type: ignore[union-attr]
@@ -190,8 +225,21 @@ class StructuredOutputManager:
         except Exception:
             logger.exception(
                 "Structured output grammar compilation failed for request %s; "
-                "falling back to unconstrained decoding for this request.",
+                "trying guidance fallback before disabling constraints.",
                 request.request_id,
+            )
+            fallback_grammar = self._compile_guidance_fallback(
+                request_type,
+                grammar_spec,
+                request.request_id,
+            )
+            if fallback_grammar is not None:
+                return fallback_grammar
+            logger.error(
+                "Structured output constraints disabled for request %s after "
+                "%s and guidance grammar compilation both failed.",
+                request.request_id,
+                self.backend_name or self.backend.__class__.__name__,
             )
             return PassthroughGrammar()
 
@@ -370,3 +418,5 @@ class StructuredOutputManager:
     def clear_backend(self) -> None:
         if self.backend is not None:
             self.backend.destroy()
+        if self.guidance_fallback_backend is not None:
+            self.guidance_fallback_backend.destroy()

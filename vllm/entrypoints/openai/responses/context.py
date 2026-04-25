@@ -72,6 +72,30 @@ def _map_tool_name_to_tool_type(tool_name: str) -> str:
     return _TOOL_NAME_TO_TYPE_MAP[tool_name]
 
 
+def _response_item_attr(item: Any, field: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(field)
+    return getattr(item, field, None)
+
+
+def _coerce_function_call(item: Any) -> FunctionCall | None:
+    item_type = _response_item_attr(item, "type")
+    if item_type != "function_call":
+        return None
+
+    name = _response_item_attr(item, "name")
+    arguments = _response_item_attr(item, "arguments")
+    if not isinstance(name, str) or not isinstance(arguments, str):
+        return None
+
+    return FunctionCall(
+        id=_response_item_attr(item, "call_id")
+        or _response_item_attr(item, "id"),
+        name=name,
+        arguments=arguments,
+    )
+
+
 class TurnMetrics:
     """Tracks token and toolcall details for a single conversation turn."""
 
@@ -280,6 +304,7 @@ class ParsableContext(ConversationContext):
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
     ):
+        self.last_output = None
         self.num_prompt_tokens = 0
         self.num_output_tokens = 0
         self.num_cached_tokens = 0
@@ -314,6 +339,7 @@ class ParsableContext(ConversationContext):
         self.kv_transfer_params: dict[str, Any] | None = None
 
     def append_output(self, output: RequestOutput) -> None:
+        self.last_output = output
         self.num_prompt_tokens = len(output.prompt_token_ids or [])
         self.num_cached_tokens = output.num_cached_tokens or 0
         self.num_output_tokens += len(output.outputs[0].token_ids or [])
@@ -354,8 +380,8 @@ class ParsableContext(ConversationContext):
     def need_builtin_tool_call(self) -> bool:
         """Return true if the last message is a builtin tool call
         that the request has enabled."""
-        last_message = self.parser.response_messages[-1]
-        if last_message.type != "function_call":
+        last_message = _coerce_function_call(self.parser.response_messages[-1])
+        if last_message is None:
             return False
         if last_message.name in ("code_interpreter", "python"):
             return "python" in self.available_tools
@@ -460,7 +486,9 @@ class ParsableContext(ConversationContext):
     async def call_tool(self) -> list[ResponseInputOutputItem]:
         if not self.parser.response_messages:
             return []
-        last_msg = self.parser.response_messages[-1]
+        last_msg = _coerce_function_call(self.parser.response_messages[-1])
+        if last_msg is None:
+            return []
         # change this to a mcp_ function call
         last_msg.id = f"{MCP_PREFIX}{random_uuid()}"
         self.parser.response_messages[-1] = last_msg

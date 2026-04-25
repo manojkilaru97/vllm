@@ -281,6 +281,16 @@ class ResponsesRequest(OpenAIBaseModel):
                     add_generation_prompt=not continue_final,
                     continue_final_message=continue_final,
                     reasoning_effort=None if reasoning is None else reasoning.effort,
+                    enable_thinking=(
+                        False
+                        if reasoning is not None and reasoning.effort == "none"
+                        else None
+                    ),
+                    thinking=(
+                        False
+                        if reasoning is not None and reasoning.effort == "none"
+                        else None
+                    ),
                 ),
             ),
             media_io_kwargs=self.media_io_kwargs,
@@ -409,6 +419,38 @@ class ResponsesRequest(OpenAIBaseModel):
             raise VLLMValidationError(
                 "prompt template is not supported", parameter="prompt"
             )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_nested_function_tools(cls, data: Any) -> Any:
+        tools = data.get("tools")
+        if not isinstance(tools, list):
+            return data
+
+        normalized_tools: list[Any] = []
+        changed = False
+        for tool in tools:
+            if (
+                isinstance(tool, dict)
+                and tool.get("type") == "function"
+                and isinstance(tool.get("function"), dict)
+                and "name" not in tool
+            ):
+                flattened = {
+                    "type": "function",
+                    **tool["function"],
+                }
+                if "strict" in tool and "strict" not in flattened:
+                    flattened["strict"] = tool["strict"]
+                normalized_tools.append(flattened)
+                changed = True
+            else:
+                normalized_tools.append(tool)
+
+        if changed:
+            data = dict(data)
+            data["tools"] = normalized_tools
         return data
 
     @model_validator(mode="before")

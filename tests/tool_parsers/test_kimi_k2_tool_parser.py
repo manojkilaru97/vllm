@@ -71,6 +71,29 @@ def run_streaming_sequence(parser, deltas):
     return results
 
 
+def collect_streamed_tool_calls(results):
+    """Merge tool call deltas by index into final streamed calls."""
+    tool_calls = {}
+    for result in results:
+        if result is None or not result.tool_calls:
+            continue
+        for tc in result.tool_calls:
+            index = tc.index or 0
+            call = tool_calls.setdefault(index, {"name": None, "arguments": ""})
+            function = tc.function or {}
+            if isinstance(function, dict):
+                name = function.get("name")
+                arguments = function.get("arguments")
+            else:
+                name = getattr(function, "name", None)
+                arguments = getattr(function, "arguments", None)
+            if name:
+                call["name"] = name
+            if isinstance(arguments, str):
+                call["arguments"] += arguments
+    return [tool_calls[i] for i in sorted(tool_calls)]
+
+
 def test_extract_tool_calls_no_tools(kimi_k2_tool_parser):
     model_output = "This is a test"
     extracted_tool_calls = kimi_k2_tool_parser.extract_tool_calls(
@@ -542,6 +565,40 @@ def test_malformed_tool_section_recovery(kimi_k2_tool_parser):
     # And returned the content as reasoning
     assert result2 is not None
     assert result2.content == large_text
+
+
+def test_long_active_tool_section_keeps_streaming_arguments(kimi_k2_tool_parser):
+    """
+    A long-running tool call should not trigger malformed-section recovery.
+    This covers the truncation path where a valid streaming JSON payload used to
+    be cut off once the tool section crossed the old hard limit.
+    """
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+    tool_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_call_begin|>")
+    tool_end_id = kimi_k2_tool_parser.vocab.get("<|tool_call_end|>")
+    section_end_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_end|>")
+
+    long_query = "luxo-diamond-ankara-" * 4000
+    deltas = [
+        ("<|tool_calls_section_begin|>", [section_begin_id]),
+        (
+            '<|tool_call_begin|>functions.search:0 <|tool_call_argument_begin|> {"queries": ["',
+            [tool_begin_id],
+        ),
+        (long_query, [101]),
+        ('"]}<|tool_call_end|><|tool_calls_section_end|>', [tool_end_id, section_end_id]),
+    ]
+
+    results = run_streaming_sequence(kimi_k2_tool_parser, deltas)
+    streamed_calls = collect_streamed_tool_calls(results)
+
+    assert kimi_k2_tool_parser.in_tool_section is False
+    assert len(streamed_calls) == 1
+    assert streamed_calls[0]["name"] == "search"
+    parsed_args = json.loads(streamed_calls[0]["arguments"])
+    assert parsed_args == {"queries": [long_query]}
 
 
 def test_state_reset(kimi_k2_tool_parser):

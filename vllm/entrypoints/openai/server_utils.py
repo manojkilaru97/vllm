@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import uuid
 from argparse import Namespace
@@ -26,13 +27,95 @@ from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     GenerationError,
 )
+from vllm.entrypoints.openai.request_metrics import summarize_request_payload
 from vllm.entrypoints.utils import create_error_response, sanitize_message
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.payload_sanitization import prepare_request_payload_for_logging
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 logger = init_logger("vllm.entrypoints.openai.server_utils")
+payload_logger = logging.getLogger("vllm.payload")
+
+
+def _extract_request_rid(req: Request) -> str:
+    rid = req.headers.get("X-Request-Id", "")
+    if not rid and hasattr(req.state, "request_metadata"):
+        rid = str(getattr(req.state.request_metadata, "request_id", "") or "")
+        if rid.startswith("chatcmpl-"):
+            rid = rid[len("chatcmpl-") :]
+    return rid
+
+
+async def _log_request_payload(req: Request) -> None:
+    rid = _extract_request_rid(req)
+    if not rid:
+        return
+
+    try:
+        headers_obj = {k: v for k, v in req.headers.items()}
+    except Exception:
+        headers_obj = None
+
+    payload = None
+    try:
+        body = await req.body()
+        if body:
+            payload = json.loads(body)
+    except Exception:
+        payload = None
+
+    payload = prepare_request_payload_for_logging(
+        payload,
+        headers=headers_obj,
+    )
+    summary = summarize_request_payload(payload)
+    extra = {
+        "rid": rid,
+        "endpoint": req.url.path,
+        "input_image_count": summary.image_count,
+        "input_video_count": summary.video_count,
+        "input_audio_count": summary.audio_count,
+        "input_tool_count": summary.tool_count,
+        "has_images": summary.has_images,
+        "has_videos": summary.has_videos,
+        "has_audios": summary.has_audios,
+        "has_tools": summary.has_tools,
+        "has_tool_calls_enabled": summary.has_tool_calls_enabled,
+        "has_structured_output": summary.has_structured_output,
+        "payload": payload,
+        "payload_json": (
+            json.dumps(payload, ensure_ascii=False) if payload is not None else None
+        ),
+        "headers": headers_obj,
+    }
+    if summary.tool_choice is not None:
+        extra["tool_choice"] = summary.tool_choice
+    if summary.structured_output_kind is not None:
+        extra["structured_output_kind"] = summary.structured_output_kind
+
+    try:
+        payload_logger.info("openai.request", extra=extra)
+    except Exception:
+        pass
+
+
+def _log_error_response(req: Request, err: ErrorResponse) -> None:
+    rid = _extract_request_rid(req)
+    if not rid:
+        return
+    try:
+        payload_logger.info(
+            "openai.response",
+            extra={
+                "rid": rid,
+                "endpoint": req.url.path,
+                "payload": err.model_dump(),
+            },
+        )
+    except Exception:
+        pass
 
 
 class AuthenticationMiddleware:
@@ -355,6 +438,7 @@ async def engine_error_handler(
         engine=req.app.state.engine_client,
     )
     err = create_error_response(exc)
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -366,6 +450,7 @@ async def generation_error_handler(req: Request, exc: GenerationError):
     server logs with stack traces.
     """
     err = create_error_response(exc)
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -379,6 +464,7 @@ async def exception_handler(req: Request, exc: Exception):
         )
 
     err = create_error_response(exc)
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
@@ -397,6 +483,7 @@ async def http_exception_handler(req: Request, exc: HTTPException):
             code=exc.status_code,
         )
     )
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=exc.status_code)
 
 
@@ -434,6 +521,8 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
             param=param,
         )
     )
+    await _log_request_payload(req)
+    _log_error_response(req, err)
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 

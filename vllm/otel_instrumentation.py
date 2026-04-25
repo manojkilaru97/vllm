@@ -35,7 +35,9 @@ import queue
 import hashlib
 from logging.handlers import QueueHandler, QueueListener
 
+from vllm import envs
 from vllm.logger import init_logger
+from vllm.payload_sanitization import maybe_redact_mm_text
 
 logger = init_logger(__name__)
 
@@ -465,7 +467,12 @@ def _sanitize_url_no_query(url: str) -> str:
 
 def _media_mirror_enabled() -> bool:
     # Default to enabled when kratos is enabled, since mirroring relies on it.
-    return _is_truthy(os.getenv("VLLM_MEDIA_MIRROR_ENABLE", os.getenv("KRATOS_BULKUPLOAD_ENABLE", "0")))
+    return bool(envs.VLLM_LOG_MM_INPUT_METADATA) and _is_truthy(
+        os.getenv(
+            "VLLM_MEDIA_MIRROR_ENABLE",
+            os.getenv("KRATOS_BULKUPLOAD_ENABLE", "0"),
+        )
+    )
 
 
 def _start_media_mirror_worker() -> None:
@@ -606,7 +613,11 @@ class _KratosOffloadFilter(logging.Filter):
 
     def _offload_data_uris_in_string(self, text: str, record: logging.LogRecord) -> str:
         if not text or "base64," not in text:
-            return text
+            return maybe_redact_mm_text(text)
+        if not envs.VLLM_LOG_MM_INPUT_METADATA:
+            return maybe_redact_mm_text(text)
+        if not self.enabled:
+            return maybe_redact_mm_text(text)
 
         def _maybe_upload(m: re.Match) -> str:
             full = m.group(0)
@@ -662,7 +673,11 @@ class _KratosOffloadFilter(logging.Filter):
             return text
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
-        if not self.enabled:
+        if (
+            not self.enabled
+            and envs.VLLM_LOG_MM_INPUT_METADATA
+            and envs.VLLM_LOG_AUDIO_INPUT_METADATA
+        ):
             return True
         try:
             seen: set[int] = set()

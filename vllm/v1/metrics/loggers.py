@@ -59,7 +59,7 @@ class StatLoggerBase(ABC):
     ): ...
 
     @abstractmethod
-    def log_engine_initialized(self): ...
+    def log_engine_initialized(self, startup_time: float | None = None): ...
 
     def log(self):  # noqa
         pass
@@ -269,7 +269,7 @@ class LoggingStatLogger(StatLoggerBase):
         if self._enable_perf_stats():
             self.perf_metrics_logging.log(log_fn=log_fn, log_prefix=self.log_prefix)
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         if self.vllm_config.cache_config.num_gpu_blocks:
             logger.debug(
                 "Engine %03d: vllm cache_config_info with initialization "
@@ -337,7 +337,7 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
     def log(self):
         LoggingStatLogger.log(self)
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         if self.vllm_config.cache_config.num_gpu_blocks:
             logger.info(
                 "%d Engines: vllm cache_config_info with initialization "
@@ -382,9 +382,9 @@ class PerEngineStatLoggerAdapter(AggregateStatLoggerBase):
         for per_engine_stat_logger in self.per_engine_stat_loggers.values():
             per_engine_stat_logger.log()
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         for per_engine_stat_logger in self.per_engine_stat_loggers.values():
-            per_engine_stat_logger.log_engine_initialized()
+            per_engine_stat_logger.log_engine_initialized(startup_time)
 
 
 class PrometheusStatLogger(AggregateStatLoggerBase):
@@ -489,6 +489,26 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.gauge_kv_cache_usage = create_metric_per_engine(
             gauge_kv_cache_usage, per_engine_labelvalues
+        )
+
+        gauge_engine_startup_time = self._gauge_cls(
+            name="vllm:engine_startup_time",
+            documentation="Time taken for the engine to start up in seconds.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_engine_startup_time = create_metric_per_engine(
+            gauge_engine_startup_time, per_engine_labelvalues
+        )
+
+        gauge_engine_load_weights_time = self._gauge_cls(
+            name="vllm:engine_load_weights_time",
+            documentation="Time taken for the engine to load weights in seconds.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_engine_load_weights_time = create_metric_per_engine(
+            gauge_engine_load_weights_time, per_engine_labelvalues
         )
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -1006,14 +1026,31 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 ],
             )
 
+    def _config_metrics_info(self, config_obj: SupportsMetricsInfo) -> dict[str, str]:
+        if hasattr(config_obj, "metrics_info"):
+            try:
+                return dict(config_obj.metrics_info())
+            except Exception:
+                pass
+        return {"config_class": config_obj.__class__.__name__}
+
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
-        metrics_info = config_obj.metrics_info()
+        metrics_info = self._config_metrics_info(config_obj)
         metrics_info["engine"] = ""
 
         name, documentation = None, None
         if type == "cache_config":
             name = "vllm:cache_config_info"
             documentation = "Information of the LLMEngine CacheConfig"
+        elif type == "model_config":
+            name = "vllm:model_config_info"
+            documentation = "Information of the LLMEngine ModelConfig"
+        elif type == "parallel_config":
+            name = "vllm:parallel_config_info"
+            documentation = "Information of the LLMEngine ParallelConfig"
+        elif type == "speculative_config":
+            name = "vllm:speculative_config_info"
+            documentation = "Information of the LLMEngine SpeculativeConfig"
         assert name is not None, f"Unknown metrics info type {type}"
 
         # Info type metrics are syntactic sugar for a gauge permanently set to 1
@@ -1026,7 +1063,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             labelnames=metrics_info.keys(),
         )
         for engine_index in self.engine_indexes:
-            metrics_info = config_obj.metrics_info()
+            metrics_info = self._config_metrics_info(config_obj)
             metrics_info["engine"] = str(engine_index)
             info_gauge.labels(**metrics_info).set(1)
 
@@ -1202,8 +1239,64 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
 
-    def log_engine_initialized(self):
+    def _log_detailed_config_info(self):
+        """Expose scheduler/compilation/attention config as an info gauge."""
+        cfg = self.vllm_config
+
+        def _cfg_val(config_obj, attr, default="N/A"):
+            val = getattr(config_obj, attr, None) if config_obj else None
+            if val is None:
+                return default
+            if hasattr(val, "name"):
+                return str(val.name)
+            return str(val)
+
+        labels: dict[str, str] = {
+            "stream_interval": _cfg_val(
+                cfg.scheduler_config, "stream_interval", "1"
+            ),
+            "compilation_mode": _cfg_val(cfg.compilation_config, "mode", "none"),
+            "compilation_backend": _cfg_val(
+                cfg.compilation_config, "backend", "default"
+            ),
+            "cudagraph_mode": _cfg_val(
+                cfg.compilation_config, "cudagraph_mode", "none"
+            ),
+            "attention_backend": _cfg_val(cfg.attention_config, "backend", "auto"),
+            "flash_attn_version": _cfg_val(
+                cfg.attention_config, "flash_attn_version", "auto"
+            ),
+            "flashinfer_moe_backend": str(
+                getattr(envs, "VLLM_FLASHINFER_MOE_BACKEND", "N/A")
+            ),
+            "engine": "",
+        }
+        info_gauge = self._gauge_cls(
+            name="vllm:detailed_config_info",
+            documentation=(
+                "Additional engine configuration details "
+                "(scheduler, compilation, attention, env settings)"
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labels.keys(),
+        )
+        for engine_index in self.engine_indexes:
+            labels["engine"] = str(engine_index)
+            info_gauge.labels(**labels).set(1)
+
+    def log_engine_initialized(self, startup_time: float | None = None):
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
+        self.log_metrics_info("model_config", self.vllm_config.model_config)
+        self.log_metrics_info("parallel_config", self.vllm_config.parallel_config)
+        if self.vllm_config.speculative_config is not None:
+            self.log_metrics_info(
+                "speculative_config", self.vllm_config.speculative_config
+            )
+        self._log_detailed_config_info()
+        startup_value = 0.0 if startup_time is None else startup_time
+        for engine_idx in self.engine_indexes:
+            self.gauge_engine_startup_time[engine_idx].set(startup_value)
+            self.gauge_engine_load_weights_time[engine_idx].set(0.0)
 
 
 def build_buckets(mantissa_lst: list[int], max_value: int) -> list[int]:
@@ -1322,6 +1415,6 @@ class StatLoggerManager:
         for logger in self.stat_loggers:
             logger.log()
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         for agg_logger in self.stat_loggers:
-            agg_logger.log_engine_initialized()
+            agg_logger.log_engine_initialized(startup_time)

@@ -127,6 +127,9 @@ class OpenAIServingCompletion(OpenAIServing):
         result = await self.render_completion_request(request)
         if isinstance(result, ErrorResponse):
             return result
+        maybe_priority_error = self._validate_priority(request.priority)
+        if maybe_priority_error is not None:
+            return maybe_priority_error
 
         engine_inputs = result
         classify_completion_request(request)

@@ -173,6 +173,6 @@ def validate_structured_output_request_lm_format_enforcer(params: SamplingParams
         return
     elif so_params.grammar:
         raise ValueError(
-            "LM Format Enforcer structured outputs backend "
+            "Grammar error: LM Format Enforcer structured outputs backend "
             "does not support grammar specifications"
         )

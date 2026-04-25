@@ -195,7 +195,7 @@ def validate_structured_output_request_outlines(params: SamplingParams):
         validate_regex_is_buildable(regex)
     elif so_params.grammar:
         raise ValueError(
-            "Outlines structured outputs backend "
+            "Grammar error: Outlines structured outputs backend "
             "does not support grammar specifications"
         )
 

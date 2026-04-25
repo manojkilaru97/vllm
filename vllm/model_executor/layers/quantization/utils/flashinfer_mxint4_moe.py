@@ -261,6 +261,9 @@ def flashinfer_trtllm_mxint4_moe(
         enable_pdl=None,
         output=None,
         tune_max_num_tokens=8192,
-    ).to(x.dtype)
+    )
+    if isinstance(out, (list, tuple)):
+        out = out[0]
+    out = out.to(x.dtype)
 
     return out

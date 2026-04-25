@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from concurrent.futures import Future
+from types import SimpleNamespace
 
 import pytest
 from transformers import AutoTokenizer
@@ -12,11 +13,48 @@ from vllm.config.parallel import ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.request import Request
-from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output import PassthroughGrammar, StructuredOutputManager
 from vllm.v1.structured_output.backend_guidance import GuidanceBackend
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 
 TOKENIZER = "gpt2"
+
+
+class _FakeGrammar(PassthroughGrammar):
+    pass
+
+
+class _FailingBackend:
+    def compile_grammar(self, request_type, grammar_spec):
+        raise RuntimeError("compile failed")
+
+
+class _WorkingBackend:
+    def compile_grammar(self, request_type, grammar_spec):
+        return _FakeGrammar()
+
+
+def test_structured_output_uses_guidance_fallback_before_passthrough():
+    manager = StructuredOutputManager.__new__(StructuredOutputManager)
+    manager.backend = _FailingBackend()
+    manager.backend_name = "xgrammar"
+    manager.guidance_fallback_backend = None
+    manager._init_backend = lambda backend: _WorkingBackend()
+
+    request = SimpleNamespace(
+        request_id="test_request",
+        structured_output_request=SimpleNamespace(
+            structured_output_key=(
+                StructuredOutputOptions.JSON,
+                '{"type": "object"}',
+            )
+        ),
+    )
+
+    grammar = StructuredOutputManager._create_grammar(manager, request)
+
+    assert isinstance(grammar, _FakeGrammar)
+    assert isinstance(manager.guidance_fallback_backend, _WorkingBackend)
 
 
 def test_backend_guidance_rollback_terminated():

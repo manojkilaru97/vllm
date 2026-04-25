@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
+    VLLM_LOG_MM_INPUT_METADATA: bool = True
+    VLLM_LOG_AUDIO_INPUT_METADATA: bool = True
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -652,6 +654,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False"
     ).lower()
     == "true",
+    # If set to 0, redact multimodal input metadata from logs and disable
+    # media mirroring / payload offload for MM inputs.
+    "VLLM_LOG_MM_INPUT_METADATA": lambda: bool(
+        int(os.getenv("VLLM_LOG_MM_INPUT_METADATA", "1"))
+    ),
+    # Audio payloads are additionally gated because they can be regulated as
+    # personal data in some jurisdictions.
+    "VLLM_LOG_AUDIO_INPUT_METADATA": lambda: bool(
+        int(os.getenv("VLLM_LOG_AUDIO_INPUT_METADATA", "1"))
+    ),
     # S3 access information, used for tensorizer to load model from S3
     "S3_ACCESS_KEY_ID": lambda: os.environ.get("S3_ACCESS_KEY_ID", None),
     "S3_SECRET_ACCESS_KEY": lambda: os.environ.get("S3_SECRET_ACCESS_KEY", None),

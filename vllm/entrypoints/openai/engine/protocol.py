@@ -118,7 +118,7 @@ class JsonSchemaResponseFormat(OpenAIBaseModel):
     description: str | None = None
     # schema is the field in openai but that causes conflicts with pydantic so
     # instead use json_schema with an alias
-    json_schema: dict[str, Any] | None = Field(default=None, alias="schema")
+    json_schema: dict[str, Any] | bool | None = Field(default=None, alias="schema")
     strict: bool | None = None
 
 

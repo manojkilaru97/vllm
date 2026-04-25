@@ -3,7 +3,7 @@
 import inspect
 import itertools
 from collections import defaultdict, deque
-from collections.abc import Set
+from collections.abc import Sequence, Set
 from functools import lru_cache
 from typing import Any, Literal, cast, overload
 
@@ -13,6 +13,7 @@ import jinja2.meta
 import jinja2.nodes
 import jinja2.parser
 import jinja2.sandbox
+from PIL import Image
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.entrypoints.chat_utils import (
@@ -525,19 +526,127 @@ def rebuild_mm_uuids_from_mm_data(
     if vision_chunks is None:
         return mm_uuids
 
-    assert all(isinstance(item, dict) for item in vision_chunks), (
-        "Expected all vision_chunk items to be dicts"
-    )
-    vision_chunks = cast(list[dict[str, Any]], vision_chunks)
+    vision_chunk_items = list(vision_chunks)
+    vision_chunk_dicts = [
+        item for item in vision_chunk_items if isinstance(item, dict)
+    ]
+    vision_chunk_dicts = cast(list[dict[str, Any]], vision_chunk_dicts)
     vision_chunk_uuids = [
-        uuid_val for item in vision_chunks if (uuid_val := item.get("uuid")) is not None
+        uuid_val
+        for item in vision_chunk_dicts
+        if (uuid_val := item.get("uuid")) is not None
     ]
 
-    if vision_chunk_uuids:
-        mm_uuids = dict(mm_uuids)
+    mm_uuids = dict(mm_uuids)
+
+    if (
+        vision_chunk_items
+        and len(vision_chunk_dicts) == len(vision_chunk_items)
+        and len(vision_chunk_uuids) == len(vision_chunk_dicts)
+    ):
         mm_uuids["vision_chunk"] = vision_chunk_uuids
+    else:
+        mm_uuids.pop("vision_chunk", None)
 
     return mm_uuids
+
+
+def _format_video_timestamp(seconds: float) -> str:
+    milliseconds = int((seconds % 1) * 1000)
+    total_seconds = int(seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+
+
+def _to_pil_frame(frame: Any) -> Image.Image:
+    if isinstance(frame, Image.Image):
+        return frame.convert("RGB")
+    return Image.fromarray(frame).convert("RGB")
+
+
+def normalize_kimi_vision_chunks(
+    mm_data: MultiModalDataDict,
+    mm_uuids: MultiModalUUIDDict | None,
+) -> MultiModalDataDict:
+    """Convert vLLM video tuples into Kimi's unified video_chunk dicts."""
+    vision_chunks = mm_data.get("vision_chunk")
+    if vision_chunks is None:
+        return mm_data
+
+    base_uuids = None
+    if isinstance(mm_uuids, dict):
+        maybe_uuids = mm_uuids.get("vision_chunk")
+        if isinstance(maybe_uuids, Sequence) and not isinstance(maybe_uuids, str):
+            base_uuids = list(maybe_uuids)
+
+    normalized: list[Any] = []
+    video_idx = 0
+    chunk_size = 4
+    source_idx = 0
+    for item in vision_chunks:
+        base_uuid = (
+            base_uuids[source_idx]
+            if base_uuids is not None and source_idx < len(base_uuids)
+            else None
+        )
+        source_idx += 1
+
+        if isinstance(item, dict):
+            if base_uuid is not None and item.get("uuid") is None:
+                item = dict(item)
+                item["uuid"] = base_uuid
+            normalized.append(item)
+            if item.get("type") == "video_chunk":
+                video_idx = max(video_idx, int(item.get("video_idx", video_idx)) + 1)
+            continue
+
+        if not (isinstance(item, tuple) and len(item) == 2):
+            normalized.append(item)
+            continue
+
+        frames, metadata = item
+        frame_indices = []
+        fps = 0.0
+        if isinstance(metadata, dict):
+            frame_indices = metadata.get("frames_indices") or []
+            try:
+                fps = float(metadata.get("fps") or 0.0)
+            except Exception:
+                fps = 0.0
+
+        try:
+            frame_count = len(frames)
+        except Exception:
+            normalized.append(item)
+            continue
+
+        for start in range(0, frame_count, chunk_size):
+            raw_chunk = frames[start : start + chunk_size]
+            pil_chunk = [_to_pil_frame(frame) for frame in raw_chunk]
+            if frame_indices and fps > 0 and start < len(frame_indices):
+                timestamp_seconds = float(frame_indices[start]) / fps
+            else:
+                timestamp_seconds = float(start)
+            prompt = (
+                f"{_format_video_timestamp(timestamp_seconds)}"
+                "<|media_begin|>video<|media_content|><|media_pad|><|media_end|>"
+            )
+            chunk: dict[str, Any] = {
+                "type": "video_chunk",
+                "video_chunk": pil_chunk,
+                "prompt": prompt,
+                "video_idx": video_idx,
+            }
+            if base_uuid is not None:
+                chunk["uuid"] = f"{base_uuid}:chunk:{start // chunk_size}"
+            normalized.append(chunk)
+        video_idx += 1
+
+    mm_data = dict(mm_data)
+    mm_data["vision_chunk"] = normalized
+    return mm_data
 
 
 def build_video_prompts_from_mm_data(
@@ -561,8 +670,8 @@ def build_video_prompts_from_mm_data(
     video_prompts_dict: dict[int, list[str]] = defaultdict(list)
 
     for item in vision_chunks:
-        # vision_chunk items are always dicts (VisionChunkImage/VisionChunkVideo)
-        assert isinstance(item, dict)
+        if not isinstance(item, dict):
+            continue
         if item.get("type") == "video_chunk":
             video_idx = item.get("video_idx", 0)
             prompt = item.get("prompt", "")
@@ -655,6 +764,7 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             and mm_uuids is not None
             and mm_data is not None
         ):
+            mm_data = normalize_kimi_vision_chunks(mm_data, mm_uuids)
             mm_uuids = rebuild_mm_uuids_from_mm_data(mm_uuids, mm_data)
 
             # get video placeholder, replace it with runtime video-chunk prompts
@@ -714,6 +824,9 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             and mm_uuids is not None
             and mm_data is not None
         ):
+            mm_data = normalize_kimi_vision_chunks(mm_data, mm_uuids)
+            mm_uuids = rebuild_mm_uuids_from_mm_data(mm_uuids, mm_data)
+
             # get video placeholder, replace it with runtime video-chunk prompts
             video_placeholder = getattr(
                 model_config.hf_config, "video_placeholder", None

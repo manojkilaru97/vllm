@@ -476,6 +476,11 @@ class DelegatingParser(Parser):
         # First extract reasoning
         reasoning, content = self.extract_reasoning(model_output, request)
 
+        if request.reasoning is not None and request.reasoning.effort == "none":
+            if reasoning:
+                content = f"{reasoning}{content or ''}"
+                reasoning = None
+
         # Then parse tool calls from the content
         tool_calls, content = self._parse_tool_calls(
             request=request,

@@ -779,10 +779,6 @@ class SamplingParams(
         ):
             raise ValueError("structured_outputs.grammar cannot be an empty string")
 
-        from vllm.v1.structured_output.backend_guidance import (
-            has_guidance_unsupported_json_features,
-            validate_guidance_grammar,
-        )
         from vllm.v1.structured_output.backend_lm_format_enforcer import (
             validate_structured_output_request_lm_format_enforcer,
         )
@@ -795,30 +791,18 @@ class SamplingParams(
             so_params = self.structured_outputs
             assert so_params is not None
 
-            skip_guidance = False
-            if so_params.json:
-                if isinstance(so_params.json, str):
-                    schema = json_mod.loads(so_params.json)
-                else:
-                    schema = so_params.json
-                skip_guidance = has_guidance_unsupported_json_features(schema)
-
-            if is_mistral_tokenizer(tokenizer) or skip_guidance:
-                validate_structured_output_request_outlines(self)
-                so_params._backend = "outlines"
-                logger.warning(
-                    "xgrammar validation/compilation failed (%s); "
-                    "falling back to outlines structured output backend.",
-                    err,
-                )
-            else:
-                validate_guidance_grammar(self, tokenizer=None)
-                so_params._backend = "guidance"
-                logger.warning(
-                    "xgrammar validation/compilation failed (%s); "
-                    "falling back to guidance structured output backend.",
-                    err,
-                )
+            # Keep structured-output fallback on the xgrammar/outlines side.
+            # Guidance introduces a second grammar dialect and has been a
+            # frequent source of opaque validation failures for these Kimi
+            # bringups. If xgrammar rejects the request, prefer outlines as the
+            # single fallback backend for consistent behavior.
+            validate_structured_output_request_outlines(self)
+            so_params._backend = "outlines"
+            logger.warning(
+                "xgrammar validation/compilation failed (%s); "
+                "falling back to outlines structured output backend.",
+                err,
+            )
 
         if backend.startswith("xgrammar"):
             try:

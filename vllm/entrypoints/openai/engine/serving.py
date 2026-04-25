@@ -575,6 +575,20 @@ class OpenAIServing:
         )
         return json_str
 
+    def _validate_priority(self, priority: int) -> ErrorResponse | None:
+        if priority == 0:
+            return None
+
+        vllm_config = getattr(self.engine_client, "vllm_config", None)
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        if getattr(scheduler_config, "policy", None) != "priority":
+            return self.create_error_response(
+                "priority is only supported when priority scheduling is enabled",
+                param="priority",
+            )
+
+        return None
+
     def _raise_if_error(self, finish_reason: str | None, request_id: str) -> None:
         """Raise GenerationError if finish_reason indicates an error."""
         if finish_reason == "error":

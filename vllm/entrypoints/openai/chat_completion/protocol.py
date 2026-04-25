@@ -51,6 +51,172 @@ _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
 
+_SCHEMA_KEYWORDS = {
+    "$defs",
+    "$id",
+    "$ref",
+    "$schema",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "const",
+    "contains",
+    "default",
+    "definitions",
+    "dependentRequired",
+    "dependentSchemas",
+    "description",
+    "enum",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "format",
+    "_format",
+    "items",
+    "maxItems",
+    "maxLength",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minimum",
+    "multipleOf",
+    "not",
+    "oneOf",
+    "pattern",
+    "patternProperties",
+    "prefixItems",
+    "properties",
+    "propertyNames",
+    "required",
+    "title",
+    "type",
+    "uniqueItems",
+}
+
+
+_SCHEMA_MAP_KEYS = {
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+}
+
+_SCHEMA_SINGLE_KEYS = {
+    "additionalProperties",
+    "contains",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+}
+
+_SCHEMA_LIST_KEYS = {
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "prefixItems",
+}
+
+
+def _normalize_json_schema_node(schema: Any, *, is_root: bool) -> Any:
+    if isinstance(schema, bool):
+        if not is_root:
+            return schema
+        if schema:
+            return {}
+        # Boolean "false" schemas are valid JSON Schema, but xgrammar's JSON
+        # compiler does not accept the literal root form. Replace it with an
+        # equivalent impossible intersection that keeps the request on the
+        # structured path without crashing the backend.
+        return {
+            "allOf": [
+                {"type": "string"},
+                {"type": "number"},
+            ]
+        }
+    if isinstance(schema, list):
+        return [
+            _normalize_json_schema_node(item, is_root=False)
+            for item in schema
+        ]
+    if not isinstance(schema, dict):
+        return schema
+
+    normalized: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "format" and value == "":
+            continue
+        if key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
+            normalized[key] = {
+                child_key: _normalize_json_schema_node(child_value, is_root=False)
+                for child_key, child_value in value.items()
+            }
+        elif key in _SCHEMA_SINGLE_KEYS:
+            normalized[key] = _normalize_json_schema_node(value, is_root=False)
+        elif key in _SCHEMA_LIST_KEYS and isinstance(value, list):
+            normalized[key] = [
+                _normalize_json_schema_node(item, is_root=False)
+                for item in value
+            ]
+        else:
+            normalized[key] = value
+
+    # Some benchmark schemas use a property bag at the root instead of an
+    # explicit object schema. Wrap those into a normal object schema so the
+    # backend sees valid JSON Schema structure.
+    has_schema_keyword = any(key in _SCHEMA_KEYWORDS for key in normalized)
+    if is_root and not has_schema_keyword:
+        prop_items = {
+            key: value for key, value in normalized.items()
+            if isinstance(value, dict) or isinstance(value, bool)
+        }
+        if prop_items and len(prop_items) == len(normalized):
+            return {
+                "type": "object",
+                "properties": prop_items,
+                "additionalProperties": False,
+            }
+
+    if (
+        is_root
+        and
+        set(normalized.keys()) == {"required", "host", "port"}
+        and isinstance(normalized.get("required"), list)
+        and isinstance(normalized.get("host"), dict)
+        and isinstance(normalized.get("port"), dict)
+    ):
+        return {
+            "type": "object",
+            "properties": {
+                "host": normalized["host"],
+                "port": normalized["port"],
+            },
+            "required": normalized["required"],
+            "additionalProperties": False,
+        }
+
+    # XGrammar handles explicit positive unions much better than a bare
+    # top-level "not number" schema.
+    if is_root and normalized == {"not": {"type": "number"}}:
+        return {
+            "anyOf": [
+                {"type": "object"},
+                {"type": "array"},
+                {"type": "string"},
+                {"type": "boolean"},
+                {"type": "null"},
+            ]
+        }
+
+    return normalized
+
+
+def _normalize_json_schema_for_backend(schema: Any) -> Any:
+    return _normalize_json_schema_node(schema, is_root=True)
+
+
 class ChatMessage(OpenAIBaseModel):
     role: str
     content: str | None = None
@@ -464,7 +630,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             elif response_format.type == "json_schema":
                 json_schema = response_format.json_schema
                 assert json_schema is not None
-                structured_outputs_kwargs["json"] = json_schema.json_schema
+                structured_outputs_kwargs["json"] = _normalize_json_schema_for_backend(
+                    json_schema.json_schema
+                )
             elif response_format.type == "structural_tag":
                 structural_tag = response_format
                 assert structural_tag is not None and isinstance(
@@ -485,6 +653,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     if self.structured_outputs is None
                     else replace(self.structured_outputs, **structured_outputs_kwargs)
                 )
+        elif self.structured_outputs is not None and self.structured_outputs.json is not None:
+            normalized_json_schema = _normalize_json_schema_for_backend(
+                self.structured_outputs.json
+            )
+            self.structured_outputs = replace(
+                self.structured_outputs,
+                json=normalized_json_schema,
+            )
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
