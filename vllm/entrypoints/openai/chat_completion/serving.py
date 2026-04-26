@@ -2205,6 +2205,11 @@ class OpenAIServingChat(OpenAIServing):
                                 as_list(output.token_ids)
                             ):
                                 reasoning_end_arr[i] = True
+                                pending_reasoning = (
+                                    delta_message.reasoning
+                                    if delta_message and delta_message.reasoning
+                                    else None
+                                )
                                 if delta_message and delta_message.content:
                                     # This need to be added to next `delta_text`
                                     current_text = delta_message.content
@@ -2288,11 +2293,16 @@ class OpenAIServingChat(OpenAIServing):
                                             function_name_returned[i] = True
 
                                         delta_message = DeltaMessage(
+                                            reasoning=pending_reasoning,
                                             tool_calls=[delta_tool_call]
                                         )
                                         tools_streamed[i] = True
                                     else:
-                                        delta_message = None
+                                        delta_message = (
+                                            DeltaMessage(reasoning=pending_reasoning)
+                                            if pending_reasoning
+                                            else None
+                                        )
                         else:
                             # Named tool_choice streaming - handle Kimi K2 marker format
                             # Accumulate full text to extract clean JSON arguments
@@ -2422,6 +2432,11 @@ class OpenAIServingChat(OpenAIServing):
                             )
                             if reasoning_parser.is_reasoning_end(output_token_ids):
                                 reasoning_end_arr[i] = True
+                                pending_reasoning = (
+                                    delta_message.reasoning
+                                    if delta_message and delta_message.reasoning
+                                    else None
+                                )
                                 if delta_message and delta_message.content:
                                     current_text = delta_message.content
                                     delta_message.content = None
@@ -2471,13 +2486,18 @@ class OpenAIServingChat(OpenAIServing):
 
                                     if delta_tool_calls:
                                         delta_message = DeltaMessage(
+                                            reasoning=pending_reasoning,
                                             tool_calls=delta_tool_calls
                                         )
                                         function_name_returned[i] = True
                                         history_tool_call_cnt += len(delta_tool_calls)
                                         tools_streamed[i] = True
                                     else:
-                                        delta_message = None
+                                        delta_message = (
+                                            DeltaMessage(reasoning=pending_reasoning)
+                                            if pending_reasoning
+                                            else None
+                                        )
 
                         else:
                             # either finished reasoning or no reasoning at all
@@ -2521,6 +2541,7 @@ class OpenAIServingChat(OpenAIServing):
                         assert added_content_delta_arr is not None
                         assert reasoning_end_arr is not None
                         output_token_ids = as_list(output.token_ids)
+                        pending_reasoning: str | None = None
                         if not reasoning_end_arr[i]:
                             # When encountering think end id in prompt_token_ids
                             # i.e {"enable_thinking": False},
@@ -2547,6 +2568,11 @@ class OpenAIServingChat(OpenAIServing):
                                 # to 'reasoning'.
                                 if reasoning_parser.is_reasoning_end(output_token_ids):
                                     reasoning_end_arr[i] = True
+                                    pending_reasoning = (
+                                        delta_message.reasoning
+                                        if delta_message and delta_message.reasoning
+                                        else None
+                                    )
                                     current_token_ids = (
                                         reasoning_parser.extract_content_ids(
                                             output_token_ids
@@ -2580,6 +2606,16 @@ class OpenAIServingChat(OpenAIServing):
                                 delta_token_ids=delta_token_ids,
                                 request=request,
                             )
+                            if pending_reasoning:
+                                if delta_message is None:
+                                    delta_message = DeltaMessage(
+                                        reasoning=pending_reasoning
+                                    )
+                                else:
+                                    delta_message.reasoning = (
+                                        pending_reasoning
+                                        + (delta_message.reasoning or "")
+                                    )
                             if delta_message and delta_message.tool_calls:
                                 tools_streamed[i] = True
                     # when only tool calls

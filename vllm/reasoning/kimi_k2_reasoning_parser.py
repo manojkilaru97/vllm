@@ -240,6 +240,26 @@ class KimiK2ReasoningParser(ReasoningParser):
                 delta_token_ids,
             )
 
+        def decode_delta_ids(token_ids: Sequence[int]) -> str:
+            if not token_ids:
+                return ""
+            return self.model_tokenizer.decode(
+                token_ids, skip_special_tokens=True
+            )
+
+        def split_on_marker_id(
+            marker_id: int,
+            marker_text: str,
+            include_marker_in_content: bool,
+        ) -> tuple[str, str | None]:
+            """Split a streaming chunk when the marker token was not decoded."""
+            marker_index = list(delta_token_ids).index(marker_id)
+            reasoning = decode_delta_ids(delta_token_ids[:marker_index])
+            content = decode_delta_ids(delta_token_ids[marker_index + 1 :])
+            if include_marker_in_content:
+                content = marker_text + content
+            return reasoning, content or None
+
         # If reasoning has already ended in previous tokens, this is content
         if self.is_reasoning_end(previous_token_ids):
             return DeltaMessage(content=delta_text)
@@ -253,14 +273,29 @@ class KimiK2ReasoningParser(ReasoningParser):
 
         if self._end_token_id in delta_token_ids:
             end_index = delta_text.find(self._end_token)
+            if end_index == -1:
+                reasoning, content = split_on_marker_id(
+                    self._end_token_id, self._end_token, False
+                )
+                return DeltaMessage(reasoning=reasoning, content=content)
             reasoning = delta_text[:end_index]
             content = delta_text[end_index + len(self._end_token) :]
             return DeltaMessage(
                 reasoning=reasoning, content=content if content else None
             )
 
-        if self._tool_section_start_token_id in delta_token_ids:
+        if (
+            self._tool_section_start_token_id is not None
+            and self._tool_section_start_token_id in delta_token_ids
+        ):
             tool_index = delta_text.find(self._tool_section_start_token)
+            if tool_index == -1:
+                reasoning, content = split_on_marker_id(
+                    self._tool_section_start_token_id,
+                    self._tool_section_start_token,
+                    True,
+                )
+                return DeltaMessage(reasoning=reasoning, content=content)
             reasoning = delta_text[:tool_index]
             content = delta_text[tool_index:]
             return DeltaMessage(reasoning=reasoning, content=content)
@@ -270,6 +305,13 @@ class KimiK2ReasoningParser(ReasoningParser):
             and self._tool_call_start_token_id in delta_token_ids
         ):
             tool_index = delta_text.find(self._tool_call_start_token)
+            if tool_index == -1:
+                reasoning, content = split_on_marker_id(
+                    self._tool_call_start_token_id,
+                    self._tool_call_start_token,
+                    True,
+                )
+                return DeltaMessage(reasoning=reasoning, content=content)
             reasoning = delta_text[:tool_index]
             content = delta_text[tool_index:]
             return DeltaMessage(reasoning=reasoning, content=content)

@@ -151,6 +151,32 @@ def test_streaming_reasoning_then_content(kimi_k2_tokenizer):
     assert result.content == "answer"
 
 
+def test_streaming_hidden_end_token_preserves_reasoning_suffix(kimi_k2_tokenizer):
+    """Decoded deltas may omit special tokens even when their IDs are present."""
+    parser = KimiK2ReasoningParser(kimi_k2_tokenizer)
+
+    reasoning_ids = kimi_k2_tokenizer.encode(" so", add_special_tokens=False)
+    content_ids = kimi_k2_tokenizer.encode(" done", add_special_tokens=False)
+    delta_token_ids = reasoning_ids + [parser._end_token_id] + content_ids
+
+    result = parser.extract_reasoning_streaming(
+        previous_text="<think>thinking",
+        current_text="<think>thinking so done",
+        delta_text=" so done",
+        previous_token_ids=[parser._start_token_id],
+        current_token_ids=[parser._start_token_id] + delta_token_ids,
+        delta_token_ids=delta_token_ids,
+    )
+
+    assert isinstance(result, DeltaMessage)
+    assert result.reasoning == kimi_k2_tokenizer.decode(
+        reasoning_ids, skip_special_tokens=True
+    )
+    assert result.content == kimi_k2_tokenizer.decode(
+        content_ids, skip_special_tokens=True
+    )
+
+
 def test_streaming_tool_section_ends_reasoning(kimi_k2_tokenizer):
     """<|tool_calls_section_begin|> in delta ends reasoning during streaming."""
     parser = KimiK2ReasoningParser(kimi_k2_tokenizer)
@@ -170,3 +196,36 @@ def test_streaming_tool_section_ends_reasoning(kimi_k2_tokenizer):
     )
     assert isinstance(result, DeltaMessage)
     assert result.content == "<|tool_calls_section_begin|>"
+
+
+def test_streaming_hidden_tool_section_preserves_reasoning_suffix(
+    kimi_k2_tokenizer,
+):
+    """Do not slice at -1 when the tool-section marker token is hidden."""
+    parser = KimiK2ReasoningParser(kimi_k2_tokenizer)
+
+    reasoning_ids = kimi_k2_tokenizer.encode(" before tool", add_special_tokens=False)
+    tool_payload_ids = kimi_k2_tokenizer.encode(
+        "functions.search:0", add_special_tokens=False
+    )
+    delta_token_ids = (
+        reasoning_ids + [parser._tool_section_start_token_id] + tool_payload_ids
+    )
+
+    result = parser.extract_reasoning_streaming(
+        previous_text="<think>thinking",
+        current_text="<think>thinking before toolfunctions.search:0",
+        delta_text=" before toolfunctions.search:0",
+        previous_token_ids=[parser._start_token_id],
+        current_token_ids=[parser._start_token_id] + delta_token_ids,
+        delta_token_ids=delta_token_ids,
+    )
+
+    assert isinstance(result, DeltaMessage)
+    assert result.reasoning == kimi_k2_tokenizer.decode(
+        reasoning_ids, skip_special_tokens=True
+    )
+    assert result.content == (
+        parser._tool_section_start_token
+        + kimi_k2_tokenizer.decode(tool_payload_ids, skip_special_tokens=True)
+    )
