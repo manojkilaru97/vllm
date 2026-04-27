@@ -410,7 +410,7 @@ def _materialize_media_url_for_logging(
             kind=kind,
             allowed_local_media_path=allowed_local_media_path,
         )
-    if kind in {"image", "video"} and ";asset_id," in lowered:
+    if kind in {"image", "video", "audio"} and ";asset_id," in lowered:
         return _asset_ref_to_data_url_for_logging(url, headers=headers)
     return url
 
@@ -449,7 +449,7 @@ def _asset_ref_to_data_url_for_logging(url: str, *, headers: dict[str, str]) -> 
         return url
 
     match = re.match(
-        r"^data:(?P<mime>(?:image|video)/[^;]+);asset_id,(?P<asset_id>.+)$",
+        r"^data:(?P<mime>(?:image|video|audio)/[^;]+);asset_id,(?P<asset_id>.+)$",
         url,
         re.IGNORECASE,
     )

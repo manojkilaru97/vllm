@@ -2745,16 +2745,19 @@ class OpenAIServingChat(OpenAIServing):
         self, messages: list[dict], raw_request: Request
     ) -> list[dict]:
         """
-        Convert any NVCF image/video asset references to base64 data URLs and,
-        when present inside plain text content with <img>/<video> tags,
+        Convert any NVCF image/video/audio asset references to base64 data
+        URLs and, when present inside plain text content with
+        <img>/<video>/<audio> tags,
         transform the message into structured parts to ensure media loading by
         the multimodal parser.
 
         Supported inputs:
         - Structured image: {"type":"image_url", "image_url":{"url":"data:image/...;asset_id,<id>"}}
         - Structured video: {"type":"video_url", "video_url":{"url":"data:video/...;asset_id,'<id>'"}}
+        - Structured audio: {"type":"audio_url", "audio_url":{"url":"data:audio/...;asset_id,<id>"}}
         - Text with HTML: "... <img src=\"data:image/...;asset_id,<id>\"/> ..."
         - Text with HTML: "... <video src=\"data:video/mp4;asset_id,'<id>'\"/> ..."
+        - Text with HTML: "... <audio src=\"data:audio/wav;asset_id,<id>\"/> ..."
         Headers used:
         - NVCF-ASSET-DIR: absolute directory containing assets
         - NVCF-FUNCTION-ASSET-IDS: comma-separated allowed asset ids
@@ -2781,9 +2784,9 @@ class OpenAIServingChat(OpenAIServing):
         allowed_ids = {normalize_asset_id(s) for s in allowed_ids_hdr.split(',') if s.strip()}
 
         def to_base64_data_url(data_url: str) -> str:
-            # data:<mime>;asset_id,<id> (images/videos)
+            # data:<mime>;asset_id,<id> (images/videos/audios)
             m = re.match(
-                r"^data:(?P<mime>(?:image|video)/[^;]+);asset_id,(?P<asset_id>.+)$",
+                r"^data:(?P<mime>(?:image|video|audio)/[^;]+);asset_id,(?P<asset_id>.+)$",
                 data_url,
             )
             if not m:
@@ -2805,7 +2808,12 @@ class OpenAIServingChat(OpenAIServing):
                 from vllm.otel_instrumentation import enqueue_media_mirror
 
                 rid = get_request_id() or ""
-                kind = "video" if mime.startswith("video/") else "image"
+                if mime.startswith("video/"):
+                    kind = "video"
+                elif mime.startswith("audio/"):
+                    kind = "audio"
+                else:
+                    kind = "image"
                 enqueue_media_mirror(
                     rid=rid,
                     kind=kind,
@@ -2852,14 +2860,25 @@ class OpenAIServingChat(OpenAIServing):
                         new_parts.append(part)
                         continue
 
+                    if "audio_url" in part:
+                        url_obj = part["audio_url"]
+                        if isinstance(url_obj, dict):
+                            url = url_obj.get("url")
+                            if isinstance(url, str) and ";asset_id," in url:
+                                url_obj["url"] = to_base64_data_url(url)
+                        elif isinstance(url_obj, str) and ";asset_id," in url_obj:
+                            part["audio_url"] = {"url": to_base64_data_url(url_obj)}
+                        new_parts.append(part)
+                        continue
+
                     new_parts.append(part)
                 msg["content"] = new_parts
                 return msg
 
-            # Case 2: plain text possibly containing <img>/<video> tags
+            # Case 2: plain text possibly containing <img>/<video>/<audio> tags
             if isinstance(content, str):
                 pattern = re.compile(
-                    r"<(?P<tag>img|video)\s+[^>]*src=\"(?P<src>[^\"]+)\"[^>]*\/?>",
+                    r"<(?P<tag>img|video|audio)\s+[^>]*src=\"(?P<src>[^\"]+)\"[^>]*\/?>",
                     re.IGNORECASE,
                 )
                 idx = 0
@@ -2879,6 +2898,9 @@ class OpenAIServingChat(OpenAIServing):
                         elif tag == "video" and url.startswith("data:video/"):
                             b64_url = to_base64_data_url(url)
                             parts.append({"type": "video_url", "video_url": {"url": b64_url}})
+                        elif tag == "audio" and url.startswith("data:audio/"):
+                            b64_url = to_base64_data_url(url)
+                            parts.append({"type": "audio_url", "audio_url": {"url": b64_url}})
                         else:
                             parts.append({"type": "text", "text": m.group(0)})
                     else:
