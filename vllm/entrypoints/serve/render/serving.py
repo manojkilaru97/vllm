@@ -531,18 +531,24 @@ class OpenAIServingRender:
         ).with_defaults(
             default_template_kwargs,
             default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
-            default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
+            default_mm_processor_kwargs=(
+                mm_config.mm_processor_kwargs if mm_config else None
+            ),
         )
+
+        prompt_extras = {
+            k: v
+            for k in ("cache_salt",)
+            if (v := getattr(request, k, None)) is not None
+        }
+        if chat_params.mm_processor_kwargs is not None:
+            prompt_extras["mm_processor_kwargs"] = chat_params.mm_processor_kwargs
 
         (conversation,), (engine_input,) = await renderer.render_chat_async(
             [messages],
             chat_params,
             tok_params,
-            prompt_extras={
-                k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
-                if (v := getattr(request, k, None)) is not None
-            },
+            prompt_extras=prompt_extras,
             skip_mm_cache=skip_mm_cache,
         )
 

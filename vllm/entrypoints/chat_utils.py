@@ -751,6 +751,26 @@ class BaseMultiModalContentParser(ABC):
     def mm_placeholder_storage(self) -> dict[str, list]:
         return dict(self._placeholder_storage)
 
+    def _should_fetch_audio_from_video(self, video_url: str | None) -> bool:
+        return bool(
+            video_url
+            and self._mm_processor_kwargs
+            and self._mm_processor_kwargs.get("use_audio_in_video", False)
+        )
+
+    @staticmethod
+    def _is_no_audio_track_error(exc: BaseException) -> bool:
+        current: BaseException | None = exc
+        while current is not None:
+            message = str(current)
+            if (
+                "No audio found in the video" in message
+                or "No audio stream found" in message
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
     @abstractmethod
     def parse_image(self, image_url: str | None, uuid: str | None = None) -> None:
         raise NotImplementedError
@@ -907,13 +927,19 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         placeholder = self._tracker.add("video", (video, uuid))
         self._add_placeholder("video", placeholder)
 
-        # Extract audio from video if use_audio_in_video is True
-        if (
-            video_url
-            and self._mm_processor_kwargs
-            and self._mm_processor_kwargs.get("use_audio_in_video", False)
-        ):
-            audio = self._connector.fetch_audio(video_url) if video_url else None
+        if self._should_fetch_audio_from_video(video_url):
+            try:
+                audio = self._connector.fetch_audio(video_url) if video_url else None
+            except ValueError as exc:
+                if not self._is_no_audio_track_error(exc):
+                    raise
+                logger.info(
+                    "Video has no audio track; continuing with visual-only "
+                    "processing despite use_audio_in_video=True."
+                )
+                if self._mm_processor_kwargs is not None:
+                    self._mm_processor_kwargs["use_audio_in_video"] = False
+                return
             audio_placeholder = self._tracker.add("audio", (audio, uuid))
             self._add_placeholder("audio", audio_placeholder)
 
@@ -1069,14 +1095,22 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         placeholder = self._tracker.add("video", coro)
         self._add_placeholder("video", placeholder)
 
-        # Extract audio from video if use_audio_in_video is True
-        if (
-            video_url
-            and self._mm_processor_kwargs
-            and self._mm_processor_kwargs.get("use_audio_in_video", False)
-        ):
-            audio_coro = self._audio_with_uuid_async(video_url, uuid)
-            audio_placeholder = self._tracker.add("audio", audio_coro)
+        if self._should_fetch_audio_from_video(video_url):
+            try:
+                audio = self._connector.fetch_audio(video_url) if video_url else None
+            except ValueError as exc:
+                if not self._is_no_audio_track_error(exc):
+                    raise
+                logger.info(
+                    "Video has no audio track; continuing with visual-only "
+                    "processing despite use_audio_in_video=True."
+                )
+                if self._mm_processor_kwargs is not None:
+                    self._mm_processor_kwargs["use_audio_in_video"] = False
+                return
+            audio_future = asyncio.Future[tuple[object, str | None]]()
+            audio_future.set_result((audio, uuid))
+            audio_placeholder = self._tracker.add("audio", audio_future)
             self._add_placeholder("audio", audio_placeholder)
 
 

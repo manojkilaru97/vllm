@@ -681,6 +681,12 @@ class NanoNemotronVLMultiModalProcessor(
             # Reuse existing audio items; validate 1:1 correspondence.
             videos = mm_items.get_items("video", VideoProcessorItems)
             audios = mm_items.get_items("audio", AudioProcessorItems)
+            if len(audios) == 0:
+                logger.info(
+                    "use_audio_in_video=True but no audio items are present; "
+                    "continuing with visual-only video processing."
+                )
+                return super().apply(inputs, timing_ctx)
             if len(audios) != len(videos):
                 raise ValueError(
                     "use_audio_in_video requires equal number of audio and "
