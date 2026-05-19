@@ -105,9 +105,12 @@ class NemotronV3Parser(Qwen3Parser):
     ) -> tuple[str | None, str | None]:
         reasoning, content = super().extract_reasoning(model_output, request)
 
-        if self._should_force_content(request) and (
-            content is None or not content.strip()
-        ):
-            reasoning, content = content, reasoning
+        if content is None or not content.strip():
+            if self._should_force_content(request):
+                reasoning, content = None, reasoning
+            elif reasoning:
+                # Model stopped before closing reasoning; surface it as
+                # content rather than returning an empty answer.
+                content = reasoning
 
         return reasoning, content
