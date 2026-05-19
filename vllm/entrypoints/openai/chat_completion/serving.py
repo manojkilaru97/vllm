@@ -1350,6 +1350,20 @@ class OpenAIServingChat(OpenAIServing):
                         ):
                             delta_message.content = current_text
                             delta_message.reasoning = None
+                        elif (
+                            not request.tools
+                            and request.include_reasoning
+                            and not streamed_content_texts[i]
+                            and not delta_message.content
+                        ):
+                            # If the model stops before </think>, expose the
+                            # reasoning text as content instead of returning an
+                            # effectively empty answer.
+                            pending_reasoning = streamed_reasoning_texts[i] + (
+                                delta_message.reasoning or ""
+                            )
+                            if pending_reasoning:
+                                delta_message.content = pending_reasoning
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
