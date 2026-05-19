@@ -1198,6 +1198,8 @@ class OpenAIServingResponses(OpenAIServing):
                 request,
                 enable_auto_tools=self.enable_auto_tools,
             )
+            if request.parallel_tool_calls is False and tool_calls:
+                tool_calls = tool_calls[:1]
             return build_response_output_items(
                 reasoning=reasoning,
                 content=content,
