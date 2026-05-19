@@ -56,15 +56,14 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
         reasoning, final_content = super().extract_reasoning(model_output, request)
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None)
 
-        if (
-            chat_template_kwargs
-            and (
-                chat_template_kwargs.get("enable_thinking") is False
-                or chat_template_kwargs.get("force_nonempty_content") is True
-            )
-            and (final_content is None or not final_content.strip())
-        ):
-            reasoning, final_content = final_content, reasoning
+        if final_content is None or not final_content.strip():
+            if (
+                chat_template_kwargs
+                and chat_template_kwargs.get("enable_thinking") is False
+            ):
+                reasoning, final_content = None, reasoning
+            elif reasoning:
+                final_content = reasoning
 
         if final_content and self.end_token in final_content:
             _, _, final_content = final_content.rpartition(self.end_token)
