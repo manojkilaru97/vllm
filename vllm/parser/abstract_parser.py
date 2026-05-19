@@ -388,6 +388,8 @@ class DelegatingParser(Parser):
             content=content,
             enable_auto_tools=enable_auto_tools,
         )
+        if request.parallel_tool_calls is False:
+            tool_calls = tool_calls[:1]
 
         # Build output items
         outputs: list[ResponseOutputItem] = []
