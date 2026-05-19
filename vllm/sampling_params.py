@@ -839,6 +839,33 @@ class SamplingParams(
         ):
             raise ValueError("structured_outputs.grammar cannot be an empty string")
 
+        needs_guidance_json_schema = False
+        if self.structured_outputs.json is not None:
+            from vllm.structured_schema_bounds import (
+                bound_json_schema_for_constrained_decoding,
+                json_schema_has_unconstrained_string_fields,
+            )
+
+            if isinstance(self.structured_outputs.json, str):
+                schema = json_mod.loads(self.structured_outputs.json)
+                needs_guidance_json_schema = (
+                    json_schema_has_unconstrained_string_fields(schema)
+                )
+                self.structured_outputs.json = json_mod.dumps(
+                    bound_json_schema_for_constrained_decoding(schema)
+                )
+            else:
+                needs_guidance_json_schema = (
+                    json_schema_has_unconstrained_string_fields(
+                        self.structured_outputs.json
+                    )
+                )
+                self.structured_outputs.json = (
+                    bound_json_schema_for_constrained_decoding(
+                        self.structured_outputs.json
+                    )
+                )
+
         from vllm.v1.structured_output.backend_guidance import (
             has_guidance_unsupported_json_features,
             validate_guidance_grammar,
@@ -890,6 +917,17 @@ class SamplingParams(
             # this setting. We include fallback behavior here, but not with any
             # other setting where a specific backend was specified.
             try:
+                so_params = self.structured_outputs
+                if so_params.json:
+                    if isinstance(so_params.json, str):
+                        schema = json_mod.loads(so_params.json)
+                    else:
+                        schema = so_params.json
+                    if needs_guidance_json_schema:
+                        raise ValueError(
+                            "Unconstrained string JSON schemas use guidance in auto "
+                            "mode to avoid valid-but-wrong string continuations."
+                        )
                 validate_xgrammar_grammar(self)
                 self.structured_outputs._backend = "xgrammar"
             except ValueError:
@@ -900,7 +938,6 @@ class SamplingParams(
                 skip_guidance = _is_non_tekken_mistral(tokenizer)
 
                 # Check if schema has features unsupported by guidance
-                so_params = self.structured_outputs
                 if not skip_guidance and so_params.json:
                     if isinstance(so_params.json, str):
                         schema = json_mod.loads(so_params.json)

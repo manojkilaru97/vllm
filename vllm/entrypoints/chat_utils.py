@@ -344,6 +344,9 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     reasoning: str | None
     """The reasoning content for interleaved thinking."""
 
+    reasoning_content: str | None
+    """Deprecated: The reasoning content for interleaved thinking."""
+
     tools: list[ChatCompletionFunctionToolParam] | None
     """The tools for developer role."""
 
@@ -1733,6 +1736,10 @@ def _parse_chat_message_content(
     role = message["role"]
     content = message.get("content")
     reasoning = message.get("reasoning")
+    if reasoning is None:
+        # Some clients use reasoning_content for historical assistant turns.
+        # Normalize it to vLLM's internal reasoning field before templating.
+        reasoning = message.get("reasoning_content")
 
     if content is None:
         content = []

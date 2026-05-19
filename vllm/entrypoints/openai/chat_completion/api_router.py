@@ -3,6 +3,8 @@
 
 
 from http import HTTPStatus
+import logging
+import os
 
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -22,8 +24,10 @@ from vllm.entrypoints.utils import (
     with_cancellation,
 )
 from vllm.logger import init_logger
+from vllm.payload_sanitization import maybe_redact_mm_payload
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 router = APIRouter()
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
@@ -61,6 +65,19 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
+        rid = raw_request.headers.get("X-Request-Id", "")
+        if rid and os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            try:
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": rid,
+                        "endpoint": handler.__class__.__name__,
+                        "payload": maybe_redact_mm_payload(generator.model_dump()),
+                    },
+                )
+            except Exception:
+                pass
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )

@@ -18,7 +18,6 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
-from vllm.envs import VLLM_ENFORCE_STRICT_TOOL_CALLING
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
@@ -39,7 +38,9 @@ logger = init_logger(__name__)
 
 
 class Qwen3CoderToolParser(ToolParser):
-    supports_required_and_named: bool = not VLLM_ENFORCE_STRICT_TOOL_CALLING
+    # Required/named tool choice uses xgrammar-constrained JSON and the
+    # standard conversion path; auto tool choice still uses this parser.
+    supports_required_and_named: bool = True
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
@@ -513,6 +514,34 @@ class Qwen3CoderToolParser(ToolParser):
 
             if json_fragments:
                 combined = "".join(json_fragments)
+                if not self.json_closed and self.function_end_token in tool_text:
+                    combined += "}"
+                    self.json_closed = True
+                    self.in_function = False
+
+                    func_start = tool_text.find(self.tool_call_prefix) + len(
+                        self.tool_call_prefix
+                    )
+                    func_content_end = tool_text.find(
+                        self.function_end_token, func_start
+                    )
+                    if func_content_end != -1:
+                        func_content = tool_text[func_start:func_content_end]
+                        try:
+                            parsed_tool = self._parse_xml_function_call(func_content)
+                            if parsed_tool and self.current_tool_index < len(
+                                self.prev_tool_call_arr
+                            ):
+                                self.prev_tool_call_arr[self.current_tool_index][
+                                    "arguments"
+                                ] = parsed_tool.function.arguments
+                        except Exception:
+                            logger.debug(
+                                "Failed to parse tool call during streaming: %s",
+                                tool_text,
+                                exc_info=True,
+                            )
+                    self.accumulated_params = {}
 
                 if self.current_tool_index < len(self.streamed_args_for_tool):
                     self.streamed_args_for_tool[self.current_tool_index] += combined

@@ -347,7 +347,27 @@ class DelegatingParser(Parser):
     ) -> tuple[str | None, str | None]:
         if self._reasoning_parser is None:
             return None, model_output
-        return self._reasoning_parser.extract_reasoning(model_output, request)
+        reasoning, content = self._reasoning_parser.extract_reasoning(
+            model_output, request
+        )
+        if self._reasoning_disabled_for_request(request) and content is None:
+            return None, reasoning
+        return reasoning, content
+
+    @staticmethod
+    def _reasoning_disabled_for_request(
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> bool:
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None)
+        if (
+            chat_template_kwargs
+            and chat_template_kwargs.get("enable_thinking") is False
+        ):
+            return True
+        if getattr(request, "reasoning_effort", None) == "none":
+            return True
+        reasoning = getattr(request, "reasoning", None)
+        return bool(reasoning and getattr(reasoning, "effort", None) == "none")
 
     def extract_response_outputs(
         self,
@@ -671,10 +691,20 @@ class DelegatingParser(Parser):
                 prompt_token_ids
             ):
                 state.reasoning_ended = True
+        reasoning_disabled = self._reasoning_disabled_for_request(request)
+        if reasoning_disabled:
+            state.reasoning_ended = True
+        if state.reasoning_ended and not delta_text and delta_token_ids:
+            delta_text = self.model_tokenizer.decode(
+                delta_token_ids, skip_special_tokens=True
+            )
 
         current_text = state.previous_text + delta_text
         current_token_ids = state.previous_token_ids + delta_token_ids
         delta_message: DeltaMessage | None = None
+        tool_parsing_enabled = bool(getattr(request, "tools", None)) and (
+            getattr(request, "tool_choice", None) != "none"
+        )
 
         # Reasoning extraction
         if self._in_reasoning_phase(state):
@@ -696,9 +726,13 @@ class DelegatingParser(Parser):
                 )
                 delta_text = current_text
                 delta_token_ids = current_token_ids
+                if tool_parsing_enabled and self._tool_parser and delta_message:
+                    # Boundary content belongs to the tool parser, not the
+                    # assistant content stream.
+                    delta_message.content = None
 
         # Tool call extraction
-        if self._in_tool_call_phase(state):
+        if tool_parsing_enabled and self._in_tool_call_phase(state):
             if not state.tool_call_text_started:
                 state.tool_call_text_started = True
                 state.previous_text = ""
@@ -733,7 +767,9 @@ class DelegatingParser(Parser):
                 and delta_message.tool_calls
                 and delta_message.tool_calls[0].id is not None
             ):
-                state.history_tool_call_cnt += 1
+                state.history_tool_call_cnt += sum(
+                    1 for tool_call in delta_message.tool_calls if tool_call.id
+                )
 
         # No phase active: pass through as content
         if (

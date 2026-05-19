@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 class StructuredOutputRequest:
     params: StructuredOutputsParams
     _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
+    _grammar_error: Exception | None = None
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
     # Cached per request; do not share reasoning parsers across requests because
@@ -40,16 +41,15 @@ class StructuredOutputRequest:
         return StructuredOutputRequest(params=params)
 
     def _check_grammar_completion(self) -> bool:
-        # NOTE: We have to lazy import to gate circular imports
-        from vllm.v1.request import RequestStatus
-
         if isinstance(self._grammar, Future):
             try:
                 # We will check whether the future is ready within 100 us
                 self._grammar = self._grammar.result(timeout=0.0001)
-                self.status = RequestStatus.WAITING
             except TimeoutError:
                 return False
+            except Exception as exc:
+                self._grammar = None
+                self._grammar_error = exc
         return True
 
     @property
@@ -59,9 +59,16 @@ class StructuredOutputRequest:
     @property
     def grammar(self) -> StructuredOutputGrammar | None:
         completed = self._check_grammar_completion()
+        if self._grammar_error is not None:
+            return None
         return (
             cast(StructuredOutputGrammar | None, self._grammar) if completed else None
         )
+
+    @property
+    def grammar_error(self) -> Exception | None:
+        self._check_grammar_completion()
+        return self._grammar_error
 
     @grammar.setter
     def grammar(

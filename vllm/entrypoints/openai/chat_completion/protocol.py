@@ -62,6 +62,15 @@ class ChatMessage(OpenAIBaseModel):
 
     # vLLM-specific fields that are not in OpenAI spec
     reasoning: str | None = None
+    reasoning_content: str | None = None
+
+    @model_validator(mode="after")
+    def populate_reasoning_alias(self) -> "ChatMessage":
+        if self.reasoning_content is None and self.reasoning is not None:
+            self.reasoning_content = self.reasoning
+        elif self.reasoning is None and self.reasoning_content is not None:
+            self.reasoning = self.reasoning_content
+        return self
 
 
 class ChatCompletionLogProb(OpenAIBaseModel):
@@ -225,7 +234,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "part of the standard OpenAI API specification."
         ),
     )
+    reasoning: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "OpenAI-compatible reasoning options. Supported compatibility "
+            "keys are enabled, effort, and max_tokens."
+        ),
+    )
     thinking_token_budget: int | None = None
+    reasoning_budget: Annotated[int, Field(ge=-1)] | None = Field(
+        default=None,
+        description=(
+            "Reasoning token budget. Set to -1 to disable budget enforcement."
+        ),
+    )
+    reasoning_budget_grace_period: Annotated[int, Field(ge=0)] | None = Field(
+        default=None,
+        description=(
+            "Extra token allowance after the budget is reached before forcing "
+            "reasoning termination."
+        ),
+    )
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -446,6 +475,109 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 msg["reasoning"] = reasoning_content
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def set_include_reasoning_for_none_effort(cls, data: Any) -> Any:
+        if isinstance(data, dict) and data.get("reasoning_effort") == "none":
+            data["include_reasoning"] = False
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_reasoning_object(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        reasoning = data.get("reasoning")
+        if not isinstance(reasoning, dict):
+            return data
+
+        chat_template_kwargs = data.get("chat_template_kwargs")
+        explicit_chat_template_reasoning = isinstance(
+            chat_template_kwargs, dict
+        ) and any(
+            key in chat_template_kwargs
+            for key in ("enable_thinking", "low_effort", "medium_effort")
+        )
+
+        if data.get("reasoning_budget") is None and reasoning.get("max_tokens") is not None:
+            data["reasoning_budget"] = reasoning["max_tokens"]
+
+        enabled = reasoning.get("enabled")
+        effort = reasoning.get("effort")
+
+        if enabled is False:
+            data["include_reasoning"] = False
+            if not explicit_chat_template_reasoning:
+                data.setdefault("chat_template_kwargs", {})
+                data["chat_template_kwargs"].setdefault("enable_thinking", False)
+            return data
+
+        if explicit_chat_template_reasoning or data.get("reasoning_effort") is not None:
+            return data
+
+        if isinstance(effort, str):
+            data["reasoning_effort"] = effort
+        elif enabled is True:
+            data.setdefault("chat_template_kwargs", {})
+            data["chat_template_kwargs"].setdefault("enable_thinking", True)
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_preserved_thinking_kwargs(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        chat_template_kwargs = data.get("chat_template_kwargs")
+        if isinstance(chat_template_kwargs, dict):
+            chat_template_kwargs = dict(chat_template_kwargs)
+            if chat_template_kwargs.get("preserve_thinking") is True:
+                chat_template_kwargs.setdefault("truncate_history_thinking", False)
+            data["chat_template_kwargs"] = chat_template_kwargs
+
+        thinking = data.get("thinking")
+        if isinstance(thinking, dict):
+            chat_template_kwargs = dict(data.get("chat_template_kwargs") or {})
+            thinking_enabled = (
+                thinking.get("type") == "enabled"
+                or thinking.get("enabled") is True
+            )
+            if thinking_enabled:
+                chat_template_kwargs.setdefault("enable_thinking", True)
+            if thinking.get("keep") in (True, "all"):
+                chat_template_kwargs.setdefault("truncate_history_thinking", False)
+            data["chat_template_kwargs"] = chat_template_kwargs
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unsupported_openai_chat_flags(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        unsupported_fields = (
+            "return_logits",
+            "return_token_ids",
+            "return_hidden_states",
+            "return_logprob",
+            "return_text_in_logprobs",
+            "logits_processors",
+            "logprob_start_len",
+            "top_logprobs_num",
+            "spaces_between_special_tokens",
+            "truncate_prompt_tokens",
+        )
+        present = [field for field in unsupported_fields if field in data]
+        if present:
+            joined = ", ".join(present)
+            raise VLLMValidationError(
+                f"Unsupported OpenAI chat request field(s): {joined}",
+                parameter=joined,
+            )
+        return data
+
     @model_validator(mode="after")
     def _materialize_tool_calls_after(self) -> "ChatCompletionRequest":
         """Convert Pydantic ValidatorIterator wrappers back to lists.
@@ -467,32 +599,68 @@ class ChatCompletionRequest(OpenAIBaseModel):
     _grammar_from_tool_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by ``ToolParser.adjust_request``."""
 
+    def _has_explicit_reasoning_chat_template_kwargs(self) -> bool:
+        request_chat_template_kwargs = self.chat_template_kwargs or {}
+        return (
+            "enable_thinking" in request_chat_template_kwargs
+            or "low_effort" in request_chat_template_kwargs
+            or "medium_effort" in request_chat_template_kwargs
+        )
+
+    def _resolve_reasoning_effort(self) -> tuple[str | None, str]:
+        if self._has_explicit_reasoning_chat_template_kwargs():
+            return None, "chat_template_kwargs"
+
+        if self.reasoning_effort is not None:
+            return self.reasoning_effort, "reasoning_effort"
+
+        return None, "default"
+
+    def get_resolved_chat_template_kwargs(self) -> dict[str, Any]:
+        request_chat_template_kwargs = dict(self.chat_template_kwargs or {})
+        if (
+            "low_effort" in request_chat_template_kwargs
+            and "medium_effort" not in request_chat_template_kwargs
+        ):
+            request_chat_template_kwargs["medium_effort"] = (
+                request_chat_template_kwargs["low_effort"]
+            )
+        if self._has_explicit_reasoning_chat_template_kwargs():
+            return request_chat_template_kwargs
+
+        effective_reasoning_effort, _ = self._resolve_reasoning_effort()
+        if effective_reasoning_effort == "none":
+            request_chat_template_kwargs.setdefault("enable_thinking", False)
+        elif effective_reasoning_effort in ("minimal", "low", "medium"):
+            request_chat_template_kwargs.setdefault("enable_thinking", True)
+            request_chat_template_kwargs.setdefault("medium_effort", True)
+        elif effective_reasoning_effort in ("high", "xhigh", "max"):
+            request_chat_template_kwargs.setdefault("enable_thinking", True)
+
+        return request_chat_template_kwargs
+
     def build_chat_params(
         self,
         default_template: str | None,
         default_template_content_format: ChatTemplateContentFormatOption,
     ) -> ChatParams:
-        extra_kwargs: dict[str, Any] = dict(
-            add_generation_prompt=self.add_generation_prompt,
-            continue_final_message=self.continue_final_message,
-            documents=self.documents,
-            reasoning_effort=self.reasoning_effort,
-        )
-
-        # When reasoning is requested, activate thinking for models whose
-        # chat templates require explicit opt-in (e.g., Gemma4 defaults
-        # enable_thinking to false). For templates that don't declare the
-        # variable, resolve_chat_template_kwargs filters it out harmlessly.
-        user_kwargs = self.chat_template_kwargs or {}
-        if self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
-            extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
+        explicit_reasoning_mode = self._has_explicit_reasoning_chat_template_kwargs()
+        resolved_chat_template_kwargs = self.get_resolved_chat_template_kwargs()
+        compatibility_reasoning_effort, _ = self._resolve_reasoning_effort()
+        if explicit_reasoning_mode or compatibility_reasoning_effort == "none":
+            compatibility_reasoning_effort = None
 
         return ChatParams(
             chat_template=self.chat_template or default_template,
             chat_template_content_format=default_template_content_format,
             chat_template_kwargs=merge_kwargs(
-                self.chat_template_kwargs,
-                extra_kwargs,
+                resolved_chat_template_kwargs,
+                dict(
+                    add_generation_prompt=self.add_generation_prompt,
+                    continue_final_message=self.continue_final_message,
+                    documents=self.documents,
+                    reasoning_effort=compatibility_reasoning_effort,
+                ),
             ),
             media_io_kwargs=self.media_io_kwargs,
         )
@@ -607,10 +775,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     else replace(self.structured_outputs, **structured_outputs_kwargs)
                 )
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        extra_args: dict[str, Any] = dict(self.vllm_xargs) if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        resolved_chat_template_kwargs = self.get_resolved_chat_template_kwargs()
+        if resolved_chat_template_kwargs.get("enable_thinking", True):
+            extra_args["disable_spec_decode"] = True
+        if self.tool_choice == "required" or isinstance(
+            self.tool_choice, ChatCompletionNamedToolChoiceParam
+        ):
+            extra_args["disable_spec_decode"] = True
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

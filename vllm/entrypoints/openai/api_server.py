@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import inspect
+import logging
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
@@ -682,6 +683,66 @@ async def run_server_worker(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
     """Run a single API server worker."""
+
+    try:
+        from vllm.otel_instrumentation import init_otel, start_prom_to_otel_bridge
+
+        meter, _, otel_handler = init_otel(
+            {
+                "service.name": os.getenv("OTEL_SERVICE_NAME", "vllm"),
+                "service.instance.id": os.getenv(
+                    "OTEL_SERVICE_INSTANCE_ID",
+                    os.getenv("HOSTNAME", "instance-0"),
+                ),
+                "service.version": VLLM_VERSION,
+                "service.namespace": "vllm.openai.api_server",
+            }
+        )
+        if otel_handler is not None:
+            class OtelLogFilter(logging.Filter):
+                def filter(self, record: logging.LogRecord) -> bool:
+                    if "Avg prompt throughput" in record.getMessage():
+                        return False
+                    if record.name.startswith("vllm.v1.metrics"):
+                        return False
+                    return True
+
+            otel_handler.addFilter(OtelLogFilter())
+            vllm_root_logger = logging.getLogger("vllm")
+            if not any(isinstance(h, type(otel_handler))
+                       for h in vllm_root_logger.handlers):
+                vllm_root_logger.addHandler(otel_handler)
+                logger.info(
+                    "OpenTelemetry logging handler attached to vllm root logger")
+
+            class ConsoleLogFilter(logging.Filter):
+                def filter(self, record: logging.LogRecord) -> bool:
+                    msg = record.getMessage()
+                    return not (
+                        "openai.request" in msg
+                        or "openai.response" in msg
+                        or "openai.media_mirror" in msg
+                    )
+
+            for handler in vllm_root_logger.handlers:
+                if isinstance(handler, logging.StreamHandler) and not isinstance(
+                    handler, type(otel_handler)
+                ):
+                    handler.addFilter(ConsoleLogFilter())
+
+        if meter is not None or os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"):
+            scrape_target = os.getenv("VLLM_SCRAPE_TARGET")
+            if not scrape_target:
+                host = args.host or "127.0.0.1"
+                if host in ("0.0.0.0", "::"):
+                    host = "127.0.0.1"
+                scrape_target = f"{host}:{args.port}"
+            start_prom_to_otel_bridge(
+                f"http://{scrape_target}/metrics",
+                interval_seconds=float(os.getenv("VLLM_PROM_SCRAPE_INTERVAL", "30")),
+            )
+    except Exception as e:
+        logger.warning("OTEL initialization skipped: %s", e)
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
