@@ -27,6 +27,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     ToolCall,
 )
 from vllm.logger import init_logger
+from vllm.structured_schema_bounds import bound_json_schema_for_constrained_decoding
 
 Tool: TypeAlias = ChatCompletionToolsParam | ResponsesTool
 
@@ -215,7 +216,11 @@ def find_tool_name(
 
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
-    params = params if params else {"type": "object", "properties": {}}
+    params = (
+        bound_json_schema_for_constrained_decoding(params)
+        if params
+        else {"type": "object", "properties": {}}
+    )
     return {
         "properties": {
             "name": {"type": "string", "enum": [name]},
@@ -259,7 +264,7 @@ def _get_json_schema_from_tools(
     json_schema_defs = _get_tool_schema_defs(fn_tools)
     if json_schema_defs:
         json_schema["$defs"] = json_schema_defs
-    return json_schema
+    return bound_json_schema_for_constrained_decoding(json_schema)
 
 
 def get_json_schema_from_tools(
@@ -277,7 +282,9 @@ def get_json_schema_from_tools(
         tool_map = {tool.name: tool for tool in tools if isinstance(tool, FunctionTool)}
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return tool_map[tool_name].parameters
+        return bound_json_schema_for_constrained_decoding(
+            tool_map[tool_name].parameters
+        )
     # tool_choice: Forced Function (ChatCompletion)
     if (not isinstance(tool_choice, str)) and isinstance(
         tool_choice, ChatCompletionNamedToolChoiceParam
@@ -290,7 +297,9 @@ def get_json_schema_from_tools(
         }
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return tool_map[tool_name].function.parameters
+        return bound_json_schema_for_constrained_decoding(
+            tool_map[tool_name].function.parameters
+        )
     # tool_choice: "required"
     if tool_choice == "required":
         return _get_json_schema_from_tools(tools)

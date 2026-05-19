@@ -156,6 +156,7 @@ class ResponsesRequest(OpenAIBaseModel):
     max_tool_calls: int | None = None
     metadata: Metadata | None = None
     model: str | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
     logit_bias: dict[str, float] | None = None
     parallel_tool_calls: bool | None = True
     previous_response_id: str | None = None
@@ -297,29 +298,28 @@ class ResponsesRequest(OpenAIBaseModel):
         # user provides an incomplete assistant message to continue from.
         continue_final = should_continue_final_message(self.input)
 
-        reasoning = self.reasoning
-        reasoning_effort = None if reasoning is None else reasoning.effort
-
-        extra_kwargs: dict[str, Any] = dict(
-            add_generation_prompt=not continue_final,
-            continue_final_message=continue_final,
-            reasoning_effort=reasoning_effort,
-        )
-
-        # When reasoning is requested, activate thinking for models whose
-        # chat templates require explicit opt-in (e.g., Gemma4 defaults
-        # enable_thinking to false). For templates that don't declare the
-        # variable, resolve_chat_template_kwargs filters it out harmlessly.
-        user_kwargs = self.chat_template_kwargs or {}
-        if reasoning_effort is not None and "enable_thinking" not in user_kwargs:
-            extra_kwargs["enable_thinking"] = reasoning_effort != "none"
+        reasoning_effort = None if self.reasoning is None else self.reasoning.effort
+        reasoning_kwargs: dict[str, Any] = {}
+        if reasoning_effort == "none":
+            reasoning_kwargs["enable_thinking"] = False
+        elif reasoning_effort in ("minimal", "low", "medium"):
+            reasoning_kwargs["enable_thinking"] = True
+            reasoning_kwargs["medium_effort"] = True
+        elif reasoning_effort in ("high", "xhigh", "max"):
+            reasoning_kwargs["enable_thinking"] = True
 
         return ChatParams(
             chat_template=default_template,
             chat_template_content_format=default_template_content_format,
-            chat_template_kwargs=merge_kwargs(
-                self.chat_template_kwargs,
-                extra_kwargs,
+            chat_template_kwargs=merge_kwargs(  # To remove unset values
+                merge_kwargs(reasoning_kwargs, self.chat_template_kwargs),
+                dict(
+                    add_generation_prompt=not continue_final,
+                    continue_final_message=continue_final,
+                    reasoning_effort=(
+                        None if reasoning_effort == "none" else reasoning_effort
+                    ),
+                ),
             ),
             media_io_kwargs=self.media_io_kwargs,
         )
@@ -392,6 +392,8 @@ class ResponsesRequest(OpenAIBaseModel):
                     # --follow-imports skip hides the class definition but also hides
                     # multiple third party conflicts, so best of both evils
                 )
+            elif response_format.type == "json_object":
+                structured_outputs = StructuredOutputsParams(json_object=True)
 
         stop = self.stop if self.stop else []
         if isinstance(stop, str):
