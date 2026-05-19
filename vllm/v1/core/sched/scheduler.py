@@ -2014,7 +2014,21 @@ class Scheduler(SchedulerInterface):
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
             structured_output_req = request.structured_output_request
-            if not (structured_output_req and structured_output_req.grammar):
+            if structured_output_req is None:
+                request.status = RequestStatus.WAITING
+                return True
+
+            grammar_error = structured_output_req.grammar_error
+            if grammar_error is not None:
+                logger.error(
+                    "Structured output grammar compilation failed for request_id=%s: %s",
+                    request.request_id,
+                    grammar_error,
+                )
+                self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
+                return True
+
+            if not structured_output_req.grammar:
                 return False
             request.status = RequestStatus.WAITING
             return True

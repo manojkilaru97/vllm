@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
+import os
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
@@ -52,6 +54,10 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     has_custom_tools,
     render_for_completion,
 )
+from vllm.entrypoints.openai.request_metrics import (
+    classify_responses_request,
+    summarize_request_payload,
+)
 from vllm.entrypoints.openai.responses.context import (
     ConversationContext,
     HarmonyContext,
@@ -79,9 +85,13 @@ from vllm.entrypoints.openai.responses.protocol import (
     StreamingResponsesResponse,
 )
 from vllm.entrypoints.openai.responses.streaming_events import (
+    SimpleStreamingState,
     SimpleStreamingEventProcessor,
     StreamingState,
     _StateType,
+    emit_simple_content_delta,
+    emit_simple_content_done,
+    emit_simple_content_open,
     emit_content_delta_events,
     emit_previous_item_done_events,
     emit_tool_action_events,
@@ -106,8 +116,119 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
+from vllm.payload_sanitization import prepare_request_payload_for_logging
 
 logger = init_logger(__name__)
+payload_logger = __import__("logging").getLogger("vllm.payload")
+
+
+def _response_reasoning_enabled(request: ResponsesRequest) -> bool:
+    reasoning = getattr(request, "reasoning", None)
+    if reasoning is not None and getattr(reasoning, "effort", None) == "none":
+        return False
+    return getattr(request, "include_reasoning", True)
+
+
+def _strip_reasoning_output_items(
+    output: list[ResponseOutputItem],
+) -> list[ResponseOutputItem]:
+    return [
+        item for item in output if getattr(item, "type", None) != "reasoning"
+    ]
+
+
+async def _log_responses_request_payload(
+    raw_request: Request | None,
+    request: ResponsesRequest,
+    serving_render: OpenAIServingRender,
+) -> None:
+    if raw_request is None or os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
+        return
+    rid = request.request_id
+    try:
+        headers_obj = {k: v for k, v in raw_request.headers.items()}
+    except Exception:
+        headers_obj = None
+    try:
+        body = await raw_request.body()
+        payload = json.loads(body) if body else None
+    except Exception:
+        payload = None
+    if payload is None:
+        try:
+            payload = request.model_dump(mode="json", by_alias=True)
+        except Exception:
+            payload = None
+    try:
+        allowed_local_media_path = (
+            serving_render.model_config.allowed_local_media_path
+        )
+    except Exception:
+        allowed_local_media_path = ""
+    try:
+        summary = summarize_request_payload(payload)
+        payload_logger.info(
+            "openai.request",
+            extra={
+                "rid": rid,
+                "endpoint": OpenAIServingResponses.__name__,
+                "input_image_count": summary.image_count,
+                "input_video_count": summary.video_count,
+                "input_audio_count": summary.audio_count,
+                "input_tool_count": summary.tool_count,
+                "has_images": summary.has_images,
+                "has_videos": summary.has_videos,
+                "has_audios": summary.has_audios,
+                "has_tools": summary.has_tools,
+                "has_tool_calls_enabled": summary.has_tool_calls_enabled,
+                "has_structured_output": summary.has_structured_output,
+                **(
+                    {"tool_choice": summary.tool_choice}
+                    if summary.tool_choice is not None
+                    else {}
+                ),
+                **(
+                    {"structured_output_kind": summary.structured_output_kind}
+                    if summary.structured_output_kind is not None
+                    else {}
+                ),
+                "payload": prepare_request_payload_for_logging(
+                    payload,
+                    headers=headers_obj,
+                    allowed_local_media_path=allowed_local_media_path,
+                ),
+                "payload_json": (
+                    json.dumps(payload, ensure_ascii=False)
+                    if payload is not None
+                    else None
+                ),
+                "headers": headers_obj,
+            },
+        )
+    except Exception:
+        logger.exception("Failed to log openai.request rid=%s", rid)
+
+
+def _log_responses_response_payload(
+    rid: str,
+    response: ResponsesResponse,
+) -> None:
+    if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
+        return
+    try:
+        payload = response.model_dump(mode="json", by_alias=True)
+        payload_logger.info(
+            "openai.response",
+            extra={
+                "rid": rid,
+                "request_id": rid,
+                "endpoint": OpenAIServingResponses.__name__,
+                "payload": payload,
+                "payload_json": json.dumps(payload, ensure_ascii=False),
+            },
+        )
+    except Exception:
+        logger.exception("Failed to log openai.response rid=%s", rid)
 
 
 def _extract_allowed_tools_from_mcp_requests(
@@ -342,6 +463,10 @@ class OpenAIServingResponses(OpenAIServing):
         maybe_validation_error = self._validate_create_responses_input(request)
         if maybe_validation_error is not None:
             return maybe_validation_error
+
+        await _log_responses_request_payload(
+            raw_request, request, self.openai_serving_render)
+        classify_responses_request(request)
 
         # If the engine is dead, raise the engine's DEAD_ERROR.
         # This is required for the streaming case, where we return a
@@ -843,6 +968,8 @@ class OpenAIServingResponses(OpenAIServing):
             num_tool_output_tokens = 0
 
         assert isinstance(context, (SimpleContext, HarmonyContext, ParsableContext))
+        if not _response_reasoning_enabled(request):
+            output = _strip_reasoning_output_items(output)
         num_prompt_tokens = context.num_prompt_tokens
         num_generated_tokens = context.num_output_tokens
         num_cached_tokens = context.num_cached_tokens
@@ -863,6 +990,8 @@ class OpenAIServingResponses(OpenAIServing):
             )
             accumulated = getattr(context, "_accumulated_token_ids", []) or []
             num_reasoning_tokens = reasoning_parser.count_reasoning_tokens(accumulated)
+        if not _response_reasoning_enabled(request):
+            num_reasoning_tokens = 0
 
         usage = ResponseUsage(
             input_tokens=num_prompt_tokens,
@@ -907,6 +1036,7 @@ class OpenAIServingResponses(OpenAIServing):
                 # If the response is already cancelled, don't update it.
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
+        _log_responses_response_payload(request.request_id, response)
         return response
 
     def _topk_logprobs(
@@ -1387,6 +1517,11 @@ class OpenAIServingResponses(OpenAIServing):
             self._raise_if_error(output.finish_reason, request.request_id)
             delta_text = output.text
             delta_token_ids = as_list(output.token_ids)
+            if not delta_text and delta_token_ids:
+                delta_text = tokenizer.decode(
+                    delta_token_ids,
+                    skip_special_tokens=True,
+                )
 
             if parser:
                 delta_message = parser.parse_delta(
@@ -1400,6 +1535,27 @@ class OpenAIServingResponses(OpenAIServing):
 
             if not delta_message:
                 continue
+            thinking_disabled = not _response_reasoning_enabled(request)
+            if thinking_disabled and delta_message.reasoning is not None:
+                delta_message = copy(delta_message)
+                if (
+                    not request.tools
+                    and not delta_message.content
+                    and not delta_message.tool_calls
+                    and delta_text
+                    and "</think>" in delta_text
+                ):
+                    delta_message.content = delta_text.split("</think>", 1)[1]
+                delta_message.reasoning = None
+            if (
+                thinking_disabled
+                and not request.tools
+                and not delta_message.content
+                and not delta_message.reasoning
+                and not delta_message.tool_calls
+                and delta_text
+            ):
+                delta_message.content = delta_text
 
             target_state, tool_call = processor.resolve_target_state(delta_message)
             if target_state == _StateType.NONE:
@@ -1516,6 +1672,7 @@ class OpenAIServingResponses(OpenAIServing):
                 )
             )
 
+            emitted_output_events = False
             try:
                 async for event_data in processor(
                     request,
@@ -1528,6 +1685,14 @@ class OpenAIServingResponses(OpenAIServing):
                     created_time,
                     _increment_sequence_number_and_return,
                 ):
+                    event_type = getattr(event_data, "type", "")
+                    if event_type.startswith((
+                        "response.output_item.",
+                        "response.content_part.",
+                        "response.output_text.",
+                        "response.function_call_arguments.",
+                    )):
+                        emitted_output_events = True
                     yield event_data
             except GenerationError as e:
                 error_json = self._convert_generation_error_to_streaming_response(e)
@@ -1552,6 +1717,29 @@ class OpenAIServingResponses(OpenAIServing):
                 request_metadata,
                 created_time=created_time,
             )
+            if (
+                not emitted_output_events
+                and isinstance(final_response, ResponsesResponse)
+            ):
+                fallback_text = ""
+                for item in final_response.output:
+                    if getattr(item, "type", None) != "message":
+                        continue
+                    for part in getattr(item, "content", []) or []:
+                        if getattr(part, "type", None) == "output_text":
+                            fallback_text += getattr(part, "text", "") or ""
+                    if fallback_text:
+                        break
+                if fallback_text:
+                    fallback_state = SimpleStreamingState()
+                    for event in emit_simple_content_open(fallback_state):
+                        yield _increment_sequence_number_and_return(event)
+                    for event in emit_simple_content_delta(
+                        fallback_state, fallback_text, []
+                    ):
+                        yield _increment_sequence_number_and_return(event)
+                    for event in emit_simple_content_done(fallback_state):
+                        yield _increment_sequence_number_and_return(event)
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(
                     type="response.completed",

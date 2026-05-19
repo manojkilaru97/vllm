@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import multiprocessing
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -9,12 +10,17 @@ from typing import TYPE_CHECKING
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
+from vllm.structured_schema_bounds import json_schema_has_unconstrained_string_fields
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.utils.import_utils import LazyLoader
-from vllm.v1.structured_output.backend_guidance import GuidanceBackend
+from vllm.v1.structured_output.backend_guidance import (
+    GuidanceBackend,
+    has_guidance_unsupported_json_features,
+)
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
+    StructuredOutputOptions,
 )
 from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
 
@@ -163,11 +169,19 @@ class StructuredOutputManager:
             else:
                 raise ValueError(f"Unsupported structured output backend: {backend}")
 
-        if self._use_async_grammar_compilation:
-            grammar = self.executor.submit(self._create_grammar, request)
-        else:
-            grammar = self._create_grammar(request)  # type: ignore[assignment]
-        request.structured_output_request.grammar = grammar  # type: ignore[assignment]
+        try:
+            if self._use_async_grammar_compilation:
+                grammar = self.executor.submit(self._create_grammar, request)
+            else:
+                grammar = self._create_grammar(request)  # type: ignore[assignment]
+            request.structured_output_request.grammar = grammar  # type: ignore[assignment]
+        except Exception as exc:
+            logger.error(
+                "Failed to initialize structured output grammar for request_id=%s",
+                request.request_id,
+                exc_info=True,
+            )
+            request.structured_output_request._grammar_error = exc
 
     def _create_grammar(self, request: "Request") -> StructuredOutputGrammar:
         key = request.structured_output_request.structured_output_key  # type: ignore[union-attr]
@@ -180,7 +194,57 @@ class StructuredOutputManager:
         request_type, grammar_spec = key
 
         assert self.backend is not None
-        return self.backend.compile_grammar(request_type, grammar_spec)
+        request_backend = None
+        if request.sampling_params and request.sampling_params.structured_outputs:
+            request_backend = request.sampling_params.structured_outputs._backend
+        if request_backend == "guidance" and isinstance(self.backend, XgrammarBackend):
+            return self._compile_with_guidance(request_type, grammar_spec)
+
+        if self._should_use_guidance_for_xgrammar(request_type, grammar_spec):
+            logger.info(
+                "using guidance for unconstrained string JSON schema request_id=%s",
+                request.request_id,
+            )
+            return self._compile_with_guidance(request_type, grammar_spec)
+
+        try:
+            return self.backend.compile_grammar(request_type, grammar_spec)
+        except Exception:
+            if not isinstance(self.backend, XgrammarBackend):
+                raise
+
+            logger.warning(
+                "xgrammar compile failed for request_id=%s; trying guidance fallback",
+                request.request_id,
+                exc_info=True,
+            )
+            return self._compile_with_guidance(request_type, grammar_spec)
+
+    def _should_use_guidance_for_xgrammar(
+        self, request_type: StructuredOutputOptions, grammar_spec: str
+    ) -> bool:
+        if not isinstance(self.backend, XgrammarBackend):
+            return False
+        if request_type != StructuredOutputOptions.JSON:
+            return False
+        try:
+            schema = json.loads(grammar_spec)
+        except Exception:
+            return False
+        if has_guidance_unsupported_json_features(schema):
+            return False
+        return json_schema_has_unconstrained_string_fields(schema)
+
+    def _compile_with_guidance(
+        self, request_type: StructuredOutputOptions, grammar_spec: str
+    ) -> StructuredOutputGrammar:
+        vocab_size = self.vllm_config.model_config.get_vocab_size()
+        guidance_backend = GuidanceBackend(
+            self.vllm_config,
+            tokenizer=self.tokenizer,
+            vocab_size=vocab_size,
+        )
+        return guidance_backend.compile_grammar(request_type, grammar_spec)
 
     def _fill_bitmasks(
         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]
