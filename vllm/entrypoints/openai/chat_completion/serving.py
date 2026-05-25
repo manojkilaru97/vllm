@@ -290,7 +290,7 @@ class OpenAIServingChat(OpenAIServing):
             max_tokens = getattr(sampling_params, "max_tokens", None) or 0
             if max_tokens > 0:
                 reserve = max(64, min(256, max_tokens // 2))
-                reasoning_budget = max(32, max_tokens - reserve)
+                reasoning_budget = min(4096, max(32, max_tokens - reserve))
 
         if request_reasoning_budget is not None:
             parser_chat_template_kwargs["reasoning_budget"] = request_reasoning_budget

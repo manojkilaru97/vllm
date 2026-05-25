@@ -822,20 +822,20 @@ class SamplingParams(
         if self.structured_outputs.json is not None:
             from vllm.structured_schema_bounds import (
                 bound_json_schema_for_constrained_decoding,
-                json_schema_has_unconstrained_string_fields,
+                json_schema_should_use_guidance_for_unconstrained_strings,
             )
 
             if isinstance(self.structured_outputs.json, str):
                 schema = json_mod.loads(self.structured_outputs.json)
                 needs_guidance_json_schema = (
-                    json_schema_has_unconstrained_string_fields(schema)
+                    json_schema_should_use_guidance_for_unconstrained_strings(schema)
                 )
                 self.structured_outputs.json = json_mod.dumps(
                     bound_json_schema_for_constrained_decoding(schema)
                 )
             else:
                 needs_guidance_json_schema = (
-                    json_schema_has_unconstrained_string_fields(
+                    json_schema_should_use_guidance_for_unconstrained_strings(
                         self.structured_outputs.json
                     )
                 )
