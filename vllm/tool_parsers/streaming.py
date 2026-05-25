@@ -58,70 +58,6 @@ def filter_delta_text(
     return updated_delta, passed_zero
 
 
-def _find_matching_brace(text: str, opening_index: int) -> int | None:
-    depth = 0
-    in_string = False
-    escaped = False
-    for idx in range(opening_index, len(text)):
-        char = text[idx]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return idx
-    return None
-
-
-def _extract_complete_required_calls(text: str) -> list[tuple[str, str]]:
-    """Return completed ``(name, parameters_json)`` calls from required JSON."""
-    calls: list[tuple[str, str]] = []
-    search_from = 0
-    while True:
-        name_match = re.search(
-            r'"name"\s*:\s*"((?:\\.|[^"\\])*)"', text[search_from:]
-        )
-        if name_match is None:
-            break
-        name_start = search_from + name_match.start()
-        name_end = search_from + name_match.end()
-        try:
-            function_name = json.loads(f'"{name_match.group(1)}"')
-        except json.JSONDecodeError:
-            break
-
-        params_match = re.search(r'"parameters"\s*:', text[name_end:])
-        if params_match is None:
-            break
-        params_start = name_end + params_match.end()
-        opening_index = text.find("{", params_start)
-        if opening_index < 0:
-            break
-        closing_index = _find_matching_brace(text, opening_index)
-        if closing_index is None:
-            break
-        parameters = text[opening_index : closing_index + 1]
-        try:
-            json.loads(parameters)
-        except json.JSONDecodeError:
-            break
-        calls.append((function_name, parameters))
-        search_from = closing_index + 1
-        if search_from <= name_start:
-            break
-    return calls
-
-
 def extract_named_tool_call_streaming(
     *,
     delta_text: str,
@@ -175,33 +111,6 @@ def extract_required_tool_call_streaming(
     tool_call_idx: int | None,
     tool_call_id_type: str,
 ) -> tuple[DeltaMessage | None, bool]:
-    emitted_tool_calls = tool_call_idx or 0
-    completed_calls = _extract_complete_required_calls(current_text or "")
-    if len(completed_calls) > emitted_tool_calls:
-        delta_tool_calls: list[DeltaToolCall] = []
-        for index, (function_name, arguments) in enumerate(
-            completed_calls[emitted_tool_calls:], start=emitted_tool_calls
-        ):
-            tool_call_id = make_tool_call_id(
-                id_type=tool_call_id_type,
-                func_name=function_name,
-                idx=index,
-            )
-            delta_tool_calls.append(
-                DeltaToolCall(
-                    id=tool_call_id,
-                    function=DeltaFunctionCall(
-                        name=function_name,
-                        arguments=arguments,
-                    ),
-                    index=index,
-                    type="function",
-                )
-            )
-        return DeltaMessage(tool_calls=delta_tool_calls), False
-
-    return None, False
-
     if current_text is None or current_text == "":
         # if the current text is empty, we cannot parse it
         return None, function_name_returned
