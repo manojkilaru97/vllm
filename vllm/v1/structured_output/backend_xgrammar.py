@@ -240,6 +240,7 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
         if (
             obj.get("type") == "string"
             and "format" in obj
+            and obj["format"] != ""
             and obj["format"] not in STRING_SUPPORTED_FORMATS
         ):
             return True

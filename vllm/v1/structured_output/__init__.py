@@ -10,7 +10,9 @@ from typing import TYPE_CHECKING
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
-from vllm.structured_schema_bounds import json_schema_has_unconstrained_string_fields
+from vllm.structured_schema_bounds import (
+    json_schema_should_use_guidance_for_unconstrained_strings,
+)
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.utils.import_utils import LazyLoader
 from vllm.v1.structured_output.backend_guidance import (
@@ -201,11 +203,19 @@ class StructuredOutputManager:
             return self._compile_with_guidance(request_type, grammar_spec)
 
         if self._should_use_guidance_for_xgrammar(request_type, grammar_spec):
+            schema = json.loads(grammar_spec)
             logger.info(
                 "using guidance for unconstrained string JSON schema request_id=%s",
                 request.request_id,
             )
-            return self._compile_with_guidance(request_type, grammar_spec)
+            return self._compile_with_guidance(
+                request_type,
+                grammar_spec,
+                disable_any_whitespace=not (
+                    _is_tool_call_array_schema(schema)
+                    and _may_need_reasoning_handoff_whitespace(request)
+                ),
+            )
 
         try:
             return self.backend.compile_grammar(request_type, grammar_spec)
@@ -233,10 +243,14 @@ class StructuredOutputManager:
             return False
         if has_guidance_unsupported_json_features(schema):
             return False
-        return json_schema_has_unconstrained_string_fields(schema)
+        return json_schema_should_use_guidance_for_unconstrained_strings(schema)
 
     def _compile_with_guidance(
-        self, request_type: StructuredOutputOptions, grammar_spec: str
+        self,
+        request_type: StructuredOutputOptions,
+        grammar_spec: str,
+        *,
+        disable_any_whitespace: bool | None = None,
     ) -> StructuredOutputGrammar:
         vocab_size = self.vllm_config.model_config.get_vocab_size()
         guidance_backend = GuidanceBackend(
@@ -244,6 +258,8 @@ class StructuredOutputManager:
             tokenizer=self.tokenizer,
             vocab_size=vocab_size,
         )
+        if disable_any_whitespace is not None:
+            guidance_backend.disable_any_whitespace = disable_any_whitespace
         return guidance_backend.compile_grammar(request_type, grammar_spec)
 
     def _fill_bitmasks(
@@ -435,3 +451,46 @@ class StructuredOutputManager:
     def clear_backend(self) -> None:
         if self.backend is not None:
             self.backend.destroy()
+
+
+def _is_tool_call_array_schema(schema: object) -> bool:
+    """Return true for the required-tool JSON array schema shape.
+
+    Tool-call schemas can appear immediately after a reasoning suffix such as
+    ``</think>\n\n``. Guidance's compact whitespace mode is useful for normal
+    structured outputs, but it rejects that leading newline for tool arrays.
+    """
+    if not isinstance(schema, dict) or schema.get("type") != "array":
+        return False
+    items = schema.get("items")
+    if not isinstance(items, dict):
+        return False
+    variants = items.get("anyOf")
+    if not isinstance(variants, list) or not variants:
+        return False
+    for variant in variants:
+        if not isinstance(variant, dict):
+            return False
+        properties = variant.get("properties")
+        required = variant.get("required")
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return False
+        if not {"name", "parameters"}.issubset(properties):
+            return False
+        if not {"name", "parameters"}.issubset(set(required)):
+            return False
+    return True
+
+
+def _may_need_reasoning_handoff_whitespace(request: "Request") -> bool:
+    """Return true when grammar may start after a reasoning suffix.
+
+    Required-tool arrays in thinking mode can begin immediately after
+    ``</think>\n\n``. Compact guidance whitespace rejects that leading newline.
+    If the frontend already determined reasoning is ended or disabled, compact
+    whitespace is safer because it avoids whitespace-only runaways.
+    """
+    structured_req = request.structured_output_request
+    if structured_req is None:
+        return False
+    return structured_req.reasoning_ended is not True

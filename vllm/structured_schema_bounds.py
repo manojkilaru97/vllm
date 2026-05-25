@@ -8,12 +8,8 @@ DEFAULT_SCHEMA_MAX_STRING_LENGTH = 4096
 DEFAULT_SCHEMA_MAX_ARRAY_ITEMS = 32
 _STRING_CONSTRAINT_KEYS = {
     "const",
-    "contentEncoding",
-    "contentMediaType",
     "enum",
     "format",
-    "maxLength",
-    "minLength",
     "pattern",
 }
 
@@ -31,6 +27,9 @@ def bound_json_schema_for_constrained_decoding(schema: Any) -> Any:
         return schema
 
     bounded = copy.deepcopy(schema)
+    for key in ("format", "pattern"):
+        if bounded.get(key) == "":
+            bounded.pop(key)
     schema_type = bounded.get("type")
     schema_types = schema_type if isinstance(schema_type, list) else [schema_type]
     if "string" in schema_types and "maxLength" not in bounded:
@@ -59,8 +58,9 @@ def json_schema_has_unconstrained_string_fields(schema: Any) -> bool:
     JSON grammars can only enforce syntax. With an unconstrained string schema,
     many semantically different strings are valid, so xgrammar can allow a
     valid-but-wrong continuation such as literal "n" where an escaped newline
-    was intended. Constrained strings with enum/const/pattern/format stay on
-    xgrammar.
+    was intended. Length-only bounds are not semantic constraints; they cap the
+    language but still leave arbitrary content valid. Strings constrained by
+    enum/const/pattern/format stay on xgrammar.
     """
 
     def has_string_type(obj: dict[str, Any]) -> bool:
@@ -75,7 +75,10 @@ def json_schema_has_unconstrained_string_fields(schema: Any) -> bool:
         pattern = obj.get("pattern")
         if isinstance(pattern, str) and ".*" in pattern:
             return True
-        return not any(key in obj for key in _STRING_CONSTRAINT_KEYS)
+        return not any(
+            _has_semantic_string_constraint(obj, key)
+            for key in _STRING_CONSTRAINT_KEYS
+        )
 
     def visit(obj: Any) -> bool:
         if isinstance(obj, list):
@@ -106,3 +109,62 @@ def json_schema_has_unconstrained_string_fields(schema: Any) -> bool:
         return False
 
     return visit(schema)
+
+
+def json_schema_should_use_guidance_for_unconstrained_strings(schema: Any) -> bool:
+    """Return true when guidance is safer than xgrammar for string-heavy schemas.
+
+    xgrammar can choose valid-but-wrong arbitrary string continuations for
+    simple payload schemas. Guidance avoids that, but currently handles some
+    composition-heavy JSON schemas too loosely and can allow immediate EOS.
+    Prefer xgrammar for non-tool schemas that rely on composition keywords.
+    """
+    if not json_schema_has_unconstrained_string_fields(schema):
+        return False
+    if _is_tool_call_array_schema(schema):
+        return True
+    return not _has_composition_keywords(schema)
+
+
+def _has_semantic_string_constraint(obj: dict[str, Any], key: str) -> bool:
+    if key not in obj:
+        return False
+    value = obj[key]
+    if key in {"format", "pattern"}:
+        return isinstance(value, str) and bool(value)
+    return True
+
+
+def _has_composition_keywords(schema: Any) -> bool:
+    if isinstance(schema, list):
+        return any(_has_composition_keywords(item) for item in schema)
+    if not isinstance(schema, dict):
+        return False
+    if any(key in schema for key in ("anyOf", "oneOf", "allOf", "not")):
+        return True
+    return any(_has_composition_keywords(value) for value in schema.values())
+
+
+def _is_tool_call_array_schema(schema: Any) -> bool:
+    if not isinstance(schema, dict) or schema.get("type") != "array":
+        return False
+    items = schema.get("items")
+    if not isinstance(items, dict):
+        return False
+    candidates = items.get("anyOf")
+    if not isinstance(candidates, list):
+        return False
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        properties = candidate.get("properties")
+        required = candidate.get("required")
+        if (
+            isinstance(properties, dict)
+            and "name" in properties
+            and "parameters" in properties
+            and isinstance(required, list)
+            and {"name", "parameters"}.issubset(required)
+        ):
+            return True
+    return False
