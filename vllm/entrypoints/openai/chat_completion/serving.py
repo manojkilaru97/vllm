@@ -290,6 +290,12 @@ class OpenAIServingChat(OpenAIServing):
             and request.structured_outputs is not None
             and parser_chat_template_kwargs.get("enable_thinking", True) is not False
         ):
+            # Structured outputs cannot be constrained until reasoning ends.
+            # Without an internal cap, thinking models can spend the full
+            # max_tokens budget before emitting </think>, leaving no room for
+            # the required JSON/tool payload. Reserve a small answer budget and
+            # cap the auto reasoning budget to keep EA structured-output
+            # requests fail-closed instead of returning missing/invalid JSON.
             max_tokens = getattr(sampling_params, "max_tokens", None) or 0
             if max_tokens > 0:
                 reserve = max(64, min(256, max_tokens // 2))
