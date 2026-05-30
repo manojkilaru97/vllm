@@ -702,6 +702,7 @@ class DelegatingParser(Parser):
         )
 
         # Reasoning extraction
+        reasoning_handoff_delta: str | None = None
         if self._in_reasoning_phase(state):
             delta_message = self.extract_reasoning_streaming(
                 previous_text=state.previous_text,
@@ -716,6 +717,8 @@ class DelegatingParser(Parser):
             if self.is_reasoning_end(delta_token_ids):
                 state.reasoning_ended = True
                 if tool_parsing_enabled and self._tool_parser:
+                    if delta_message and delta_message.reasoning:
+                        reasoning_handoff_delta = delta_message.reasoning
                     current_token_ids = self.extract_content_ids(delta_token_ids)
                     if delta_message and delta_message.content:
                         current_text = delta_message.content
@@ -732,7 +735,7 @@ class DelegatingParser(Parser):
                 delta_text = current_text
                 delta_token_ids = current_token_ids
 
-            delta_message, state.function_name_returned = (
+            tool_delta_message, state.function_name_returned = (
                 self._extract_tool_calls_streaming(
                     previous_text=state.previous_text,
                     current_text=current_text,
@@ -746,6 +749,18 @@ class DelegatingParser(Parser):
                     function_name_returned=state.function_name_returned,
                 )
             )
+            if reasoning_handoff_delta:
+                if tool_delta_message is None:
+                    delta_message = DeltaMessage(reasoning=reasoning_handoff_delta)
+                else:
+                    tool_delta_message.reasoning = (
+                        f"{reasoning_handoff_delta}{tool_delta_message.reasoning}"
+                        if tool_delta_message.reasoning
+                        else reasoning_handoff_delta
+                    )
+                    delta_message = tool_delta_message
+            else:
+                delta_message = tool_delta_message
             if (
                 delta_message
                 and delta_message.tool_calls

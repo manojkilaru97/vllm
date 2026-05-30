@@ -77,13 +77,39 @@ class XgrammarBackend(StructuredOutputBackend):
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
+        return self._compile_grammar(
+            request_type,
+            grammar_spec,
+            any_whitespace=not self.disable_any_whitespace,
+        )
+
+    def compile_grammar_with_whitespace(
+        self,
+        request_type: StructuredOutputOptions,
+        grammar_spec: str,
+        *,
+        any_whitespace: bool,
+    ) -> StructuredOutputGrammar:
+        return self._compile_grammar(
+            request_type,
+            grammar_spec,
+            any_whitespace=any_whitespace,
+        )
+
+    def _compile_grammar(
+        self,
+        request_type: StructuredOutputOptions,
+        grammar_spec: str,
+        *,
+        any_whitespace: bool,
+    ) -> StructuredOutputGrammar:
         if request_type == StructuredOutputOptions.JSON:
             ctx = self.compiler.compile_json_schema(
-                grammar_spec, any_whitespace=not self.disable_any_whitespace
+                grammar_spec, any_whitespace=any_whitespace
             )
         elif request_type == StructuredOutputOptions.JSON_OBJECT:
             ctx = self.compiler.compile_json_schema(
-                '{"type": "object"}', any_whitespace=not self.disable_any_whitespace
+                '{"type": "object"}', any_whitespace=any_whitespace
             )
         elif request_type == StructuredOutputOptions.GRAMMAR:
             ctx = self.compiler.compile_grammar(grammar_spec)

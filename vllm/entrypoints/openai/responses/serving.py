@@ -1672,7 +1672,7 @@ class OpenAIServingResponses(OpenAIServing):
                 )
             )
 
-            emitted_output_events = False
+            emitted_text_events = False
             try:
                 async for event_data in processor(
                     request,
@@ -1686,13 +1686,8 @@ class OpenAIServingResponses(OpenAIServing):
                     _increment_sequence_number_and_return,
                 ):
                     event_type = getattr(event_data, "type", "")
-                    if event_type.startswith((
-                        "response.output_item.",
-                        "response.content_part.",
-                        "response.output_text.",
-                        "response.function_call_arguments.",
-                    )):
-                        emitted_output_events = True
+                    if event_type.startswith("response.output_text."):
+                        emitted_text_events = True
                     yield event_data
             except GenerationError as e:
                 error_json = self._convert_generation_error_to_streaming_response(e)
@@ -1718,20 +1713,24 @@ class OpenAIServingResponses(OpenAIServing):
                 created_time=created_time,
             )
             if (
-                not emitted_output_events
+                not emitted_text_events
                 and isinstance(final_response, ResponsesResponse)
             ):
                 fallback_text = ""
-                for item in final_response.output:
+                fallback_output_index = 0
+                for output_index, item in enumerate(final_response.output):
                     if getattr(item, "type", None) != "message":
                         continue
+                    fallback_output_index = output_index
                     for part in getattr(item, "content", []) or []:
                         if getattr(part, "type", None) == "output_text":
                             fallback_text += getattr(part, "text", "") or ""
                     if fallback_text:
                         break
                 if fallback_text:
-                    fallback_state = SimpleStreamingState()
+                    fallback_state = SimpleStreamingState(
+                        output_index=fallback_output_index
+                    )
                     for event in emit_simple_content_open(fallback_state):
                         yield _increment_sequence_number_and_return(event)
                     for event in emit_simple_content_delta(

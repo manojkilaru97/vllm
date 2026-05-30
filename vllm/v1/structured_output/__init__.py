@@ -136,9 +136,17 @@ class StructuredOutputManager:
         # _backend is set in Processor._validate_structured_output
         if self.backend is None:
             assert request.sampling_params is not None
-            backend = request.sampling_params.structured_outputs._backend
+            structured_outputs = request.sampling_params.structured_outputs
+            backend = structured_outputs._backend
+            backend_was_auto = structured_outputs._backend_was_auto
             vocab_size = self.vllm_config.model_config.get_vocab_size()
-            if backend == "xgrammar":
+            if backend == "xgrammar" or (
+                backend == "guidance" and backend_was_auto
+            ):
+                # Auto mode may pick guidance for string-heavy schemas, but
+                # composition-heavy schemas should still use xgrammar later in
+                # the same process. Keep xgrammar as the primary manager backend
+                # and compile guidance per-request when auto selected it.
                 self.backend = XgrammarBackend(
                     self.vllm_config,
                     tokenizer=self.tokenizer,
@@ -218,6 +226,17 @@ class StructuredOutputManager:
             )
 
         try:
+            if isinstance(self.backend, XgrammarBackend) and request_type in {
+                StructuredOutputOptions.JSON,
+                StructuredOutputOptions.JSON_OBJECT,
+            }:
+                # Compact JSON prevents whitespace-only continuations from
+                # consuming the full max_tokens budget after a valid prefix.
+                return self.backend.compile_grammar_with_whitespace(
+                    request_type,
+                    grammar_spec,
+                    any_whitespace=False,
+                )
             return self.backend.compile_grammar(request_type, grammar_spec)
         except Exception:
             if not isinstance(self.backend, XgrammarBackend):
