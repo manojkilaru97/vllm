@@ -6,6 +6,7 @@ from typing import Any
 
 DEFAULT_SCHEMA_MAX_STRING_LENGTH = 4096
 DEFAULT_SCHEMA_MAX_ARRAY_ITEMS = 32
+DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS = 8
 _STRING_CONSTRAINT_KEYS = {
     "const",
     "enum",
@@ -35,7 +36,11 @@ def bound_json_schema_for_constrained_decoding(schema: Any) -> Any:
     if "string" in schema_types and "maxLength" not in bounded:
         bounded["maxLength"] = DEFAULT_SCHEMA_MAX_STRING_LENGTH
     if "array" in schema_types and "maxItems" not in bounded:
-        bounded["maxItems"] = DEFAULT_SCHEMA_MAX_ARRAY_ITEMS
+        bounded["maxItems"] = (
+            DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS
+            if _is_tool_call_array_schema(bounded)
+            else DEFAULT_SCHEMA_MAX_ARRAY_ITEMS
+        )
 
     for key in ("properties", "$defs", "definitions"):
         if key in bounded:
@@ -52,7 +57,11 @@ def bound_json_schema_for_constrained_decoding(schema: Any) -> Any:
     return bounded
 
 
-def json_schema_has_unconstrained_string_fields(schema: Any) -> bool:
+def json_schema_has_unconstrained_string_fields(
+    schema: Any,
+    *,
+    treat_length_bounds_as_constraint: bool = False,
+) -> bool:
     """Return true for schemas with unconstrained string fields.
 
     JSON grammars can only enforce syntax. With an unconstrained string schema,
@@ -60,7 +69,10 @@ def json_schema_has_unconstrained_string_fields(schema: Any) -> bool:
     valid-but-wrong continuation such as literal "n" where an escaped newline
     was intended. Length-only bounds are not semantic constraints; they cap the
     language but still leave arbitrary content valid. Strings constrained by
-    enum/const/pattern/format stay on xgrammar.
+    enum/const/pattern/format stay on xgrammar. For non-tool response schemas,
+    caller-provided length bounds are often enough to keep xgrammar from
+    running away, while avoiding guidance's weaker handling of punctuation-heavy
+    strings.
     """
 
     def has_string_type(obj: dict[str, Any]) -> bool:
@@ -71,6 +83,10 @@ def json_schema_has_unconstrained_string_fields(schema: Any) -> bool:
 
     def is_unconstrained_string(obj: dict[str, Any]) -> bool:
         if not has_string_type(obj):
+            return False
+        if treat_length_bounds_as_constraint and (
+            "maxLength" in obj or "minLength" in obj
+        ):
             return False
         pattern = obj.get("pattern")
         if isinstance(pattern, str) and ".*" in pattern:
@@ -119,10 +135,16 @@ def json_schema_should_use_guidance_for_unconstrained_strings(schema: Any) -> bo
     composition-heavy JSON schemas too loosely and can allow immediate EOS.
     Prefer xgrammar for non-tool schemas that rely on composition keywords.
     """
-    if not json_schema_has_unconstrained_string_fields(schema):
-        return False
     if _is_tool_call_array_schema(schema):
-        return True
+        # Required tool_choice uses a tool-call array schema. Keep this on
+        # xgrammar when possible: guidance is significantly slower for large
+        # tool catalogs and can produce malformed argument JSON under complex
+        # anyOf tool arrays.
+        return False
+    if not json_schema_has_unconstrained_string_fields(
+        schema, treat_length_bounds_as_constraint=True
+    ):
+        return False
     return not _has_composition_keywords(schema)
 
 

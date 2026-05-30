@@ -1603,13 +1603,19 @@ class Scheduler(SchedulerInterface):
                 if not struct_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
                     req_id, new_token_ids
                 ):
-                    logger.error(
+                    logger.warning(
                         "Unexpected: grammar rejected tokens %s for request %s. "
-                        "Terminating request.",
+                        "Stopping at the last accepted prefix.",
                         new_token_ids,
                         req_id,
                     )
-                    request.status = RequestStatus.FINISHED_ERROR
+                    # The sampled token was already appended before grammar
+                    # validation. Do not emit it to the client; finish with the
+                    # last accepted prefix instead of surfacing a retryable
+                    # internal error as HTTP 500.
+                    request.trim_output_token_ids(len(new_token_ids))
+                    new_token_ids = []
+                    request.status = RequestStatus.FINISHED_STOPPED
                     request.resumable = False
                     stopped = True
 

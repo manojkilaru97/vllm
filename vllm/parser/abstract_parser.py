@@ -801,6 +801,7 @@ class DelegatingParser(Parser):
         )
 
         # Reasoning extraction
+        reasoning_handoff_delta: str | None = None
         if self._in_reasoning_phase(state):
             delta_message = self.extract_reasoning_streaming(
                 previous_text=state.previous_text,

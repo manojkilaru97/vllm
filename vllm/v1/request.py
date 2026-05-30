@@ -234,6 +234,17 @@ class Request:
 
         self.update_block_hashes()
 
+    def trim_output_token_ids(self, num_tokens: int) -> None:
+        if num_tokens <= 0:
+            return
+        del self._output_token_ids[-num_tokens:]
+        del self._all_token_ids[-num_tokens:]
+        # Token removal can invalidate hashes for the last completed block.
+        # Recompute from the remaining prefix; this path is only used when
+        # terminating a structured-output request after grammar rejection.
+        self.block_hashes.clear()
+        self.update_block_hashes()
+
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
