@@ -1401,30 +1401,6 @@ class OpenAIServingChat(OpenAIServing):
 
                         finish_reason_sent[i] = True
 
-                    if choice_data.delta.tool_calls:
-                        for tool_delta in choice_data.delta.tool_calls:
-                            tool_index = tool_delta.index or 0
-                            state = streamed_tool_calls[i].setdefault(
-                                tool_index,
-                                {
-                                    "id": tool_delta.id,
-                                    "type": tool_delta.type or "function",
-                                    "function": {"name": None, "arguments": ""},
-                                },
-                            )
-                            if tool_delta.id:
-                                state["id"] = tool_delta.id
-                            if tool_delta.type:
-                                state["type"] = tool_delta.type
-                            if tool_delta.function is not None:
-                                if tool_delta.function.name:
-                                    state["function"]["name"] = (
-                                        tool_delta.function.name
-                                    )
-                                if tool_delta.function.arguments:
-                                    state["function"]["arguments"] += (
-                                        tool_delta.function.arguments
-                                    )
                     if choice_data.finish_reason is not None:
                         final_finish_reasons[i] = choice_data.finish_reason
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
@@ -1457,42 +1433,121 @@ class OpenAIServingChat(OpenAIServing):
                                 pending_tool_whitespace_content[i]
                             )
                             pending_tool_whitespace_content[i] = ""
-                    if choice_data.delta.content:
-                        streamed_content_texts[i] += choice_data.delta.content
-                    if (
-                        choice_data.delta.reasoning
-                        and request.include_reasoning
-                    ):
-                        streamed_reasoning_texts[i] += choice_data.delta.reasoning
-                    chunk = ChatCompletionStreamResponse(
-                        id=request_id,
-                        object=chunk_object_type,
-                        created=created_time,
-                        choices=[choice_data],
-                        model=model_name,
-                    )
-                    # Stamp the fingerprint on terminal chunks only (those with
-                    # finish_reason set). When ``include_usage`` is on, the
-                    # trailing usage chunk below overrides this as the true
-                    # final message.
-                    if (
-                        not include_usage
-                        and self.system_fingerprint is not None
-                        and choice_data.finish_reason is not None
-                    ):
-                        chunk.system_fingerprint = self.system_fingerprint
 
-                    # handle usage stats if requested & if continuous
-                    if include_continuous_usage:
-                        completion_tokens = previous_num_tokens[i]
-                        chunk.usage = UsageInfo(
-                            prompt_tokens=num_prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            total_tokens=num_prompt_tokens + completion_tokens,
+                    choice_deltas = [choice_data]
+                    if (
+                        choice_data.delta.reasoning is not None
+                        and choice_data.delta.content is not None
+                        and not choice_data.delta.tool_calls
+                    ):
+                        # A stream interval can batch the final reasoning
+                        # tokens and first answer tokens together. Keep the
+                        # model bytes unchanged, but emit separate API deltas
+                        # so clients never have to join reasoning and content
+                        # across an ambiguous hidden </think> boundary.
+                        reasoning_choice = choice_data.model_copy(deep=True)
+                        reasoning_choice.delta = DeltaMessage(
+                            reasoning=choice_data.delta.reasoning
+                        )
+                        reasoning_choice.finish_reason = None
+                        reasoning_choice.stop_reason = None
+                        reasoning_choice.token_ids = None
+
+                        content_choice = choice_data.model_copy(deep=True)
+                        content_choice.delta = DeltaMessage(
+                            content=choice_data.delta.content
                         )
 
-                    data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
+                        choice_deltas = [reasoning_choice, content_choice]
+                    elif (
+                        choice_data.delta.reasoning is not None
+                        and choice_data.delta.tool_calls
+                    ):
+                        # Same boundary issue as reasoning+content, but the
+                        # first post-thinking bytes are tool XML. Emit the
+                        # reasoning tail before the tool delta so clients
+                        # cannot drop the final reasoning tokens.
+                        reasoning_choice = choice_data.model_copy(deep=True)
+                        reasoning_choice.delta = DeltaMessage(
+                            reasoning=choice_data.delta.reasoning
+                        )
+                        reasoning_choice.finish_reason = None
+                        reasoning_choice.stop_reason = None
+                        reasoning_choice.token_ids = None
+
+                        tool_choice = choice_data.model_copy(deep=True)
+                        tool_choice.delta = DeltaMessage(
+                            tool_calls=choice_data.delta.tool_calls
+                        )
+
+                        choice_deltas = [reasoning_choice, tool_choice]
+
+                    for choice_delta in choice_deltas:
+                        if choice_delta.delta.tool_calls:
+                            for tool_delta in choice_delta.delta.tool_calls:
+                                tool_index = tool_delta.index or 0
+                                state = streamed_tool_calls[i].setdefault(
+                                    tool_index,
+                                    {
+                                        "id": tool_delta.id,
+                                        "type": tool_delta.type or "function",
+                                        "function": {
+                                            "name": None,
+                                            "arguments": "",
+                                        },
+                                    },
+                                )
+                                if tool_delta.id:
+                                    state["id"] = tool_delta.id
+                                if tool_delta.type:
+                                    state["type"] = tool_delta.type
+                                if tool_delta.function is not None:
+                                    if tool_delta.function.name:
+                                        state["function"]["name"] = (
+                                            tool_delta.function.name
+                                        )
+                                    if tool_delta.function.arguments:
+                                        state["function"]["arguments"] += (
+                                            tool_delta.function.arguments
+                                        )
+                        if choice_delta.delta.content:
+                            streamed_content_texts[i] += choice_delta.delta.content
+                        if (
+                            choice_delta.delta.reasoning
+                            and request.include_reasoning
+                        ):
+                            streamed_reasoning_texts[i] += (
+                                choice_delta.delta.reasoning
+                            )
+                        chunk = ChatCompletionStreamResponse(
+                            id=request_id,
+                            object=chunk_object_type,
+                            created=created_time,
+                            choices=[choice_delta],
+                            model=model_name,
+                        )
+                        # Stamp the fingerprint on terminal chunks only (those
+                        # with finish_reason set). When ``include_usage`` is
+                        # on, the trailing usage chunk below overrides this as
+                        # the true final message.
+                        if (
+                            not include_usage
+                            and self.system_fingerprint is not None
+                            and choice_delta.finish_reason is not None
+                        ):
+                            chunk.system_fingerprint = self.system_fingerprint
+
+                        # handle usage stats if requested & if continuous
+                        if include_continuous_usage:
+                            completion_tokens = previous_num_tokens[i]
+                            chunk.usage = UsageInfo(
+                                prompt_tokens=num_prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=num_prompt_tokens + completion_tokens,
+                            )
+
+                        data = chunk.model_dump_json(exclude_unset=True)
+                        yield f"data: {data}\n\n"
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage

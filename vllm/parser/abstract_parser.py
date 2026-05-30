@@ -709,6 +709,7 @@ class DelegatingParser(Parser):
         )
 
         # Reasoning extraction
+        reasoning_handoff_delta: str | None = None
         if self._in_reasoning_phase(state):
             delta_message = self.extract_reasoning_streaming(
                 previous_text=state.previous_text,
@@ -728,10 +729,13 @@ class DelegatingParser(Parser):
                 )
                 delta_text = current_text
                 delta_token_ids = current_token_ids
-                if tool_parsing_enabled and self._tool_parser and delta_message:
-                    # Boundary content belongs to the tool parser, not the
-                    # assistant content stream.
-                    delta_message.content = None
+                if tool_parsing_enabled and self._tool_parser:
+                    if delta_message and delta_message.reasoning:
+                        reasoning_handoff_delta = delta_message.reasoning
+                    if delta_message:
+                        # Boundary content belongs to the tool parser, not the
+                        # assistant content stream.
+                        delta_message.content = None
 
         # Tool call extraction
         if tool_parsing_enabled and self._in_tool_call_phase(state):
@@ -742,10 +746,7 @@ class DelegatingParser(Parser):
                 delta_text = current_text
                 delta_token_ids = current_token_ids
 
-            # A boundary delta may carry both reasoning and tool call,
-            # save it before the tool parser overwrites delta_message.
-            reasoning = delta_message.reasoning if delta_message else None
-            delta_message, state.function_name_returned = (
+            tool_delta_message, state.function_name_returned = (
                 self._extract_tool_calls_streaming(
                     previous_text=state.previous_text,
                     current_text=current_text,
@@ -759,11 +760,18 @@ class DelegatingParser(Parser):
                     function_name_returned=state.function_name_returned,
                 )
             )
-            if reasoning:
-                if not delta_message:
-                    delta_message = DeltaMessage()
-                delta_message.reasoning = reasoning
-
+            if reasoning_handoff_delta:
+                if tool_delta_message is None:
+                    delta_message = DeltaMessage(reasoning=reasoning_handoff_delta)
+                else:
+                    tool_delta_message.reasoning = (
+                        f"{reasoning_handoff_delta}{tool_delta_message.reasoning}"
+                        if tool_delta_message.reasoning
+                        else reasoning_handoff_delta
+                    )
+                    delta_message = tool_delta_message
+            else:
+                delta_message = tool_delta_message
             if (
                 delta_message
                 and delta_message.tool_calls
