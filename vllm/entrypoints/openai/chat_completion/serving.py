@@ -2101,13 +2101,16 @@ class OpenAIServingChat(OpenAIServing):
                     "completion."
                 )
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
-            # In OpenAI's API, when a tool is called, the finish_reason is:
-            # "tool_calls" for "auto" or "required" tool calls,
-            # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
-                request.tool_choice
-                and request.tool_choice == "required"
-                and output.finish_reason == "stop"
+            # OpenAI-compatible clients key tool execution off finish_reason.
+            # If the final message contains tool calls, report tool_calls even
+            # when the underlying constrained generation stopped naturally.
+            is_finish_reason_tool_calls = bool(message.tool_calls) or (
+                auto_tools_called
+                or (
+                    request.tool_choice
+                    and request.tool_choice == "required"
+                    and output.finish_reason == "stop"
+                )
             )
 
             choice_data = ChatCompletionResponseChoice(
