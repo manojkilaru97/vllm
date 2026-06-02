@@ -112,12 +112,21 @@ from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import ParserManager
+from vllm.payload_logging import log_payload, log_payload_lazy
+from vllm.payload_sanitization import prepare_request_payload_for_logging
+from vllm.payload_suppression import (
+    build_suppressed_request_payload,
+    build_suppressed_response_payload_from_obj,
+    payload_suppression_context_for_request_id,
+    register_request_logging_context,
+    request_logging_context_from_headers,
+)
+from vllm.reasoning import ReasoningParser
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
-from vllm.payload_sanitization import prepare_request_payload_for_logging
 
 logger = init_logger(__name__)
 payload_logger = __import__("logging").getLogger("vllm.payload")
@@ -143,71 +152,113 @@ async def _log_responses_request_payload(
     request: ResponsesRequest,
     serving_render: OpenAIServingRender,
 ) -> None:
-    if raw_request is None or os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
-        return
     rid = request.request_id
+    if raw_request is None:
+        return
     try:
         headers_obj = {k: v for k, v in raw_request.headers.items()}
     except Exception:
         headers_obj = None
+    request_context = register_request_logging_context(
+        rid,
+        request_logging_context_from_headers(
+            headers_obj,
+            model=request.model,
+            stream=bool(request.stream),
+        ),
+    )
+    if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
+        return
+    suppression_context = payload_suppression_context_for_request_id(rid)
+    if suppression_context is not None:
+        tools = getattr(request, "tools", None)
+        tool_count = len(tools) if isinstance(tools, list) else 0
+        log_payload(
+            payload_logger,
+            "openai.request",
+            extra={
+                "rid": rid,
+                "endpoint": OpenAIServingResponses.__name__,
+                "input_image_count": 0,
+                "input_video_count": 0,
+                "input_audio_count": 0,
+                "input_tool_count": tool_count,
+                "has_images": False,
+                "has_videos": False,
+                "has_audios": False,
+                "has_tools": tool_count > 0,
+                "has_tool_calls_enabled": tool_count > 0,
+                "has_structured_output": getattr(request, "text", None) is not None,
+                "payload_suppressed": request_context.payload_suppressed,
+                "suppression_reason": suppression_context.reason,
+                "nca_id": suppression_context.nca_id,
+                "payload": build_suppressed_request_payload(
+                    request, suppression_context
+                ),
+            },
+        )
+        return
+    body = b""
     try:
         body = await raw_request.body()
-        payload = json.loads(body) if body else None
     except Exception:
-        payload = None
-    if payload is None:
-        try:
-            payload = request.model_dump(mode="json", by_alias=True)
-        except Exception:
-            payload = None
+        body = b""
     try:
         allowed_local_media_path = (
             serving_render.model_config.allowed_local_media_path
         )
     except Exception:
         allowed_local_media_path = ""
-    try:
+    endpoint = OpenAIServingResponses.__name__
+
+    def build_extra() -> dict[str, Any] | None:
+        payload = None
+        if body:
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = None
+        if payload is None:
+            try:
+                payload = request.model_dump(mode="json", by_alias=True)
+            except Exception:
+                payload = None
+        if payload is None:
+            return None
         summary = summarize_request_payload(payload)
-        payload_logger.info(
-            "openai.request",
-            extra={
-                "rid": rid,
-                "endpoint": OpenAIServingResponses.__name__,
-                "input_image_count": summary.image_count,
-                "input_video_count": summary.video_count,
-                "input_audio_count": summary.audio_count,
-                "input_tool_count": summary.tool_count,
-                "has_images": summary.has_images,
-                "has_videos": summary.has_videos,
-                "has_audios": summary.has_audios,
-                "has_tools": summary.has_tools,
-                "has_tool_calls_enabled": summary.has_tool_calls_enabled,
-                "has_structured_output": summary.has_structured_output,
-                **(
-                    {"tool_choice": summary.tool_choice}
-                    if summary.tool_choice is not None
-                    else {}
-                ),
-                **(
-                    {"structured_output_kind": summary.structured_output_kind}
-                    if summary.structured_output_kind is not None
-                    else {}
-                ),
-                "payload": prepare_request_payload_for_logging(
-                    payload,
-                    headers=headers_obj,
-                    allowed_local_media_path=allowed_local_media_path,
-                ),
-                "payload_json": (
-                    json.dumps(payload, ensure_ascii=False)
-                    if payload is not None
-                    else None
-                ),
-                "headers": headers_obj,
-            },
-        )
-    except Exception:
-        logger.exception("Failed to log openai.request rid=%s", rid)
+        return {
+            "rid": rid,
+            "endpoint": endpoint,
+            "input_image_count": summary.image_count,
+            "input_video_count": summary.video_count,
+            "input_audio_count": summary.audio_count,
+            "input_tool_count": summary.tool_count,
+            "has_images": summary.has_images,
+            "has_videos": summary.has_videos,
+            "has_audios": summary.has_audios,
+            "has_tools": summary.has_tools,
+            "has_tool_calls_enabled": summary.has_tool_calls_enabled,
+            "has_structured_output": summary.has_structured_output,
+            **(
+                {"tool_choice": summary.tool_choice}
+                if summary.tool_choice is not None
+                else {}
+            ),
+            **(
+                {"structured_output_kind": summary.structured_output_kind}
+                if summary.structured_output_kind is not None
+                else {}
+            ),
+            "payload": prepare_request_payload_for_logging(
+                payload,
+                headers=headers_obj,
+                allowed_local_media_path=allowed_local_media_path,
+            ),
+            "payload_json": json.dumps(payload, ensure_ascii=False),
+            "headers": headers_obj,
+        }
+
+    log_payload_lazy(payload_logger, "openai.request", build_extra=build_extra)
 
 
 def _log_responses_response_payload(
@@ -217,16 +268,39 @@ def _log_responses_response_payload(
     if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
         return
     try:
-        payload = response.model_dump(mode="json", by_alias=True)
-        payload_logger.info(
-            "openai.response",
-            extra={
+        suppression_context = payload_suppression_context_for_request_id(rid)
+        if suppression_context is not None:
+            log_payload(
+                payload_logger,
+                "openai.response",
+                extra={
+                    "rid": rid,
+                    "request_id": rid,
+                    "endpoint": OpenAIServingResponses.__name__,
+                    "payload_suppressed": True,
+                    "suppression_reason": suppression_context.reason,
+                    "nca_id": suppression_context.nca_id,
+                    "payload": build_suppressed_response_payload_from_obj(
+                        response, suppression_context
+                    ),
+                },
+            )
+            return
+
+        def build_response_extra() -> dict[str, Any]:
+            payload = response.model_dump(mode="json", by_alias=True)
+            return {
                 "rid": rid,
                 "request_id": rid,
                 "endpoint": OpenAIServingResponses.__name__,
                 "payload": payload,
                 "payload_json": json.dumps(payload, ensure_ascii=False),
-            },
+            }
+
+        log_payload_lazy(
+            payload_logger,
+            "openai.response",
+            build_extra=build_response_extra,
         )
     except Exception:
         logger.exception("Failed to log openai.response rid=%s", rid)
@@ -378,14 +452,166 @@ class OpenAIServingResponses(OpenAIServing):
     def _effective_chat_template_kwargs(
         self, request: ResponsesRequest
     ) -> dict[str, Any]:
-        return (
-            request.build_chat_params(
-                self.chat_template,
-                self.chat_template_content_format,
+        return request.build_chat_params(
+            self.chat_template,
+            self.chat_template_content_format,
+        ).with_defaults(
+            self.openai_serving_render.default_chat_template_kwargs,
+        ).chat_template_kwargs
+
+    def _compute_newline_token_ids(
+        self,
+        tokenizer: TokenizerLike,
+        strings: list[str] | None = None,
+    ) -> list[int]:
+        cached = getattr(tokenizer, "_vllm_newline_token_ids", None)
+        if isinstance(cached, list):
+            return cached
+
+        if strings is None:
+            strings = ["\n", "\r\n", "\n\n"]
+
+        newline_ids: set[int] = set()
+        for s in strings:
+            try:
+                encoded = tokenizer.encode(s, add_special_tokens=False)
+            except TypeError:
+                encoded = tokenizer.encode(s)  # type: ignore[call-arg]
+            except Exception:
+                continue
+            for token_id in encoded:
+                try:
+                    newline_ids.add(int(token_id))
+                except Exception:
+                    continue
+
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if isinstance(vocab_size, int) and 0 < vocab_size <= 300000:
+            for token_id in range(vocab_size):
+                try:
+                    token_text = tokenizer.decode([token_id])
+                except Exception:
+                    continue
+                if any(token_text.endswith(s) for s in strings):
+                    newline_ids.add(token_id)
+
+        ids_list = sorted(newline_ids)
+        setattr(tokenizer, "_vllm_newline_token_ids", ids_list)
+        return ids_list
+
+    def _inject_think_end_token_id(
+        self,
+        sampling_params: SamplingParams,
+        request: ResponsesRequest,
+        tokenizer: TokenizerLike,
+        reasoning_parser: ReasoningParser | None,
+        chat_template_kwargs: dict[str, Any],
+    ) -> None:
+        if reasoning_parser is None:
+            return
+
+        if sampling_params.extra_args is None:
+            sampling_params.extra_args = {}
+        extra = sampling_params.extra_args
+
+        if chat_template_kwargs.get("enable_thinking", True):
+            extra.setdefault("disable_spec_decode", True)
+
+        reasoning_budget = chat_template_kwargs.get("reasoning_budget")
+        if (
+            reasoning_budget is None
+            and sampling_params.structured_outputs is not None
+            and chat_template_kwargs.get("enable_thinking", True) is not False
+        ):
+            # Structured outputs cannot be constrained until reasoning ends.
+            # Reserve answer tokens and cap internal reasoning so Responses
+            # matches Chat behavior instead of returning missing/invalid JSON.
+            max_tokens = getattr(sampling_params, "max_tokens", None) or 0
+            if max_tokens > 0:
+                reserve = max(64, min(256, max_tokens // 2))
+                reasoning_budget = min(4096, max(32, max_tokens - reserve))
+
+        if reasoning_budget is None:
+            return
+
+        try:
+            budget_int = int(reasoning_budget)
+        except Exception:
+            logger.warning("Invalid reasoning_budget=%r; skipping", reasoning_budget)
+            return
+        if budget_int == -1:
+            return
+
+        extra.setdefault("reasoning_budget", budget_int)
+        try:
+            grace_int = int(
+                chat_template_kwargs.get("reasoning_budget_grace_period", 0)
             )
-            .with_defaults(self.chat_template_kwargs)
-            .chat_template_kwargs
-        )
+        except Exception:
+            grace_int = 0
+        extra.setdefault("reasoning_budget_grace_period", grace_int)
+
+        if "enable_thinking" in chat_template_kwargs:
+            extra.setdefault("enable_thinking", chat_template_kwargs["enable_thinking"])
+
+        end_token_ids = getattr(reasoning_parser, "end_token_ids", None)
+        parsed_end_token_ids: list[int] = []
+        if isinstance(end_token_ids, list):
+            try:
+                parsed_end_token_ids = [int(tid) for tid in end_token_ids]
+            except Exception:
+                parsed_end_token_ids = []
+
+        if not parsed_end_token_ids:
+            end_token_id = getattr(reasoning_parser, "end_token_id", None)
+            if end_token_id is not None:
+                try:
+                    parsed_end_token_ids = [int(end_token_id)]
+                except Exception:
+                    parsed_end_token_ids = []
+
+        if not parsed_end_token_ids:
+            end_token = getattr(reasoning_parser, "end_token", None)
+            if isinstance(end_token, str) and end_token:
+                try:
+                    parsed_end_token_ids = [
+                        int(tid)
+                        for tid in tokenizer.encode(end_token, add_special_tokens=False)
+                    ]
+                except TypeError:
+                    try:
+                        parsed_end_token_ids = [
+                            int(tid) for tid in tokenizer.encode(end_token)
+                        ]
+                    except Exception:
+                        parsed_end_token_ids = []
+                except Exception:
+                    parsed_end_token_ids = []
+                if not parsed_end_token_ids:
+                    vocab = getattr(tokenizer, "get_vocab", lambda: {})()
+                    token_id = vocab.get(end_token)
+                    if token_id is not None:
+                        try:
+                            parsed_end_token_ids = [int(token_id)]
+                        except Exception:
+                            parsed_end_token_ids = []
+
+        if not parsed_end_token_ids:
+            logger.warning(
+                "Could not determine end-of-think token ids for reasoning budget"
+            )
+            return
+
+        extra.setdefault("think_end_token_id", parsed_end_token_ids[0])
+        extra.setdefault("end_token_ids", parsed_end_token_ids)
+
+        if "newline_token_ids" not in extra:
+            try:
+                newline_ids = self._compute_newline_token_ids(tokenizer)
+            except Exception:
+                newline_ids = []
+            if newline_ids:
+                extra["newline_token_ids"] = newline_ids
 
     def _validate_generator_input(
         self,
@@ -628,6 +854,13 @@ class OpenAIServingResponses(OpenAIServing):
                             struct_out.structural_tag, self.tool_server
                         ),
                     )
+                self._inject_think_end_token_id(
+                    sampling_params,
+                    request,
+                    tokenizer,
+                    reasoning_parser,
+                    chat_template_kwargs,
+                )
             generator = self._generate_with_builtin_tools(
                 request_id=request.request_id,
                 engine_input=engine_input,
@@ -963,7 +1196,11 @@ class OpenAIServingResponses(OpenAIServing):
             final_output = final_res.outputs[0]
 
             # finish_reason='error' indicates retryable internal error
-            self._raise_if_error(final_output.finish_reason, request.request_id)
+            self._raise_if_error(
+                final_output.finish_reason,
+                request.request_id,
+                final_output.stop_reason,
+            )
 
             # Check if generation was stopped due to max_tokens
             if final_output.finish_reason == "length":
@@ -1149,14 +1386,24 @@ class OpenAIServingResponses(OpenAIServing):
     ) -> list[ResponseOutputItem]:
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
-            self.request_logger.log_outputs(
-                request_id=request.request_id,
-                outputs=final_output.text,
-                output_token_ids=final_output.token_ids,
-                finish_reason=final_output.finish_reason,
-                is_streaming=False,
-                delta=False,
-            )
+            if payload_suppression_context_for_request_id(request.request_id) is not None:
+                self.request_logger.log_outputs(
+                    request_id=request.request_id,
+                    outputs="",
+                    output_token_ids=None,
+                    finish_reason=final_output.finish_reason,
+                    is_streaming=False,
+                    delta=False,
+                )
+            else:
+                self.request_logger.log_outputs(
+                    request_id=request.request_id,
+                    outputs=final_output.text,
+                    output_token_ids=final_output.token_ids,
+                    finish_reason=final_output.finish_reason,
+                    is_streaming=False,
+                    delta=False,
+                )
 
         # Compute logprobs if requested
         logprobs = None
@@ -1527,7 +1774,11 @@ class OpenAIServingResponses(OpenAIServing):
                 continue
 
             output = ctx.last_output.outputs[0]
-            self._raise_if_error(output.finish_reason, request.request_id)
+            self._raise_if_error(
+                output.finish_reason,
+                request.request_id,
+                output.stop_reason,
+            )
             delta_text = output.text
             delta_token_ids = as_list(output.token_ids)
             if not delta_text and delta_token_ids:

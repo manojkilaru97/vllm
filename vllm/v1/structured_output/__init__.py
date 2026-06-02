@@ -279,7 +279,36 @@ class StructuredOutputManager:
         )
         if disable_any_whitespace is not None:
             guidance_backend.disable_any_whitespace = disable_any_whitespace
-        return guidance_backend.compile_grammar(request_type, grammar_spec)
+        grammar = guidance_backend.compile_grammar(request_type, grammar_spec)
+        self._check_guidance_bitmask_compatibility(guidance_backend, grammar)
+        return grammar
+
+    def _check_guidance_bitmask_compatibility(
+        self,
+        guidance_backend: GuidanceBackend,
+        grammar: StructuredOutputGrammar,
+    ) -> None:
+        if not isinstance(self.backend, XgrammarBackend):
+            return
+
+        manager_mask = self.backend.allocate_token_bitmask(1)
+        guidance_mask = guidance_backend.allocate_token_bitmask(1)
+        if (
+            manager_mask.dtype != guidance_mask.dtype
+            or manager_mask.shape[1:] != guidance_mask.shape[1:]
+        ):
+            raise ValueError(
+                "Guidance grammar bitmask is incompatible with the "
+                "xgrammar structured-output manager bitmask: "
+                f"manager={manager_mask.shape}/{manager_mask.dtype}, "
+                f"guidance={guidance_mask.shape}/{guidance_mask.dtype}"
+            )
+
+        # Fill once against a throwaway manager mask so auto fallback fails
+        # closed if llguidance and xgrammar bitmask layouts diverge in a way
+        # shape checks cannot detect. Do not write into self._grammar_bitmask:
+        # it is the live inference buffer.
+        grammar.fill_bitmask(manager_mask, 0)
 
     def _fill_bitmasks(
         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]

@@ -24,7 +24,12 @@ from vllm.entrypoints.utils import (
     with_cancellation,
 )
 from vllm.logger import init_logger
+from vllm.payload_logging import log_payload, log_payload_lazy
 from vllm.payload_sanitization import maybe_redact_mm_payload
+from vllm.payload_suppression import (
+    build_suppressed_error_payload,
+    payload_suppression_context_from_headers,
+)
 
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
@@ -68,11 +73,36 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         rid = raw_request.headers.get("X-Request-Id", "")
         if rid and os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
             try:
-                payload_logger.info(
+                endpoint = handler.__class__.__name__
+                headers_obj = {k: v for k, v in raw_request.headers.items()}
+                suppression_context = payload_suppression_context_from_headers(
+                    headers_obj
+                )
+                if suppression_context is not None:
+                    log_payload(
+                        payload_logger,
+                        "openai.response",
+                        extra={
+                            "rid": rid,
+                            "endpoint": endpoint,
+                            "payload_suppressed": True,
+                            "suppression_reason": suppression_context.reason,
+                            "nca_id": suppression_context.nca_id,
+                            "payload": build_suppressed_error_payload(
+                                generator, suppression_context
+                            ),
+                        },
+                    )
+                    return JSONResponse(
+                        content=generator.model_dump(),
+                        status_code=generator.error.code,
+                    )
+                log_payload_lazy(
+                    payload_logger,
                     "openai.response",
-                    extra={
+                    build_extra=lambda: {
                         "rid": rid,
-                        "endpoint": handler.__class__.__name__,
+                        "endpoint": endpoint,
                         "payload": maybe_redact_mm_payload(generator.model_dump()),
                     },
                 )

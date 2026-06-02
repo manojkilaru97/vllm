@@ -6,9 +6,13 @@ import json
 import pytest
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.entrypoints.openai.engine.protocol import (
+    DeltaMessage,
+    ExtractedToolCallInformation,
+)
 from vllm.parser.abstract_parser import _WrappedParser
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
+from vllm.tool_parsers.abstract_tool_parser import ToolParser
 from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
 
 
@@ -20,6 +24,47 @@ class ThinkReasoningParser(BaseThinkingReasoningParser):
     @property
     def end_token(self) -> str:
         return "</think>"
+
+
+class TextMarkerReasoningParser(ThinkReasoningParser):
+    def extract_reasoning_streaming(
+        self,
+        previous_text,
+        current_text,
+        delta_text,
+        previous_token_ids,
+        current_token_ids,
+        delta_token_ids,
+    ) -> DeltaMessage | None:
+        if self.end_token in delta_text:
+            reasoning, _, content = delta_text.partition(self.end_token)
+            return DeltaMessage(
+                reasoning=reasoning or None,
+                content=content or None,
+            )
+        return DeltaMessage(reasoning=delta_text or None)
+
+
+class EchoToolParser(ToolParser):
+    supports_required_and_named = False
+
+    def extract_tool_calls(self, model_output, request):
+        return ExtractedToolCallInformation(
+            tools_called=False, tool_calls=[], content=model_output
+        )
+
+    def extract_tool_calls_streaming(
+        self,
+        previous_text,
+        current_text,
+        delta_text,
+        previous_token_ids,
+        current_token_ids,
+        delta_token_ids,
+        request,
+    ) -> DeltaMessage | None:
+        self.last_delta_text = delta_text
+        return DeltaMessage(content=delta_text)
 
 
 MODEL_OUTPUT = (
@@ -235,3 +280,40 @@ def test_parse_delta_reasoning_only_thinking_disabled(tokenizer, request_obj):
     assert "Hello" in content
     assert "assist" in content
     assert len(tool_calls) == 0
+
+
+def test_parse_delta_text_marker_end_hands_off_to_tool_parser(tokenizer):
+    _WrappedParser.reasoning_parser_cls = TextMarkerReasoningParser
+    _WrappedParser.tool_parser_cls = EchoToolParser
+    parser = _WrappedParser(tokenizer)
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "capture",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+    end_id = parser._reasoning_parser.end_token_id
+    start_id = parser._reasoning_parser.start_token_id
+    non_marker_id = max(start_id, end_id) + 1
+
+    result = parser.parse_delta(
+        'thinking</think>{"name":"capture","arguments":{}}',
+        [non_marker_id],
+        request,
+        prompt_token_ids=[],
+    )
+
+    assert parser._stream_state.reasoning_ended
+    assert parser._stream_state.tool_call_text_started
+    assert parser._tool_parser.last_delta_text == '{"name":"capture","arguments":{}}'
+    assert result is not None
+    assert result.reasoning == "thinking"
