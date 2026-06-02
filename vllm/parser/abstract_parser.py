@@ -27,6 +27,7 @@ from vllm.parser.metrics import record_tool_parser_invocation
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.detokenizer_utils import decode_token_ids_if_utf8_complete
 from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser
 from vllm.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
@@ -789,8 +790,10 @@ class DelegatingParser(Parser):
         if reasoning_disabled:
             state.reasoning_ended = True
         if state.reasoning_ended and not delta_text and delta_token_ids:
-            delta_text = self.model_tokenizer.decode(
-                delta_token_ids, skip_special_tokens=True
+            delta_text = decode_token_ids_if_utf8_complete(
+                self.model_tokenizer,
+                list(delta_token_ids),
+                skip_special_tokens=True,
             )
 
         current_text, current_token_ids = state.advance(delta_text, delta_token_ids)

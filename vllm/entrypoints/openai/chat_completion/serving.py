@@ -81,6 +81,7 @@ from vllm.payload_suppression import (
 from vllm.renderers import ChatParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.detokenizer_utils import decode_token_ids_if_utf8_complete
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tool_parser
 
@@ -1005,7 +1006,8 @@ class OpenAIServingChat(OpenAIServing):
 
                     delta_text = output.text
                     if not delta_text and output.token_ids:
-                        delta_text = tokenizer.decode(
+                        delta_text = decode_token_ids_if_utf8_complete(
+                            tokenizer,
                             as_list(output.token_ids),
                             skip_special_tokens=True,
                         )
