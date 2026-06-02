@@ -371,8 +371,15 @@ class DeltaMessage(OpenAIBaseModel):
 
 
 class GenerationError(Exception):
-    """raised when finish_reason indicates internal server error (500)"""
+    """Raised when generation fails after request validation."""
 
-    def __init__(self, message: str = "Internal server error"):
+    def __init__(
+        self,
+        message: str = "Internal server error",
+        *,
+        status_code: HTTPStatus = HTTPStatus.INTERNAL_SERVER_ERROR,
+        err_type: str = "InternalServerError",
+    ):
         super().__init__(message)
-        self.status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        self.status_code = status_code
+        self.err_type = err_type

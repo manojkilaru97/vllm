@@ -812,18 +812,35 @@ class DelegatingParser(Parser):
                 delta_token_ids=delta_token_ids,
             )
             reasoning_parser = self._reasoning_parser
+            reasoning_ended_by_token = True
             if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
                 should_transition = (
                     reasoning_parser.has_engine_confirmed_reasoning_end()
                 )
             else:
-                should_transition = self.is_reasoning_end_streaming(
-                    current_token_ids, delta_token_ids
+                # Reasoning may end via the text marker (e.g. </think>) even
+                # when the marker token id is absent from this delta.
+                reasoning_ended_by_token = self.is_reasoning_end(delta_token_ids)
+                end_token = getattr(self._reasoning_parser, "end_token", None)
+                reasoning_ended_by_text = (
+                    isinstance(end_token, str)
+                    and bool(end_token)
+                    and end_token in current_text
+                )
+                should_transition = (
+                    self.is_reasoning_end_streaming(
+                        current_token_ids, delta_token_ids
+                    )
+                    or reasoning_ended_by_text
                 )
             if should_transition:
                 state.reasoning_ended = True
                 reasoning_transitioned = True
-                current_token_ids = self.extract_content_ids(delta_token_ids)
+                current_token_ids = (
+                    self.extract_content_ids(delta_token_ids)
+                    if reasoning_ended_by_token
+                    else []
+                )
                 if self._engine_based:
                     flush_delta = reasoning_parser.finish_streaming()  # type: ignore[union-attr, attr-defined]
                     current_text = (

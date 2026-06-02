@@ -305,6 +305,39 @@ class ReasoningBudgetLogitsProcessor(LogitsProcessor):
                 return k
         return 0
 
+    @staticmethod
+    def _contains_subsequence(
+        tokens: list[int], subsequence: list[int], start: int = 0
+    ) -> bool:
+        if not subsequence or len(tokens) < len(subsequence):
+            return False
+
+        start = max(start, 0)
+        last_start = len(tokens) - len(subsequence)
+        for i in range(start, last_start + 1):
+            if tokens[i : i + len(subsequence)] == subsequence:
+                return True
+        return False
+
+    def _maybe_mark_natural_end(self, state: dict[str, Any]) -> bool:
+        output_tok_ids: list[int] = state["output_tok_ids"]
+        end_token_ids: list[int] = state["end_token_ids"]
+        if not end_token_ids:
+            return False
+
+        checked_len = int(state.get("natural_end_checked_len", 0) or 0)
+        # Re-scan the small overlap where an end marker could straddle the
+        # previously checked suffix and the newly generated tokens.
+        scan_start = max(0, checked_len - len(end_token_ids) + 1)
+        if self._contains_subsequence(output_tok_ids, end_token_ids, scan_start):
+            state["end_of_end"] = True
+            state["is_thinking"] = False
+            state["natural_end_seen"] = True
+            return True
+
+        state["natural_end_checked_len"] = len(output_tok_ids)
+        return False
+
     def _maybe_end_thinking(
         self, idx: int, logits: torch.Tensor, state: dict[str, Any]
     ) -> torch.Tensor:
@@ -312,6 +345,9 @@ class ReasoningBudgetLogitsProcessor(LogitsProcessor):
             return logits
 
         output_tok_ids: list[int] = state["output_tok_ids"]
+        if self._maybe_mark_natural_end(state):
+            return logits
+
         budget: int = state["thinking_budget"]
         grace: int = state["thinking_budget_grace_period"]
 
@@ -443,6 +479,7 @@ class ReasoningBudgetLogitsProcessor(LogitsProcessor):
                 "is_thinking": is_thinking,
                 "start_of_end": False,
                 "end_of_end": False,
+                "natural_end_checked_len": 0,
             }
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:

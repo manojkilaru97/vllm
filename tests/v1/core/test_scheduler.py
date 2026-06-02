@@ -2827,14 +2827,16 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     )
     assert request.resumable is False
     assert request.status == RequestStatus.FINISHED_ERROR
+    assert request.stop_reason == "structured_output_rejected"
     assert request.request_id not in scheduler.requests
     assert not scheduler.running
     scheduler._free_request.assert_called_once_with(request)
     assert len(engine_core_outputs[0].outputs) == 1
     engine_core_output = engine_core_outputs[0].outputs[0]
     assert engine_core_output.request_id == request.request_id
-    assert engine_core_output.new_token_ids == [123]
+    assert engine_core_output.new_token_ids == []
     assert engine_core_output.finish_reason == FinishReason.ERROR
+    assert engine_core_output.stop_reason == "structured_output_rejected"
 
 
 @pytest.mark.parametrize(

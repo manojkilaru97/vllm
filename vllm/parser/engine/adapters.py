@@ -60,6 +60,40 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         return self._parser_engine.is_reasoning_end(list(input_ids))
 
+    def _decode_token_ids(self, token_ids: Sequence[int]) -> str:
+        tokenizer = self._parser_engine.model_tokenizer
+        try:
+            return tokenizer.decode(list(token_ids), skip_special_tokens=False)
+        except TypeError:
+            return tokenizer.decode(list(token_ids))
+        except Exception:
+            try:
+                tokens = tokenizer.convert_ids_to_tokens(list(token_ids))
+                return tokenizer.convert_tokens_to_string(tokens)
+            except Exception:
+                return ""
+
+    def is_reasoning_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Sequence[int]
+    ) -> bool:
+        delta_ids = list(delta_ids)
+        if self.is_reasoning_end(delta_ids):
+            return True
+        if not delta_ids:
+            return False
+
+        # Structured-output gating only has token IDs. Fall back to decoded
+        # text so grammar constraints start when the model emits the
+        # reasoning end marker as ordinary token pieces.
+        end_marker = self._parser_engine.reasoning_end_str
+        if not end_marker:
+            return False
+        delta_start = max(len(input_ids) - len(delta_ids), 0)
+        tail_start = max(delta_start - 32, 0)
+        previous_tail = self._decode_token_ids(input_ids[tail_start:delta_start])
+        current_tail = self._decode_token_ids(input_ids[tail_start:])
+        return end_marker in current_tail and end_marker not in previous_tail
+
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         self._parser_engine.adjust_initial_state_from_prompt(prompt_token_ids)
 

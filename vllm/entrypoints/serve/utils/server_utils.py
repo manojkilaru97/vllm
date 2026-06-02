@@ -11,6 +11,7 @@ from argparse import Namespace
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from typing import Any
 
 import pydantic
 from fastapi import FastAPI, HTTPException, Request
@@ -34,9 +35,17 @@ from vllm.entrypoints.serve.utils.error_response import (
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.payload_logging import log_payload, log_payload_lazy
 from vllm.payload_sanitization import (
     maybe_redact_mm_payload,
     prepare_request_payload_for_logging,
+)
+from vllm.payload_suppression import (
+    build_suppressed_error_payload,
+    build_suppressed_request_payload,
+    payload_suppression_context_from_headers,
+    register_request_logging_context,
+    request_logging_context_from_headers,
 )
 from vllm.entrypoints.openai.request_metrics import summarize_request_payload
 from vllm.utils.gc_utils import freeze_gc_heap
@@ -56,8 +65,6 @@ def _extract_request_rid(req: Request) -> str:
 
 
 async def _log_request_payload(req: Request) -> None:
-    if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
-        return
     rid = _extract_request_rid(req)
     if not rid:
         return
@@ -65,20 +72,55 @@ async def _log_request_payload(req: Request) -> None:
         headers_obj = {k: v for k, v in req.headers.items()}
     except Exception:
         headers_obj = None
-    payload = None
+    register_request_logging_context(
+        rid, request_logging_context_from_headers(headers_obj)
+    )
+    if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
+        return
+    suppression_context = payload_suppression_context_from_headers(headers_obj)
+    if suppression_context is not None:
+        log_payload(
+            payload_logger,
+            "openai.request",
+            extra={
+                "rid": rid,
+                "endpoint": req.url.path,
+                "input_image_count": 0,
+                "input_video_count": 0,
+                "input_audio_count": 0,
+                "input_tool_count": 0,
+                "has_images": False,
+                "has_videos": False,
+                "has_audios": False,
+                "has_tools": False,
+                "has_tool_calls_enabled": False,
+                "has_structured_output": False,
+                "payload_suppressed": True,
+                "suppression_reason": suppression_context.reason,
+                "nca_id": suppression_context.nca_id,
+                "payload": build_suppressed_request_payload(
+                    None, suppression_context
+                ),
+            },
+        )
+        return
     try:
         body = await req.body()
-        if body:
-            payload = json.loads(body)
     except Exception:
-        payload = None
-    if payload is None:
-        return
-    summary = summarize_request_payload(payload)
-    try:
+        body = b""
+    endpoint = req.url.path
+
+    def build_extra() -> dict[str, Any] | None:
+        try:
+            payload = json.loads(body) if body else None
+        except Exception:
+            payload = None
+        if payload is None:
+            return None
+        summary = summarize_request_payload(payload)
         extra = {
             "rid": rid,
-            "endpoint": req.url.path,
+            "endpoint": endpoint,
             "input_image_count": summary.image_count,
             "input_video_count": summary.video_count,
             "input_audio_count": summary.audio_count,
@@ -98,9 +140,9 @@ async def _log_request_payload(req: Request) -> None:
             extra["tool_choice"] = summary.tool_choice
         if summary.structured_output_kind is not None:
             extra["structured_output_kind"] = summary.structured_output_kind
-        payload_logger.info("openai.request", extra=extra)
-    except Exception:
-        pass
+        return extra
+
+    log_payload_lazy(payload_logger, "openai.request", build_extra=build_extra)
 
 
 def _log_error_response(req: Request, err: ErrorResponse) -> None:
@@ -109,12 +151,35 @@ def _log_error_response(req: Request, err: ErrorResponse) -> None:
     rid = _extract_request_rid(req)
     if not rid:
         return
+    endpoint = req.url.path
     try:
-        payload_logger.info(
+        try:
+            headers_obj = {k: v for k, v in req.headers.items()}
+        except Exception:
+            headers_obj = None
+        suppression_context = payload_suppression_context_from_headers(headers_obj)
+        if suppression_context is not None:
+            log_payload(
+                payload_logger,
+                "openai.response",
+                extra={
+                    "rid": rid,
+                    "endpoint": req.url.path,
+                    "payload_suppressed": True,
+                    "suppression_reason": suppression_context.reason,
+                    "nca_id": suppression_context.nca_id,
+                    "payload": build_suppressed_error_payload(
+                        err, suppression_context
+                    ),
+                },
+            )
+            return
+        log_payload_lazy(
+            payload_logger,
             "openai.response",
-            extra={
+            build_extra=lambda: {
                 "rid": rid,
-                "endpoint": req.url.path,
+                "endpoint": endpoint,
                 "payload": maybe_redact_mm_payload(err.model_dump()),
             },
         )

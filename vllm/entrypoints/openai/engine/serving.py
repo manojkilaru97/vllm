@@ -114,9 +114,25 @@ class OpenAIServing(BaseServing, BeamSearchOnlineMixin):
         )
         return json_str
 
-    def _raise_if_error(self, finish_reason: str | None, request_id: str) -> None:
+    def _raise_if_error(
+        self,
+        finish_reason: str | None,
+        request_id: str,
+        stop_reason: int | str | None = None,
+    ) -> None:
         """Raise GenerationError if finish_reason indicates an error."""
         if finish_reason == "error":
+            if stop_reason == "structured_output_rejected":
+                logger.warning(
+                    "Request %s failed structured output validation",
+                    request_id,
+                )
+                raise GenerationError(
+                    "Generated tokens were rejected by the structured output "
+                    "grammar.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    err_type="BadRequestError",
+                )
             logger.error(
                 "Request %s failed with an internal error during generation",
                 request_id,

@@ -569,15 +569,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         unsupported_fields = (
             "return_logits",
-            "return_token_ids",
             "return_hidden_states",
             "return_logprob",
             "return_text_in_logprobs",
             "logits_processors",
             "logprob_start_len",
             "top_logprobs_num",
-            "spaces_between_special_tokens",
-            "truncate_prompt_tokens",
         )
         present = [field for field in unsupported_fields if field in data]
         if present:
