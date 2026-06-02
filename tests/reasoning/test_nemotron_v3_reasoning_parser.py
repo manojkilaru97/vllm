@@ -24,7 +24,12 @@ class FakeNemotronTokenizer:
         self._vocab = {
             "<think>": 1,
             "</think>": 2,
+            "</": 3,
+            "think": 4,
+            ">": 5,
+            "x": 6,
         }
+        self._reverse_vocab = {v: k for k, v in self._vocab.items()}
         self._pattern = re.compile(r"(<think>|</think>)")
 
     def get_vocab(self) -> dict[str, int]:
@@ -39,6 +44,13 @@ class FakeNemotronTokenizer:
 
     def convert_tokens_to_string(self, tokens: list[str]) -> str:
         return "".join(tokens)
+
+    def decode(
+        self, token_ids: list[int], skip_special_tokens: bool = False
+    ) -> str:
+        return self.convert_tokens_to_string(
+            [self._reverse_vocab[token_id] for token_id in token_ids]
+        )
 
 
 @pytest.fixture
@@ -126,6 +138,49 @@ def test_nemotron_v3_without_thinking_returns_content(
 
     assert reasoning is None
     assert content == "This is plain content"
+
+
+def test_nemotron_v3_streaming_handles_split_end_marker(
+    tokenizer: FakeNemotronTokenizer,
+):
+    parser_cls = ReasoningParserManager.get_reasoning_parser(parser_name)
+    parser = parser_cls(tokenizer)
+
+    reasoning, content = run_reasoning_extraction(
+        parser,
+        ["This is reasoning</thi", "nk>This is content"],
+        streaming=True,
+    )
+
+    assert reasoning == "This is reasoning"
+    assert content == "This is content"
+
+
+def test_nemotron_v3_streaming_preserves_false_end_marker_prefix(
+    tokenizer: FakeNemotronTokenizer,
+):
+    parser_cls = ReasoningParserManager.get_reasoning_parser(parser_name)
+    parser = parser_cls(tokenizer)
+
+    reasoning, content = run_reasoning_extraction(
+        parser,
+        ["This is reasoning</thi", "s is not an end marker"],
+        streaming=True,
+    )
+
+    assert reasoning == "This is reasoning</this is not an end marker"
+    assert content is None
+
+
+def test_nemotron_v3_streaming_end_detection_handles_token_pieces(
+    tokenizer: FakeNemotronTokenizer,
+):
+    parser_cls = ReasoningParserManager.get_reasoning_parser(parser_name)
+    parser = parser_cls(tokenizer)
+
+    assert parser.is_reasoning_end_streaming([3, 4, 5], [5])
+    assert not parser.is_reasoning_end_streaming([3, 4], [4])
+    assert not parser.is_reasoning_end_streaming([3, 4, 5, 6], [6])
 
 
 def test_nemotron_v3_force_nonempty_content_returns_content(

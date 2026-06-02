@@ -51,7 +51,7 @@ from vllm.entrypoints.openai.responses.streaming_events import (
 )
 from vllm.inputs import tokens_input
 from vllm.outputs import CompletionOutput, RequestOutput
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 
 class MockConversationContext(ConversationContext):
@@ -202,6 +202,73 @@ def test_response_created_event_uses_public_json_schema_alias() -> None:
     assert event.response.text is not None
     assert event.response.text.format is not None
     assert event.response.text.format.model_dump(by_alias=True)["schema"] == schema
+
+
+def test_responses_structured_outputs_inject_reasoning_budget():
+    class FakeTokenizer:
+        vocab_size = 4
+
+        def encode(self, text, add_special_tokens=False):
+            if text == "</think>":
+                return [2]
+            return [3]
+
+        def decode(self, token_ids):
+            return "\n" if token_ids == [3] else "x"
+
+    class FakeReasoningParser:
+        end_token = "</think>"
+        end_token_id = 2
+
+    serving = object.__new__(OpenAIServingResponses)
+    sampling_params = SamplingParams(
+        max_tokens=512,
+        structured_outputs=StructuredOutputsParams(json={"type": "object"}),
+    )
+
+    serving._inject_think_end_token_id(
+        sampling_params,
+        ResponsesRequest(input="test"),
+        FakeTokenizer(),
+        FakeReasoningParser(),
+        {"enable_thinking": True},
+    )
+
+    assert sampling_params.extra_args is not None
+    assert sampling_params.extra_args["disable_spec_decode"] is True
+    assert sampling_params.extra_args["reasoning_budget"] == 256
+    assert sampling_params.extra_args["think_end_token_id"] == 2
+
+
+def test_response_from_request_includes_safe_compatibility_fields() -> None:
+    request = ResponsesRequest(
+        input="hello",
+        store=False,
+        stream_options={"include_obfuscation": False},
+        prompt_cache_key="responses-schema-cache",
+        prompt_cache_retention="24h",
+        safety_identifier="responses-schema-safety",
+    )
+    assert request.stream_options is not None
+    assert request.stream_options.include_obfuscation is False
+
+    response = ResponsesResponse.from_request(
+        request=request,
+        sampling_params=SamplingParams(max_tokens=16),
+        model_name="test-model",
+        created_time=123,
+        output=[],
+        status="completed",
+        usage=None,
+    ).model_dump(mode="json", by_alias=True)
+
+    assert isinstance(response["completed_at"], int)
+    assert response["conversation"] is None
+    assert response["error"] is None
+    assert response["store"] is False
+    assert response["prompt_cache_key"] == "responses-schema-cache"
+    assert response["prompt_cache_retention"] == "24h"
+    assert response["safety_identifier"] == "responses-schema-safety"
 
 
 class TestInitializeToolSessions:

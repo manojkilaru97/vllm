@@ -714,12 +714,23 @@ class DelegatingParser(Parser):
             )
             # Mark reasoning complete; if tools are active, hand off any
             # remaining content to the tool parser.
-            if self.is_reasoning_end(delta_token_ids):
+            reasoning_ended_by_token = self.is_reasoning_end(delta_token_ids)
+            end_token = getattr(self._reasoning_parser, "end_token", None)
+            reasoning_ended_by_text = (
+                isinstance(end_token, str)
+                and bool(end_token)
+                and end_token in current_text
+            )
+            if reasoning_ended_by_token or reasoning_ended_by_text:
                 state.reasoning_ended = True
                 if tool_parsing_enabled and self._tool_parser:
                     if delta_message and delta_message.reasoning:
                         reasoning_handoff_delta = delta_message.reasoning
-                    current_token_ids = self.extract_content_ids(delta_token_ids)
+                    current_token_ids = (
+                        self.extract_content_ids(delta_token_ids)
+                        if reasoning_ended_by_token
+                        else []
+                    )
                     if delta_message and delta_message.content:
                         current_text = delta_message.content
                         delta_message.content = None

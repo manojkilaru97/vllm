@@ -133,6 +133,10 @@ ResponseInputOutputMessage: TypeAlias = (
 ResponseInputOutputItem: TypeAlias = ResponseInputItemParam | ResponseOutputItem
 
 
+class ResponsesStreamOptions(OpenAIBaseModel):
+    include_obfuscation: bool | None = True
+
+
 class ResponsesRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
@@ -161,10 +165,13 @@ class ResponsesRequest(OpenAIBaseModel):
     parallel_tool_calls: bool | None = True
     previous_response_id: str | None = None
     prompt: ResponsePrompt | None = None
+    prompt_cache_retention: Literal["24h"] | None = None
     reasoning: Reasoning | None = None
+    safety_identifier: str | None = None
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] = "auto"
     store: bool | None = True
     stream: bool | None = False
+    stream_options: ResponsesStreamOptions | None = None
     temperature: float | None = None
     text: ResponseTextConfig | None = None
     tool_choice: ToolChoice = "auto"
@@ -599,7 +606,8 @@ class ResponsesRequest(OpenAIBaseModel):
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{random_uuid()}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
-    # error: Optional[ResponseError] = None
+    completed_at: int | None = None
+    error: None = None
     incomplete_details: IncompleteDetails | None = None
     instructions: str | None = None
     metadata: Metadata | None = None
@@ -612,12 +620,17 @@ class ResponsesResponse(OpenAIBaseModel):
     tools: list[Tool]
     top_p: float
     background: bool
+    conversation: None = None
     max_output_tokens: int
     max_tool_calls: int | None = None
     previous_response_id: str | None = None
     prompt: ResponsePrompt | None = None
+    prompt_cache_key: str | None = None
+    prompt_cache_retention: Literal["24h"] | None = None
     reasoning: Reasoning | None = None
+    safety_identifier: str | None = None
     service_tier: Literal["auto", "default", "flex", "scale", "priority"]
+    store: bool | None = True
     status: ResponseStatus
     text: ResponseTextConfig | None = None
     top_logprobs: int | None = None
@@ -703,6 +716,7 @@ class ResponsesResponse(OpenAIBaseModel):
         return cls(
             id=request.request_id,
             created_at=created_time,
+            completed_at=int(time.time()) if status == "completed" else None,
             incomplete_details=incomplete_details,
             instructions=request.instructions,
             metadata=request.metadata,
@@ -716,12 +730,17 @@ class ResponsesResponse(OpenAIBaseModel):
             tools=request.tools,
             top_p=sampling_params.top_p,
             background=request.background,
+            conversation=None,
             max_output_tokens=sampling_params.max_tokens,
             max_tool_calls=request.max_tool_calls,
             previous_response_id=request.previous_response_id,
             prompt=request.prompt,
+            prompt_cache_key=request.prompt_cache_key,
+            prompt_cache_retention=request.prompt_cache_retention,
             reasoning=request.reasoning,
+            safety_identifier=request.safety_identifier,
             service_tier=request.service_tier,
+            store=request.store,
             presence_penalty=sampling_params.presence_penalty,
             frequency_penalty=sampling_params.frequency_penalty,
             status=status,

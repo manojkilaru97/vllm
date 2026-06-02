@@ -33,6 +33,15 @@ async def test_raise_if_error_raises_generation_error():
     assert str(exc_info.value) == "Internal server error"
     assert exc_info.value.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
 
+    with pytest.raises(GenerationError) as exc_info:
+        serving._raise_if_error(
+            "error", "test-request-id", "structured_output_rejected"
+        )
+
+    assert "structured output grammar" in str(exc_info.value)
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST
+    assert exc_info.value.err_type == "BadRequestError"
+
     # test that other finish_reasons don't raise
     serving._raise_if_error("stop", "test-request-id")  # should not raise
     serving._raise_if_error("length", "test-request-id")  # should not raise

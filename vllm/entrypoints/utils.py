@@ -340,7 +340,7 @@ def create_error_response(
             status_code = HTTPStatus.NOT_IMPLEMENTED
             param = None
         elif isinstance(exc, GenerationError):
-            err_type = "InternalServerError"
+            err_type = exc.err_type
             status_code = exc.status_code
             param = None
         elif any(cls.__name__ == "TemplateError" for cls in type(exc).__mro__):

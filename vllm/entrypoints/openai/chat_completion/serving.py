@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import Callable
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final
@@ -73,7 +74,15 @@ from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
+from vllm.payload_logging import log_payload, log_payload_lazy
 from vllm.payload_sanitization import prepare_request_payload_for_logging
+from vllm.payload_suppression import (
+    build_suppressed_request_payload,
+    build_suppressed_response_payload,
+    payload_suppression_context_for_request_id,
+    register_request_logging_context,
+    request_logging_context_from_headers,
+)
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
@@ -411,75 +420,164 @@ class OpenAIServingChat(OpenAIServing):
         raw_request: Request | None,
         rid: str,
     ) -> None:
-        if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
-            return
         headers_obj = None
         if raw_request is not None:
             try:
                 headers_obj = {k: v for k, v in raw_request.headers.items()}
             except Exception:
                 headers_obj = None
-        payload: dict[str, Any] | None = None
+        request_context = register_request_logging_context(
+            rid,
+            request_logging_context_from_headers(
+                headers_obj,
+                model=request.model,
+                stream=bool(request.stream),
+            ),
+        )
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
+            return
+        suppression_context = payload_suppression_context_for_request_id(rid)
+        if suppression_context is not None:
+            tools = getattr(request, "tools", None)
+            tool_count = len(tools) if isinstance(tools, list) else 0
+            structured_output_kind = getattr(request, "structured_output_kind", None)
+            log_payload(
+                payload_logger,
+                "openai.request",
+                extra={
+                    "rid": rid,
+                    "endpoint": self.__class__.__name__,
+                    "input_image_count": 0,
+                    "input_video_count": 0,
+                    "input_audio_count": 0,
+                    "input_tool_count": tool_count,
+                    "has_images": False,
+                    "has_videos": False,
+                    "has_audios": False,
+                    "has_tools": tool_count > 0,
+                    "has_tool_calls_enabled": bool(getattr(request, "tools", None)),
+                    "has_structured_output": structured_output_kind is not None,
+                    "payload_suppressed": request_context.payload_suppressed,
+                    "suppression_reason": suppression_context.reason,
+                    "nca_id": suppression_context.nca_id,
+                    **(
+                        {"structured_output_kind": structured_output_kind}
+                        if structured_output_kind is not None
+                        else {}
+                    ),
+                    "payload": build_suppressed_request_payload(
+                        request, suppression_context
+                    ),
+                },
+            )
+            return
+        body = b""
         if raw_request is not None:
             try:
                 body = await raw_request.body()
-                payload = json.loads(body) if body else None
             except Exception:
-                payload = None
-        if payload is None:
-            try:
-                payload = request.model_dump(mode="json")
-            except Exception:
-                payload = None
+                body = b""
         try:
             allowed_local_media_path = (
                 self.openai_serving_render.model_config.allowed_local_media_path
             )
         except Exception:
             allowed_local_media_path = ""
-        try:
-            summary = summarize_request_payload(payload)
-            payload_logger.info(
-                "openai.request",
-                extra={
-                    "rid": rid,
-                    "endpoint": self.__class__.__name__,
-                    "input_image_count": summary.image_count,
-                    "input_video_count": summary.video_count,
-                    "input_audio_count": summary.audio_count,
-                    "input_tool_count": summary.tool_count,
-                    "has_images": summary.has_images,
-                    "has_videos": summary.has_videos,
-                    "has_audios": summary.has_audios,
-                    "has_tools": summary.has_tools,
-                    "has_tool_calls_enabled": summary.has_tool_calls_enabled,
-                    "has_structured_output": summary.has_structured_output,
-                    **(
-                        {"tool_choice": summary.tool_choice}
-                        if summary.tool_choice is not None
-                        else {}
-                    ),
-                    **(
-                        {"structured_output_kind": summary.structured_output_kind}
-                        if summary.structured_output_kind is not None
-                        else {}
-                    ),
-                    "payload": prepare_request_payload_for_logging(
-                        payload,
-                        headers=headers_obj,
-                        allowed_local_media_path=allowed_local_media_path,
-                    ),
-                    "headers": headers_obj,
-                },
-            )
-        except Exception:
-            logger.exception("Failed to log openai.request rid=%s", rid)
+        endpoint = self.__class__.__name__
 
-    def _log_chat_response_payload(self, rid: str, payload: dict[str, Any]) -> None:
+        def build_extra() -> dict[str, Any] | None:
+            payload: dict[str, Any] | None = None
+            if body:
+                try:
+                    payload = json.loads(body)
+                except Exception:
+                    payload = None
+            if payload is None:
+                try:
+                    payload = request.model_dump(mode="json")
+                except Exception:
+                    payload = None
+            if payload is None:
+                return None
+            summary = summarize_request_payload(payload)
+            return {
+                "rid": rid,
+                "endpoint": endpoint,
+                "input_image_count": summary.image_count,
+                "input_video_count": summary.video_count,
+                "input_audio_count": summary.audio_count,
+                "input_tool_count": summary.tool_count,
+                "has_images": summary.has_images,
+                "has_videos": summary.has_videos,
+                "has_audios": summary.has_audios,
+                "has_tools": summary.has_tools,
+                "has_tool_calls_enabled": summary.has_tool_calls_enabled,
+                "has_structured_output": summary.has_structured_output,
+                **(
+                    {"tool_choice": summary.tool_choice}
+                    if summary.tool_choice is not None
+                    else {}
+                ),
+                **(
+                    {"structured_output_kind": summary.structured_output_kind}
+                    if summary.structured_output_kind is not None
+                    else {}
+                ),
+                "payload": prepare_request_payload_for_logging(
+                    payload,
+                    headers=headers_obj,
+                    allowed_local_media_path=allowed_local_media_path,
+                ),
+                "headers": headers_obj,
+            }
+
+        log_payload_lazy(payload_logger, "openai.request", build_extra=build_extra)
+
+    def _log_chat_response_payload(
+        self,
+        rid: str,
+        payload: dict[str, Any] | Callable[[], dict[str, Any]],
+    ) -> None:
         if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
             return
         try:
-            payload_logger.info(
+            suppression_context = payload_suppression_context_for_request_id(rid)
+            if suppression_context is not None:
+                safe_payload = (
+                    build_suppressed_response_payload(None, suppression_context)
+                    if callable(payload)
+                    else build_suppressed_response_payload(
+                        payload, suppression_context
+                    )
+                )
+                log_payload(
+                    payload_logger,
+                    "openai.response",
+                    extra={
+                        "rid": rid,
+                        "request_id": rid,
+                        "endpoint": self.__class__.__name__,
+                        "payload_suppressed": True,
+                        "suppression_reason": suppression_context.reason,
+                        "nca_id": suppression_context.nca_id,
+                        "payload": safe_payload,
+                    },
+                )
+                return
+            if callable(payload):
+                log_payload_lazy(
+                    payload_logger,
+                    "openai.response",
+                    build_extra=lambda: {
+                        "rid": rid,
+                        "request_id": rid,
+                        "endpoint": self.__class__.__name__,
+                        "payload": payload(),
+                    },
+                )
+                return
+            log_payload(
+                payload_logger,
                 "openai.response",
                 extra={
                     "rid": rid,
@@ -760,7 +858,6 @@ class OpenAIServingChat(OpenAIServing):
         streamed_tool_calls: list[dict[int, dict[str, Any]]] = [
             {} for _ in range(num_choices)
         ]
-
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
         if (
@@ -1022,6 +1119,12 @@ class OpenAIServingChat(OpenAIServing):
                             )
                         )
                         harmony_tools_streamed[i] |= tools_streamed_flag
+                    elif thinking_disabled and not request.tools:
+                        # Thinking-disabled requests should stream plain content
+                        # immediately; the reasoning parser would otherwise
+                        # wait for a </think> marker that this template mode
+                        # intentionally does not emit.
+                        delta_message = DeltaMessage(content=delta_text)
                     # Mistral grammar path: combined reasoning + tool streaming
                     elif is_mistral_grammar_path:
                         from vllm.tool_parsers.mistral_tool_parser import (
@@ -1192,7 +1295,9 @@ class OpenAIServingChat(OpenAIServing):
                     else:
                         # check for error finish reason and abort streaming
                         # finish_reason='error' indicates a retryable error
-                        self._raise_if_error(output.finish_reason, request_id)
+                        self._raise_if_error(
+                            output.finish_reason, request_id, output.stop_reason
+                        )
 
                         # check to make sure we haven't "forgotten" to stream
                         #   any tokens that were generated but previously
@@ -1582,36 +1687,48 @@ class OpenAIServingChat(OpenAIServing):
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
 
-            choices_list = []
-            for i in range(num_choices):
-                tool_calls = [
-                    streamed_tool_calls[i][idx]
-                    for idx in sorted(streamed_tool_calls[i])
-                    if streamed_tool_calls[i][idx].get("function", {}).get("name")
-                    or streamed_tool_calls[i][idx].get("function", {}).get(
-                        "arguments"
-                    )
-                ]
-                message: dict[str, Any] = {
-                    "role": self.get_chat_request_role(request),
-                }
-                if streamed_content_texts[i] or not tool_calls:
-                    message["content"] = streamed_content_texts[i] or ""
-                if streamed_reasoning_texts[i]:
-                    message["reasoning_content"] = streamed_reasoning_texts[i]
-                if tool_calls:
-                    message["tool_calls"] = tool_calls
-                choices_list.append(
-                    {
-                        "index": i,
-                        "message": message,
-                        "finish_reason": final_finish_reasons[i] or "stop",
-                    }
-                )
-            self._log_chat_response_payload(
+            log_rid = (
                 request_id[len("chatcmpl-") :]
                 if request_id.startswith("chatcmpl-")
-                else request_id,
+                else request_id
+            )
+            if payload_suppression_context_for_request_id(log_rid) is not None:
+                choices_list = [
+                    {
+                        "index": i,
+                        "finish_reason": final_finish_reasons[i] or "stop",
+                    }
+                    for i in range(num_choices)
+                ]
+            else:
+                choices_list = []
+                for i in range(num_choices):
+                    tool_calls = [
+                        streamed_tool_calls[i][idx]
+                        for idx in sorted(streamed_tool_calls[i])
+                        if streamed_tool_calls[i][idx].get("function", {}).get("name")
+                        or streamed_tool_calls[i][idx].get("function", {}).get(
+                            "arguments"
+                        )
+                    ]
+                    message: dict[str, Any] = {
+                        "role": self.get_chat_request_role(request),
+                    }
+                    if streamed_content_texts[i] or not tool_calls:
+                        message["content"] = streamed_content_texts[i] or ""
+                    if streamed_reasoning_texts[i]:
+                        message["reasoning_content"] = streamed_reasoning_texts[i]
+                    if tool_calls:
+                        message["tool_calls"] = tool_calls
+                    choices_list.append(
+                        {
+                            "index": i,
+                            "message": message,
+                            "finish_reason": final_finish_reasons[i] or "stop",
+                        }
+                    )
+            self._log_chat_response_payload(
+                log_rid,
                 {
                     "id": request_id,
                     "object": "chat.completion",
@@ -1625,21 +1742,31 @@ class OpenAIServingChat(OpenAIServing):
 
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
-                # Log the complete response for each choice
-                for i in range(num_choices):
-                    full_text = (
-                        previous_texts[i]
-                        if previous_texts and i < len(previous_texts)
-                        else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
-                    )
+                if payload_suppression_context_for_request_id(request_id) is not None:
                     self.request_logger.log_outputs(
                         request_id=request_id,
-                        outputs=full_text,
-                        output_token_ids=None,  # Consider also logging all token IDs
+                        outputs="",
+                        output_token_ids=None,
                         finish_reason="streaming_complete",
                         is_streaming=True,
                         delta=False,
                     )
+                else:
+                    # Log the complete response for each choice
+                    for i in range(num_choices):
+                        full_text = (
+                            previous_texts[i]
+                            if previous_texts and i < len(previous_texts)
+                            else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=full_text,
+                            output_token_ids=None,  # Consider also logging all token IDs
+                            finish_reason="streaming_complete",
+                            is_streaming=True,
+                            delta=False,
+                        )
 
         except (asyncio.CancelledError, GeneratorExit):
             record_aborted_request()
@@ -1690,7 +1817,9 @@ class OpenAIServingChat(OpenAIServing):
         for output in final_res.outputs:
             # check for error finish reason and raise GenerationError
             # finish_reason='error' indicates a retryable request-level internal error
-            self._raise_if_error(output.finish_reason, request_id)
+            self._raise_if_error(
+                output.finish_reason, request_id, output.stop_reason
+            )
             token_ids = output.token_ids
             _log_raw_chat_generation_debug(
                 request_id,
@@ -2058,16 +2187,45 @@ class OpenAIServingChat(OpenAIServing):
             kv_transfer_params=final_res.kv_transfer_params,
             prompt_routed_experts=prompt_routed_experts,
         )
-        self._log_chat_response_payload(
+        log_rid = (
             request_id[len("chatcmpl-") :]
             if request_id.startswith("chatcmpl-")
-            else request_id,
-            response.model_dump(),
+            else request_id
         )
+        if payload_suppression_context_for_request_id(log_rid) is not None:
+            response_payload = {
+                "id": request_id,
+                "object": "chat.completion",
+                "created": created_time,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": choice.index,
+                        "finish_reason": choice.finish_reason,
+                    }
+                    for choice in choices
+                ],
+                "usage": usage.model_dump(),
+            }
+        else:
+            response_payload = response.model_dump
+        self._log_chat_response_payload(log_rid, response_payload)
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
-            for choice in choices:
+            log_suppressed = (
+                payload_suppression_context_for_request_id(request_id) is not None
+            )
+            if log_suppressed:
+                self.request_logger.log_outputs(
+                    request_id=request_id,
+                    outputs="",
+                    output_token_ids=None,
+                    finish_reason=choices[0].finish_reason if choices else None,
+                    is_streaming=False,
+                    delta=False,
+                )
+            for choice in [] if log_suppressed else choices:
                 output_text = ""
                 if choice.message.content:
                     output_text = choice.message.content

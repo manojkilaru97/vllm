@@ -1365,17 +1365,18 @@ class Scheduler(SchedulerInterface):
                 ):
                     logger.warning(
                         "Unexpected: grammar rejected tokens %s for request %s. "
-                        "Stopping at the last accepted prefix.",
+                        "Failing the request at the last accepted prefix.",
                         new_token_ids,
                         req_id,
                     )
                     # The sampled token was already appended before grammar
-                    # validation. Do not emit it to the client; finish with the
-                    # last accepted prefix instead of surfacing a retryable
-                    # internal error as HTTP 500.
+                    # validation. Do not emit it to the client; structured
+                    # output must fail closed instead of returning truncated or
+                    # invalid content with finish_reason="stop".
                     request.trim_output_token_ids(len(new_token_ids))
                     new_token_ids = []
-                    request.status = RequestStatus.FINISHED_STOPPED
+                    request.status = RequestStatus.FINISHED_ERROR
+                    request.stop_reason = "structured_output_rejected"
                     request.resumable = False
                     stopped = True
 

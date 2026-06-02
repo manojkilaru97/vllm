@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from concurrent.futures import Future
+from unittest.mock import MagicMock
 
 import pytest
+import torch
 from transformers import AutoTokenizer
 
 from vllm.config import StructuredOutputsConfig, VllmConfig
@@ -16,6 +18,7 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.structured_output.backend_guidance import GuidanceBackend
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
+from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
 
 TOKENIZER = "gpt2"
 
@@ -127,6 +130,36 @@ def test_grammar_bitmask_with_specdec():
         )  # EOS not the final token
         grammar_bitmask(request, prompt[i:])  # EOS not present
         grammar_bitmask(request, prompt[i:] + [tokenizer.eos_token_id])
+
+
+def test_guidance_compatibility_check_does_not_touch_live_bitmask():
+    manager = object.__new__(StructuredOutputManager)
+    manager._grammar_bitmask = torch.full((1, 2), -1, dtype=torch.int32)
+
+    manager_backend = object.__new__(XgrammarBackend)
+    manager_backend.allocate_token_bitmask = MagicMock(
+        return_value=torch.zeros((1, 2), dtype=torch.int32)
+    )
+    manager.backend = manager_backend
+
+    guidance_backend = MagicMock()
+    guidance_backend.allocate_token_bitmask.return_value = torch.zeros(
+        (1, 2), dtype=torch.int32
+    )
+
+    grammar = MagicMock()
+
+    def fill_bitmask(mask, index):
+        assert index == 0
+        mask.fill_(7)
+
+    grammar.fill_bitmask.side_effect = fill_bitmask
+
+    manager._check_guidance_bitmask_compatibility(guidance_backend, grammar)
+
+    manager_backend.allocate_token_bitmask.assert_called_once_with(1)
+    grammar.fill_bitmask.assert_called_once()
+    assert manager._grammar_bitmask.tolist() == [[-1, -1]]
 
 
 @pytest.mark.parametrize("async_grammar", [True, False])
