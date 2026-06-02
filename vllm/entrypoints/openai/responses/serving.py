@@ -123,6 +123,7 @@ from vllm.payload_suppression import (
 from vllm.reasoning import ReasoningParser
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.detokenizer_utils import decode_token_ids_if_utf8_complete
 from vllm.tool_parsers import ToolParser
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
@@ -1773,7 +1774,8 @@ class OpenAIServingResponses(OpenAIServing):
             delta_text = output.text
             delta_token_ids = as_list(output.token_ids)
             if not delta_text and delta_token_ids:
-                delta_text = tokenizer.decode(
+                delta_text = decode_token_ids_if_utf8_complete(
+                    tokenizer,
                     delta_token_ids,
                     skip_special_tokens=True,
                 )

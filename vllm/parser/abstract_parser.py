@@ -37,6 +37,7 @@ from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.detokenizer_utils import decode_token_ids_if_utf8_complete
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 from vllm.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
@@ -690,8 +691,10 @@ class DelegatingParser(Parser):
         if reasoning_disabled:
             state.reasoning_ended = True
         if state.reasoning_ended and not delta_text and delta_token_ids:
-            delta_text = self.model_tokenizer.decode(
-                delta_token_ids, skip_special_tokens=True
+            delta_text = decode_token_ids_if_utf8_complete(
+                self.model_tokenizer,
+                list(delta_token_ids),
+                skip_special_tokens=True,
             )
 
         current_text = state.previous_text + delta_text
