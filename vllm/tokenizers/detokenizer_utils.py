@@ -4,6 +4,8 @@
 
 from vllm.tokenizers import TokenizerLike
 
+UNICODE_REPLACEMENT_CHAR = "\ufffd"
+
 
 def _replace_none_with_empty(tokens: list[str | None]):
     for i, token in enumerate(tokens):
@@ -102,6 +104,30 @@ def convert_ids_list_to_tokens(
             token_str = ""
         token_str_lst.append(token_str)
     return token_str_lst
+
+
+def decode_token_ids_if_utf8_complete(
+    tokenizer: TokenizerLike,
+    token_ids: list[int],
+    skip_special_tokens: bool = True,
+) -> str:
+    """Decode token IDs only when fallback decoding is UTF-8-safe.
+
+    Streaming detokenization can legitimately return an empty text delta for
+    byte-fallback token pieces until a complete Unicode scalar is available.
+    Decoding those individual token IDs with the tokenizer may produce U+FFFD,
+    which would permanently corrupt the SSE stream. In that case, keep the text
+    empty and let the incremental detokenizer emit the complete character later.
+    """
+    if not token_ids:
+        return ""
+    decoded = tokenizer.decode(
+        token_ids,
+        skip_special_tokens=skip_special_tokens,
+    )
+    if decoded is None or UNICODE_REPLACEMENT_CHAR in decoded:
+        return ""
+    return decoded
 
 
 # Based on
