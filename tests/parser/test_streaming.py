@@ -102,6 +102,28 @@ def request_obj():
     )
 
 
+@pytest.fixture
+def tool_request_obj():
+    return ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+
+
 def make_parser(tokenizer, reasoning=False, tool=False):
     class TestParser(DelegatingParser):
         reasoning_parser_cls = ThinkReasoningParser if reasoning else None
@@ -149,10 +171,10 @@ def test_parse_delta_neither_parser(tokenizer, request_obj):
     assert "get_weather" in content
 
 
-def test_parse_delta_tool_parser_only(tokenizer, request_obj):
+def test_parse_delta_tool_parser_only(tokenizer, tool_request_obj):
     parser = make_parser(tokenizer, reasoning=False, tool=True)
     results = stream_text(
-        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
+        parser, tokenizer, MODEL_OUTPUT, tool_request_obj, prompt_token_ids=[]
     )
     reasoning, content, tool_calls = collect_fields(results)
 
@@ -183,10 +205,10 @@ def test_parse_delta_reasoning_parser_only(tokenizer, request_obj):
     assert "</tool_call>" in content
 
 
-def test_parse_delta_both_parsers(tokenizer, request_obj):
+def test_parse_delta_both_parsers(tokenizer, tool_request_obj):
     parser = make_parser(tokenizer, reasoning=True, tool=True)
     results = stream_text(
-        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
+        parser, tokenizer, MODEL_OUTPUT, tool_request_obj, prompt_token_ids=[]
     )
     reasoning, content, tool_calls = collect_fields(results)
 
@@ -231,12 +253,12 @@ def _boundary_chunks(tokenizer, parser):
     ]
 
 
-def test_parse_delta_reasoning_not_dropped_on_boundary(tokenizer, request_obj):
+def test_parse_delta_reasoning_not_dropped_on_boundary(tokenizer, tool_request_obj):
     """Regression: reasoning must not be lost when a multi-token delta
     spans the reasoning/tool-call boundary."""
     parser = make_parser(tokenizer, reasoning=True, tool=True)
     chunks = _boundary_chunks(tokenizer, parser)
-    results = stream_chunks(parser, tokenizer, chunks, request_obj)
+    results = stream_chunks(parser, tokenizer, chunks, tool_request_obj)
     reasoning, content, tool_calls = collect_fields(results)
 
     assert "think about this" in reasoning
@@ -261,6 +283,46 @@ def test_parse_delta_reasoning_boundary_no_tool_parser(tokenizer, request_obj):
     assert len(tool_calls) == 0
     assert "<tool_call>" in content
     assert "get_weather" in content
+
+
+def test_parse_delta_tool_parser_configured_without_tools_keeps_content(
+    tokenizer, request_obj
+):
+    """A configured server tool parser must not consume plain content when
+    the request did not enable tool parsing."""
+    parser = make_parser(tokenizer, reasoning=True, tool=True)
+    chunks = _boundary_chunks(tokenizer, parser)
+    results = stream_chunks(parser, tokenizer, chunks, request_obj)
+    reasoning, content, tool_calls = collect_fields(results)
+
+    assert "think about this" in reasoning
+    assert len(tool_calls) == 0
+    assert "<tool_call>" in content
+    assert "get_weather" in content
+    assert "</tool_call>" in content
+
+
+def test_parse_delta_tool_choice_none_keeps_post_reasoning_content(
+    tokenizer, tool_request_obj
+):
+    """tools + tool_choice='none' disables tool parsing for this request; any
+    text after </think> is ordinary assistant content."""
+    request = ChatCompletionRequest(
+        model=tool_request_obj.model,
+        messages=tool_request_obj.messages,
+        tools=tool_request_obj.tools,
+        tool_choice="none",
+    )
+    parser = make_parser(tokenizer, reasoning=True, tool=True)
+    chunks = _boundary_chunks(tokenizer, parser)
+    results = stream_chunks(parser, tokenizer, chunks, request)
+    reasoning, content, tool_calls = collect_fields(results)
+
+    assert "think about this" in reasoning
+    assert len(tool_calls) == 0
+    assert "<tool_call>" in content
+    assert "get_weather" in content
+    assert "</tool_call>" in content
 
 
 def test_parse_delta_reasoning_only_no_think_leak(tokenizer, request_obj):
