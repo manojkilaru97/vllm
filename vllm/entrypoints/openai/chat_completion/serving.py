@@ -1464,14 +1464,20 @@ class OpenAIServingChat(OpenAIServing):
                             delta_message.content = current_text
                             delta_message.reasoning = None
                         elif (
-                            not request.tools
-                            and request.include_reasoning
+                            request.include_reasoning
                             and not streamed_content_texts[i]
                             and not delta_message.content
+                            and not delta_message.tool_calls
+                            and not tools_streamed[i]
+                            and not (
+                                self.use_harmony and harmony_tools_streamed[i]
+                            )
                         ):
                             # If the model stops before </think>, expose the
                             # reasoning text as content instead of returning an
-                            # effectively empty answer.
+                            # effectively empty answer. This applies even when
+                            # tools were available, but only if no tool call was
+                            # actually emitted.
                             pending_reasoning = streamed_reasoning_texts[i] + (
                                 delta_message.reasoning or ""
                             )
