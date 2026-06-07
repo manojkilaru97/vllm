@@ -1810,6 +1810,9 @@ class OpenAIServingChat(OpenAIServing):
                 final_res = res
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        except (ValueError, TypeError, RuntimeError) as e:
+            logger.exception("Error in chat completion full generator.")
+            return self.create_error_response(e)
 
         if final_res is None:
             return self.create_error_response(
