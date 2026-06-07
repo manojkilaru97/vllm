@@ -1100,6 +1100,16 @@ class OpenAIServingChat(OpenAIServing):
                                     content_delta = current_content[
                                         len(previous_content) :
                                     ]
+                                    strip_boundary_content = getattr(
+                                        reasoning_parser,
+                                        "strip_reasoning_boundary_content",
+                                        None,
+                                    )
+                                    if callable(strip_boundary_content):
+                                        content_delta = strip_boundary_content(
+                                            previous_content,
+                                            content_delta,
+                                        )
                                     if content_delta:
                                         if delta_message is None:
                                             delta_message = DeltaMessage()

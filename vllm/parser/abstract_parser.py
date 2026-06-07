@@ -797,6 +797,17 @@ class DelegatingParser(Parser):
                 list(delta_token_ids),
                 skip_special_tokens=True,
             )
+        if state.reasoning_ended and self._reasoning_parser is not None:
+            strip_boundary_content = getattr(
+                self._reasoning_parser,
+                "strip_reasoning_boundary_content",
+                None,
+            )
+            if callable(strip_boundary_content):
+                delta_text = strip_boundary_content(
+                    state.previous_text,
+                    delta_text,
+                )
 
         current_text, current_token_ids = state.advance(delta_text, delta_token_ids)
         delta_message: DeltaMessage | None = None

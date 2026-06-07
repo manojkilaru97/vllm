@@ -43,6 +43,12 @@ class TestChatCompletionReasoningEffort:
         request = _build_chat_request(reasoning_effort=effort)
         params = request.build_chat_params(None, "auto")
         assert params.chat_template_kwargs["enable_thinking"] is True
+        if effort in ("low", "medium"):
+            assert params.chat_template_kwargs["low_effort"] is True
+            assert params.chat_template_kwargs["medium_effort"] is True
+        else:
+            assert "low_effort" not in params.chat_template_kwargs
+            assert "medium_effort" not in params.chat_template_kwargs
 
     def test_none_effort_injects_enable_thinking_false(self):
         request = _build_chat_request(reasoning_effort="none")
@@ -78,6 +84,12 @@ class TestResponsesReasoningEffort:
         )
         params = request.build_chat_params(None, "auto")
         assert params.chat_template_kwargs["enable_thinking"] is True
+        if effort in ("low", "medium"):
+            assert params.chat_template_kwargs["low_effort"] is True
+            assert params.chat_template_kwargs["medium_effort"] is True
+        else:
+            assert "low_effort" not in params.chat_template_kwargs
+            assert "medium_effort" not in params.chat_template_kwargs
 
     def test_none_effort_injects_enable_thinking_false(self):
         request = _build_responses_request(

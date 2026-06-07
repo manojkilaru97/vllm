@@ -311,6 +311,7 @@ class ResponsesRequest(OpenAIBaseModel):
             reasoning_kwargs["enable_thinking"] = False
         elif reasoning_effort in ("minimal", "low", "medium"):
             reasoning_kwargs["enable_thinking"] = True
+            reasoning_kwargs["low_effort"] = True
             reasoning_kwargs["medium_effort"] = True
         elif reasoning_effort in ("high", "xhigh", "max"):
             reasoning_kwargs["enable_thinking"] = True

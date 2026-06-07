@@ -73,6 +73,16 @@ class ParserEngineReasoningAdapter(ReasoningParser):
             except Exception:
                 return ""
 
+    def strip_reasoning_boundary_content(
+        self, previous_content: str, content_delta: str
+    ) -> str:
+        end_marker = self._parser_engine.reasoning_end_str
+        if end_marker and end_marker in content_delta:
+            _, _, content_delta = content_delta.rpartition(end_marker)
+        if not previous_content or not previous_content.lstrip("\n"):
+            content_delta = content_delta.lstrip("\n")
+        return content_delta
+
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Sequence[int]
     ) -> bool:
