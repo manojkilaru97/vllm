@@ -1191,6 +1191,16 @@ class OpenAIServingChat(OpenAIServing):
                                     content_delta = current_content[
                                         len(previous_content) :
                                     ]
+                                    strip_boundary_content = getattr(
+                                        reasoning_parser,
+                                        "strip_reasoning_boundary_content",
+                                        None,
+                                    )
+                                    if callable(strip_boundary_content):
+                                        content_delta = strip_boundary_content(
+                                            previous_content,
+                                            content_delta,
+                                        )
                                     if content_delta:
                                         if delta_message is None:
                                             delta_message = DeltaMessage()
@@ -1948,6 +1958,12 @@ class OpenAIServingChat(OpenAIServing):
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
             )
+            if (
+                reasoning
+                and (content is None or not content.strip())
+                and not tool_calls
+            ):
+                content = reasoning
             if is_mistral_tokenizer(tokenizer):
                 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 

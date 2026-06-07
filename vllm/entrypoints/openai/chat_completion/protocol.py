@@ -630,6 +630,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             request_chat_template_kwargs.setdefault("enable_thinking", False)
         elif effective_reasoning_effort in ("minimal", "low", "medium"):
             request_chat_template_kwargs.setdefault("enable_thinking", True)
+            request_chat_template_kwargs.setdefault("low_effort", True)
             request_chat_template_kwargs.setdefault("medium_effort", True)
         elif effective_reasoning_effort in ("high", "xhigh", "max"):
             request_chat_template_kwargs.setdefault("enable_thinking", True)

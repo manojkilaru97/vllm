@@ -156,6 +156,64 @@ def test_nemotron_v3_streaming_handles_split_end_marker(
     assert content == "This is content"
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_nemotron_v3_strips_post_think_separator_newlines(
+    tokenizer: FakeNemotronTokenizer,
+    streaming: bool,
+):
+    parser_cls = ReasoningParserManager.get_reasoning_parser(parser_name)
+    parser = parser_cls(tokenizer)
+
+    reasoning, content = run_reasoning_extraction(
+        parser,
+        (
+            ["This is reasoning</think>\n\nThis is content"]
+            if not streaming
+            else ["This is reasoning", "</think>\n\nThis is content"]
+        ),
+        streaming=streaming,
+    )
+
+    assert reasoning == "This is reasoning"
+    assert content == "This is content"
+
+
+def test_nemotron_v3_streaming_strips_split_post_think_newlines(
+    tokenizer: FakeNemotronTokenizer,
+):
+    parser_cls = ReasoningParserManager.get_reasoning_parser(parser_name)
+    parser = parser_cls(tokenizer)
+
+    reasoning, content = run_reasoning_extraction(
+        parser,
+        ["This is reasoning</think>", "\n", "\nThis is content"],
+        streaming=True,
+    )
+
+    assert reasoning == "This is reasoning"
+    assert content == "This is content"
+
+
+def test_nemotron_v3_streaming_drops_replayed_end_marker_from_content(
+    tokenizer: FakeNemotronTokenizer,
+):
+    parser_cls = ReasoningParserManager.get_reasoning_parser(parser_name)
+    parser = parser_cls(tokenizer)
+
+    delta = parser.extract_reasoning_streaming(
+        previous_text="This is reasoning</think>",
+        current_text="This is reasoning</think></think>\n\nThis is content",
+        delta_text="</think>\n\nThis is content",
+        previous_token_ids=[2],
+        current_token_ids=[2, 2],
+        delta_token_ids=[2],
+    )
+
+    assert delta is not None
+    assert delta.reasoning is None
+    assert delta.content == "This is content"
+
+
 def test_nemotron_v3_streaming_preserves_false_end_marker_prefix(
     tokenizer: FakeNemotronTokenizer,
 ):
@@ -201,11 +259,11 @@ def test_nemotron_v3_force_nonempty_content_returns_content(
         streaming=False,
     )
 
-    assert reasoning is None
+    assert reasoning == "This is plain content"
     assert content == "This is plain content"
 
 
-def test_nemotron_v3_with_thinking_keeps_truncated_reasoning(
+def test_nemotron_v3_with_thinking_replays_truncated_reasoning_as_content(
     tokenizer: FakeNemotronTokenizer,
 ):
     parser_cls = ReasoningParserManager.get_reasoning_parser(parser_name)
@@ -224,4 +282,4 @@ def test_nemotron_v3_with_thinking_keeps_truncated_reasoning(
     )
 
     assert reasoning == "This is truncated reasoning"
-    assert content is None
+    assert content == "This is truncated reasoning"

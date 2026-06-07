@@ -38,6 +38,15 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
             except Exception:
                 return ""
 
+    def strip_reasoning_boundary_content(
+        self, previous_content: str, content_delta: str
+    ) -> str:
+        if self.end_token in content_delta:
+            _, _, content_delta = content_delta.rpartition(self.end_token)
+        if not previous_content or not previous_content.lstrip("\n"):
+            content_delta = content_delta.lstrip("\n")
+        return content_delta
+
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
@@ -69,10 +78,16 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
         # token ID in the same streaming delta. Fall back to text markers so the
         # final answer is not swallowed as reasoning.
         if self.end_token in previous_text:
+            previous_content = previous_text.rpartition(self.end_token)[2]
             if self.end_token in delta_text:
-                _, _, content = delta_text.rpartition(self.end_token)
+                content = self.strip_reasoning_boundary_content(
+                    previous_content, delta_text
+                )
                 return DeltaMessage(content=content or None)
-            return DeltaMessage(content=delta_text) if delta_text else None
+            content = self.strip_reasoning_boundary_content(
+                previous_content, delta_text
+            )
+            return DeltaMessage(content=content) if content else None
         if self.end_token in current_text:
             reasoning, _, content = current_text.rpartition(self.end_token)
             if self.start_token in reasoning:
@@ -81,6 +96,9 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
                 self._end_token_prefix_suffix_len(previous_text)
             )
             reasoning = reasoning[previous_reasoning_len:]
+            content = self.strip_reasoning_boundary_content("", content)
+            if not reasoning and not content:
+                return None
             return DeltaMessage(
                 reasoning=reasoning or None,
                 content=content or None,
@@ -97,7 +115,7 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
                 reasoning = reasoning[:-current_suffix_len]
             return DeltaMessage(reasoning=reasoning or None)
 
-        return super().extract_reasoning_streaming(
+        ret = super().extract_reasoning_streaming(
             previous_text,
             current_text,
             delta_text,
@@ -105,6 +123,14 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
             current_token_ids,
             delta_token_ids,
         )
+        if ret and ret.content:
+            previous_content = ""
+            if self.end_token in previous_text:
+                previous_content = previous_text.rpartition(self.end_token)[2]
+            ret.content = self.strip_reasoning_boundary_content(
+                previous_content, ret.content
+            ) or None
+        return ret
 
     def extract_reasoning(
         self, model_output: str, request: ChatCompletionRequest | ResponsesRequest
@@ -129,5 +155,9 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
         if final_content and self.end_token in final_content:
             _, _, final_content = final_content.rpartition(self.end_token)
             final_content = final_content or None
+        if final_content and self.end_token in model_output:
+            final_content = (
+                self.strip_reasoning_boundary_content("", final_content) or None
+            )
 
         return reasoning, final_content
