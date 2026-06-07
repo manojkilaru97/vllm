@@ -172,7 +172,11 @@ def find_tool_properties(
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
     params = (
-        bound_json_schema_for_constrained_decoding(params)
+        bound_json_schema_for_constrained_decoding(
+            params,
+            strict_object_properties=True,
+            strict_object_properties_min_depth=1,
+        )
         if params
         else {"type": "object", "properties": {}}
     )
@@ -237,7 +241,8 @@ def get_json_schema_from_tools(
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
         return bound_json_schema_for_constrained_decoding(
-            tool_map[tool_name].parameters
+            tool_map[tool_name].parameters,
+            strict_object_properties=True,
         )
     # tool_choice: Forced Function (ChatCompletion)
     if (not isinstance(tool_choice, str)) and isinstance(
@@ -252,7 +257,8 @@ def get_json_schema_from_tools(
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
         return bound_json_schema_for_constrained_decoding(
-            tool_map[tool_name].function.parameters
+            tool_map[tool_name].function.parameters,
+            strict_object_properties=True,
         )
     # tool_choice: "required"
     if tool_choice == "required":

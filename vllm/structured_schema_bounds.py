@@ -15,15 +15,35 @@ _STRING_CONSTRAINT_KEYS = {
 }
 
 
-def bound_json_schema_for_constrained_decoding(schema: Any) -> Any:
+def bound_json_schema_for_constrained_decoding(
+    schema: Any,
+    *,
+    strict_object_properties: bool = False,
+    strict_object_properties_min_depth: int = 0,
+    _depth: int = 0,
+) -> Any:
     """Add finite bounds to JSON schemas before constrained decoding.
 
     Unbounded strings and arrays are valid JSON Schema, but they create a very
     large language for grammar-constrained decoding and can let a model generate
     until max_tokens. Explicit caller-provided bounds are preserved.
+
+    Some tool schemas omit additionalProperties on nested objects. For tool
+    calling, closing those nested objects makes constrained decoding less likely
+    to drift into invalid mixed Python/JSON fragments while preserving explicit
+    caller settings.
     """
+    min_depth = strict_object_properties_min_depth
     if isinstance(schema, list):
-        return [bound_json_schema_for_constrained_decoding(item) for item in schema]
+        return [
+            bound_json_schema_for_constrained_decoding(
+                item,
+                strict_object_properties=strict_object_properties,
+                strict_object_properties_min_depth=min_depth,
+                _depth=_depth,
+            )
+            for item in schema
+        ]
     if not isinstance(schema, dict):
         return schema
 
@@ -41,19 +61,37 @@ def bound_json_schema_for_constrained_decoding(schema: Any) -> Any:
             if _is_tool_call_array_schema(bounded)
             else DEFAULT_SCHEMA_MAX_ARRAY_ITEMS
         )
+    if (
+        strict_object_properties
+        and "object" in schema_types
+        and "properties" in bounded
+        and "additionalProperties" not in bounded
+        and _depth >= strict_object_properties_min_depth
+    ):
+        bounded["additionalProperties"] = False
 
     for key in ("properties", "$defs", "definitions"):
         if key in bounded:
             value = bounded[key]
             if isinstance(value, dict):
                 bounded[key] = {
-                    name: bound_json_schema_for_constrained_decoding(subschema)
+                    name: bound_json_schema_for_constrained_decoding(
+                        subschema,
+                        strict_object_properties=strict_object_properties,
+                        strict_object_properties_min_depth=min_depth,
+                        _depth=_depth + 1,
+                    )
                     for name, subschema in value.items()
                 }
 
     for key in ("items", "additionalProperties", "anyOf", "oneOf", "allOf"):
         if key in bounded:
-            bounded[key] = bound_json_schema_for_constrained_decoding(bounded[key])
+            bounded[key] = bound_json_schema_for_constrained_decoding(
+                bounded[key],
+                strict_object_properties=strict_object_properties,
+                strict_object_properties_min_depth=min_depth,
+                _depth=_depth + 1,
+            )
     return bounded
 
 
