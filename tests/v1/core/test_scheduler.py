@@ -594,6 +594,31 @@ def test_check_stop_min_tokens():
     assert request_stop.stop_reason == 42
 
 
+def test_check_stop_does_not_rewrite_unclosed_reasoning_stop():
+    """Stop handling must not rewrite sampled tokens scheduler-side."""
+    from vllm.v1.core.sched.utils import check_stop
+
+    sampling_params = SamplingParams(max_tokens=20)
+    sampling_params.extra_args = {
+        "reasoning_budget": 8,
+        "end_token_ids": [13],
+    }
+    sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
+    request = Request(
+        request_id="reasoning-stop",
+        prompt_token_ids=[0, 1, 2],
+        sampling_params=sampling_params,
+        pooling_params=None,
+    )
+    request.append_output_token_ids([10, 11, EOS_TOKEN_ID])
+
+    result = check_stop(request, max_model_len=100)
+
+    assert result is True
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert list(request.output_token_ids) == [10, 11, EOS_TOKEN_ID]
+
+
 @pytest.mark.parametrize(
     "enable_prefix_caching, prompt_logprobs",
     [
@@ -3837,6 +3862,26 @@ def test_remote_kv_promotion_keeps_fcfs_with_grammar_prefix():
         req_remote.request_id,
         req_tail.request_id,
     ]
+
+
+def test_grammar_error_promotion_finishes_without_scheduling_freed_request():
+    scheduler = create_scheduler(max_num_seqs=1)
+    req_bad, req_next = create_requests(num_requests=2)
+
+    req_bad.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+    req_bad.structured_output_request = Mock(
+        grammar=None,
+        grammar_error=RuntimeError("compile failed"),
+    )
+    scheduler.add_request(req_bad)
+    scheduler.add_request(req_next)
+
+    output = scheduler.schedule()
+
+    assert req_bad.request_id not in scheduler.requests
+    assert req_bad.request_id in output.finished_req_ids
+    assert [req.req_id for req in output.scheduled_new_reqs] == [req_next.request_id]
+    assert [req.request_id for req in scheduler.running] == [req_next.request_id]
 
 
 def test_fcfs_mixed_skipped_waiting_types_keep_order():

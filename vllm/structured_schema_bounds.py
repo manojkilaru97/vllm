@@ -4,9 +4,6 @@
 import copy
 from typing import Any
 
-DEFAULT_SCHEMA_MAX_STRING_LENGTH = 4096
-DEFAULT_SCHEMA_MAX_ARRAY_ITEMS = 32
-DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS = 8
 _STRING_CONSTRAINT_KEYS = {
     "const",
     "enum",
@@ -16,11 +13,11 @@ _STRING_CONSTRAINT_KEYS = {
 
 
 def bound_json_schema_for_constrained_decoding(schema: Any) -> Any:
-    """Add finite bounds to JSON schemas before constrained decoding.
+    """Normalize JSON schemas before constrained decoding.
 
-    Unbounded strings and arrays are valid JSON Schema, but they create a very
-    large language for grammar-constrained decoding and can let a model generate
-    until max_tokens. Explicit caller-provided bounds are preserved.
+    Caller-provided schemas are behavioral constraints. Do not invent length or
+    array bounds here; preserve the user's schema except for empty string
+    constraints that constrained-decoding backends treat poorly.
     """
     if isinstance(schema, list):
         return [bound_json_schema_for_constrained_decoding(item) for item in schema]
@@ -31,16 +28,6 @@ def bound_json_schema_for_constrained_decoding(schema: Any) -> Any:
     for key in ("format", "pattern"):
         if bounded.get(key) == "":
             bounded.pop(key)
-    schema_type = bounded.get("type")
-    schema_types = schema_type if isinstance(schema_type, list) else [schema_type]
-    if "string" in schema_types and "maxLength" not in bounded:
-        bounded["maxLength"] = DEFAULT_SCHEMA_MAX_STRING_LENGTH
-    if "array" in schema_types and "maxItems" not in bounded:
-        bounded["maxItems"] = (
-            DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS
-            if _is_tool_call_array_schema(bounded)
-            else DEFAULT_SCHEMA_MAX_ARRAY_ITEMS
-        )
 
     for key in ("properties", "$defs", "definitions"):
         if key in bounded:

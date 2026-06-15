@@ -100,6 +100,12 @@ class LoggingStatLogger(StatLoggerBase):
     def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
         self.engine_index = engine_index
         self.vllm_config = vllm_config
+        parallel_config = self.vllm_config.parallel_config
+        self.dp_rank = getattr(parallel_config, "data_parallel_index", None)
+        if self.dp_rank is None:
+            self.dp_rank = getattr(parallel_config, "data_parallel_rank", None)
+        if self.dp_rank is None:
+            self.dp_rank = 0
         self._reset(time.monotonic())
 
         self.last_scheduler_stats = SchedulerStats()
@@ -156,7 +162,10 @@ class LoggingStatLogger(StatLoggerBase):
 
     @property
     def log_prefix(self):
-        return "Engine {:03d}: ".format(self.engine_index)
+        return "Engine {:03d} (dp_rank={}): ".format(
+            self.engine_index,
+            self.dp_rank,
+        )
 
     def record(
         self,

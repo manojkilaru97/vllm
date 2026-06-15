@@ -36,6 +36,29 @@ from vllm.tool_parsers.utils import (
 
 logger = init_logger(__name__)
 
+PARSER_MARKER_DELIMITERS = (
+    "</parameter>",
+    "</function>",
+    "</tool_call>",
+    "<tool_call>",
+    "<function=",
+    "<parameter=",
+    "<think>",
+    "</think>",
+    "</</think>",
+)
+
+
+def _strip_parser_marker_suffix(param_value: str) -> str:
+    for marker in PARSER_MARKER_DELIMITERS:
+        pos = param_value.find(marker)
+        while pos != -1:
+            if pos == 0 or param_value[pos - 1] in "\r\n":
+                param_value = param_value[:pos]
+                break
+            pos = param_value.find(marker, pos + 1)
+    return param_value.rstrip("\r\n")
+
 
 class Qwen3CoderToolParser(ToolParser):
     # Required/named tool choice uses xgrammar-constrained JSON and the
@@ -148,8 +171,7 @@ class Qwen3CoderToolParser(ToolParser):
             # Remove prefix and trailing \n
             if param_value.startswith("\n"):
                 param_value = param_value[1:]
-            if param_value.endswith("\n"):
-                param_value = param_value[:-1]
+            param_value = _strip_parser_marker_suffix(param_value)
 
             param_dict[param_name] = self._convert_param_value(
                 param_value, param_name, param_config, function_name
@@ -484,9 +506,7 @@ class Qwen3CoderToolParser(ToolParser):
                 if param_end_idx == -1:
                     break
 
-                param_value = value_text[:param_end_idx]
-                if param_value.endswith("\n"):
-                    param_value = param_value[:-1]
+                param_value = _strip_parser_marker_suffix(value_text[:param_end_idx])
 
                 self.current_param_name = current_param_name
                 self.accumulated_params[current_param_name] = param_value

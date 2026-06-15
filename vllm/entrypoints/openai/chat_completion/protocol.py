@@ -777,13 +777,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        resolved_chat_template_kwargs = self.get_resolved_chat_template_kwargs()
-        if resolved_chat_template_kwargs.get("enable_thinking", True):
-            extra_args["disable_spec_decode"] = True
-        if self.tool_choice == "required" or isinstance(
-            self.tool_choice, ChatCompletionNamedToolChoiceParam
-        ):
-            extra_args["disable_spec_decode"] = True
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

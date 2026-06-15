@@ -24,19 +24,54 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
                 return size
         return 0
 
-    def _decode_token_ids(self, token_ids: Sequence[int]) -> str:
+    def _decode_token_ids(
+        self, token_ids: Sequence[int], *, skip_special_tokens: bool = False
+    ) -> str:
         try:
             return self.model_tokenizer.decode(
-                list(token_ids), skip_special_tokens=False
+                list(token_ids), skip_special_tokens=skip_special_tokens
             )
         except TypeError:
             return self.model_tokenizer.decode(list(token_ids))
         except Exception:
             try:
                 tokens = self.model_tokenizer.convert_ids_to_tokens(list(token_ids))
+                if skip_special_tokens:
+                    tokens = [
+                        token
+                        for token in tokens
+                        if token not in (self.start_token, self.end_token)
+                    ]
                 return self.model_tokenizer.convert_tokens_to_string(tokens)
             except Exception:
                 return ""
+
+    def _split_stripped_end_token_delta(
+        self, delta_text: str, delta_token_ids: Sequence[int]
+    ) -> DeltaMessage | None:
+        delta_token_ids = list(delta_token_ids)
+        if self.end_token_id not in delta_token_ids:
+            return None
+
+        end_index = delta_token_ids.index(self.end_token_id)
+        reasoning_ids = delta_token_ids[:end_index]
+        content_ids = delta_token_ids[end_index + 1 :]
+
+        reasoning = self._decode_token_ids(
+            reasoning_ids, skip_special_tokens=True
+        )
+        content = self._decode_token_ids(content_ids, skip_special_tokens=True)
+
+        if not reasoning and not content and delta_text:
+            if end_index == 0:
+                content = delta_text
+            elif end_index == len(delta_token_ids) - 1:
+                reasoning = delta_text
+
+        content = self.strip_reasoning_boundary_content("", content)
+        if not reasoning and not content:
+            return None
+        return DeltaMessage(reasoning=reasoning or None, content=content or None)
 
     def strip_reasoning_boundary_content(
         self, previous_content: str, content_delta: str
@@ -77,6 +112,9 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
         # Ultra/Nemotron can expose </think> in decoded text without the marker
         # token ID in the same streaming delta. Fall back to text markers so the
         # final answer is not swallowed as reasoning.
+        if self.end_token_id in delta_token_ids and self.end_token not in delta_text:
+            return self._split_stripped_end_token_delta(delta_text, delta_token_ids)
+
         if self.end_token in previous_text:
             previous_content = previous_text.rpartition(self.end_token)[2]
             if self.end_token in delta_text:

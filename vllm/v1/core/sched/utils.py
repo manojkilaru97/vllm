@@ -6,7 +6,6 @@ from collections.abc import Sequence
 from vllm.sampling_params import RepetitionDetectionParams
 from vllm.v1.request import Request, RequestStatus
 
-
 def _has_repeating_pattern(
     token_ids: Sequence[int],
     pattern_len: int,

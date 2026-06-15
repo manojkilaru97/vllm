@@ -204,7 +204,7 @@ def test_response_created_event_uses_public_json_schema_alias() -> None:
     assert event.response.text.format.model_dump(by_alias=True)["schema"] == schema
 
 
-def test_responses_structured_outputs_inject_reasoning_budget():
+def test_responses_structured_outputs_do_not_invent_reasoning_budget():
     class FakeTokenizer:
         vocab_size = 4
 
@@ -234,8 +234,34 @@ def test_responses_structured_outputs_inject_reasoning_budget():
         {"enable_thinking": True},
     )
 
+    assert sampling_params.extra_args == {}
+
+
+def test_responses_explicit_reasoning_budget_injects_end_token_metadata():
+    class FakeTokenizer:
+        vocab_size = 4
+
+        def encode(self, text, add_special_tokens=False):
+            if text == "</think>":
+                return [2]
+            return [3]
+
+    class FakeReasoningParser:
+        end_token = "</think>"
+        end_token_id = 2
+
+    serving = object.__new__(OpenAIServingResponses)
+    sampling_params = SamplingParams(max_tokens=512)
+
+    serving._inject_think_end_token_id(
+        sampling_params,
+        ResponsesRequest(input="test"),
+        FakeTokenizer(),
+        FakeReasoningParser(),
+        {"enable_thinking": True, "reasoning_budget": 256},
+    )
+
     assert sampling_params.extra_args is not None
-    assert sampling_params.extra_args["disable_spec_decode"] is True
     assert sampling_params.extra_args["reasoning_budget"] == 256
     assert sampling_params.extra_args["think_end_token_id"] == 2
 
