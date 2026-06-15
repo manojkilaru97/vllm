@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
+import os
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 class MinPLogitsProcessor(LogitsProcessor):
@@ -338,6 +341,40 @@ class ReasoningBudgetLogitsProcessor(LogitsProcessor):
         state["natural_end_checked_len"] = len(output_tok_ids)
         return False
 
+    @staticmethod
+    def _translate_stop_to_end_token(
+        logits: torch.Tensor,
+        idx: int,
+        stop_token_ids: set[int],
+        end_token_ids: list[int],
+    ) -> torch.Tensor:
+        """Inside thinking, treat EOS/stop as intent to close the think block."""
+        if not stop_token_ids or not end_token_ids:
+            return logits
+
+        vocab_size = logits.shape[1]
+        valid_stop_ids = [
+            tid
+            for tid in stop_token_ids
+            if 0 <= tid < vocab_size and tid not in end_token_ids
+        ]
+        if not valid_stop_ids:
+            return logits
+
+        first_end_token_id = end_token_ids[0]
+        if not 0 <= first_end_token_id < vocab_size:
+            return logits
+
+        stop_token_tensor = torch.tensor(
+            valid_stop_ids, dtype=torch.long, device=logits.device
+        )
+        stop_score = logits[idx, stop_token_tensor].max()
+        logits[idx, stop_token_tensor] = float("-inf")
+        logits[idx, first_end_token_id] = torch.maximum(
+            logits[idx, first_end_token_id], stop_score
+        )
+        return logits
+
     def _maybe_end_thinking(
         self, idx: int, logits: torch.Tensor, state: dict[str, Any]
     ) -> torch.Tensor:
@@ -350,6 +387,15 @@ class ReasoningBudgetLogitsProcessor(LogitsProcessor):
 
         budget: int = state["thinking_budget"]
         grace: int = state["thinking_budget_grace_period"]
+        end_token_ids: list[int] = state["end_token_ids"]
+
+        if not state.get("start_of_end", False):
+            logits = self._translate_stop_to_end_token(
+                logits,
+                idx,
+                state.get("stop_token_ids", set()),
+                end_token_ids,
+            )
 
         newline_ids: set[int] = state.get("newline_token_ids", set())
         if not isinstance(newline_ids, set):
@@ -373,7 +419,6 @@ class ReasoningBudgetLogitsProcessor(LogitsProcessor):
         if not state.get("start_of_end", False) or state.get("end_of_end", False):
             return logits
 
-        end_token_ids: list[int] = state["end_token_ids"]
         if not end_token_ids:
             return logits
 
@@ -399,88 +444,97 @@ class ReasoningBudgetLogitsProcessor(LogitsProcessor):
 
         return logits
 
-    def update_state(self, batch_update: BatchUpdate | None):
-        if not batch_update:
-            return
+    def _new_state(
+        self,
+        params: SamplingParams,
+        _prompt_tok_ids: list[int] | None,
+        output_tok_ids: list[int],
+    ) -> dict[str, Any] | None:
+        extra = params.extra_args if isinstance(params.extra_args, dict) else {}
+        budget = extra.get("reasoning_budget")
+        if budget is None:
+            return None
 
-        for index in batch_update.removed:
-            self.logit_processor_state.pop(index, None)
+        try:
+            budget_int = int(budget)
+        except Exception:
+            return None
 
-        for a_index, b_index, direct in batch_update.moved:
-            a_entry = self.logit_processor_state.pop(a_index, None)
-            b_entry = self.logit_processor_state.pop(b_index, None)
-            if a_entry is not None:
-                self.logit_processor_state[b_index] = a_entry
-            if direct == MoveDirectionality.SWAP and b_entry is not None:
-                self.logit_processor_state[a_index] = b_entry
+        if budget_int == -1:
+            return None
 
-        for index, params, _, output_tok_ids in batch_update.added:
-            extra = params.extra_args if isinstance(params.extra_args, dict) else {}
-            budget = extra.get("reasoning_budget")
-            if budget is None:
-                self.logit_processor_state.pop(index, None)
-                continue
+        grace = extra.get("reasoning_budget_grace_period", 0) or 0
+        try:
+            grace_int = int(grace)
+        except Exception:
+            grace_int = 0
 
+        end_token_ids = extra.get("end_token_ids")
+        if (
+            isinstance(end_token_ids, Sequence)
+            and not isinstance(end_token_ids, (str, bytes))
+        ):
+            parsed_end_ids = [int(tid) for tid in end_token_ids]
+        else:
+            parsed_end_ids = []
+
+        if not parsed_end_ids and extra.get("think_end_token_id") is not None:
             try:
-                budget_int = int(budget)
+                parsed_end_ids = [int(extra["think_end_token_id"])]
             except Exception:
-                self.logit_processor_state.pop(index, None)
-                continue
-
-            if budget_int == -1:
-                self.logit_processor_state.pop(index, None)
-                continue
-
-            grace = extra.get("reasoning_budget_grace_period", 0) or 0
-            try:
-                grace_int = int(grace)
-            except Exception:
-                grace_int = 0
-
-            end_token_ids = extra.get("end_token_ids")
-            if (
-                isinstance(end_token_ids, Sequence)
-                and not isinstance(end_token_ids, (str, bytes))
-            ):
-                parsed_end_ids = [int(tid) for tid in end_token_ids]
-            else:
                 parsed_end_ids = []
 
-            if not parsed_end_ids and extra.get("think_end_token_id") is not None:
-                try:
-                    parsed_end_ids = [int(extra["think_end_token_id"])]
-                except Exception:
-                    parsed_end_ids = []
+        if not parsed_end_ids:
+            return None
 
-            if not parsed_end_ids:
-                self.logit_processor_state.pop(index, None)
-                continue
+        newline_token_ids = extra.get("newline_token_ids")
+        newline_ids_set: set[int] = set()
+        if (
+            isinstance(newline_token_ids, Sequence)
+            and not isinstance(newline_token_ids, (str, bytes))
+        ):
+            try:
+                newline_ids_set = {int(tid) for tid in newline_token_ids}
+            except Exception:
+                newline_ids_set = set()
 
-            newline_token_ids = extra.get("newline_token_ids")
-            newline_ids_set: set[int] = set()
-            if (
-                isinstance(newline_token_ids, Sequence)
-                and not isinstance(newline_token_ids, (str, bytes))
-            ):
-                try:
-                    newline_ids_set = {int(tid) for tid in newline_token_ids}
-                except Exception:
-                    newline_ids_set = set()
+        enable_thinking = extra.get("enable_thinking")
+        is_thinking = enable_thinking is not False
+        try:
+            stop_token_ids = {int(tid) for tid in params.all_stop_token_ids}
+        except Exception:
+            stop_token_ids = set()
 
-            enable_thinking = extra.get("enable_thinking")
-            is_thinking = enable_thinking is not False
+        if os.environ.get("DYN_DEBUG_REASONING_BUDGET") == "1":
+            logger.warning(
+                "reasoning budget processor state budget=%s grace=%s "
+                "stop_token_ids=%s end_token_ids=%s extra_keys=%s",
+                budget_int,
+                grace_int,
+                sorted(stop_token_ids),
+                parsed_end_ids,
+                sorted(extra.keys()),
+            )
 
-            self.logit_processor_state[index] = {
-                "output_tok_ids": output_tok_ids,
-                "thinking_budget": budget_int,
-                "thinking_budget_grace_period": grace_int,
-                "end_token_ids": parsed_end_ids,
-                "newline_token_ids": newline_ids_set,
-                "is_thinking": is_thinking,
-                "start_of_end": False,
-                "end_of_end": False,
-                "natural_end_checked_len": 0,
-            }
+        return {
+            "output_tok_ids": output_tok_ids,
+            "thinking_budget": budget_int,
+            "thinking_budget_grace_period": grace_int,
+            "end_token_ids": parsed_end_ids,
+            "newline_token_ids": newline_ids_set,
+            "stop_token_ids": stop_token_ids,
+            "is_thinking": is_thinking,
+            "start_of_end": False,
+            "end_of_end": False,
+            "natural_end_checked_len": 0,
+        }
+
+    def update_state(self, batch_update: BatchUpdate | None):
+        process_dict_updates(
+            self.logit_processor_state,
+            batch_update,
+            self._new_state,
+        )
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.logit_processor_state:

@@ -113,7 +113,11 @@ from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import Parser, ParserManager
-from vllm.payload_logging import log_payload, log_payload_lazy
+from vllm.payload_logging import (
+    log_payload,
+    log_payload_lazy,
+    schedule_payload_log_task,
+)
 from vllm.payload_sanitization import prepare_request_payload_for_logging
 from vllm.payload_suppression import (
     build_suppressed_request_payload,
@@ -147,26 +151,41 @@ def _strip_reasoning_output_items(
     ]
 
 
-async def _log_responses_request_payload(
+def _register_responses_request_logging_context(
     raw_request: Request | None,
     request: ResponsesRequest,
-    serving_render: OpenAIServingRender,
-) -> None:
-    rid = request.request_id
-    if raw_request is None:
-        return
-    try:
-        headers_obj = {k: v for k, v in raw_request.headers.items()}
-    except Exception:
-        headers_obj = None
+) -> tuple[dict[str, str] | None, Any]:
+    headers_obj = None
+    if raw_request is not None:
+        try:
+            headers_obj = {k: v for k, v in raw_request.headers.items()}
+        except Exception:
+            headers_obj = None
     request_context = register_request_logging_context(
-        rid,
+        request.request_id,
         request_logging_context_from_headers(
             headers_obj,
             model=request.model,
             stream=bool(request.stream),
         ),
     )
+    return headers_obj, request_context
+
+
+async def _log_responses_request_payload(
+    raw_request: Request | None,
+    request: ResponsesRequest,
+    serving_render: OpenAIServingRender,
+    *,
+    headers_obj: dict[str, str] | None = None,
+    request_context: Any | None = None,
+) -> None:
+    rid = request.request_id
+    if raw_request is None:
+        return
+    if request_context is None:
+        headers_obj, request_context = _register_responses_request_logging_context(
+            raw_request, request)
     if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
         return
     suppression_context = payload_suppression_context_for_request_id(rid)
@@ -254,7 +273,6 @@ async def _log_responses_request_payload(
                 headers=headers_obj,
                 allowed_local_media_path=allowed_local_media_path,
             ),
-            "payload_json": json.dumps(payload, ensure_ascii=False),
             "headers": headers_obj,
         }
 
@@ -294,7 +312,6 @@ def _log_responses_response_payload(
                 "request_id": rid,
                 "endpoint": OpenAIServingResponses.__name__,
                 "payload": payload,
-                "payload_json": json.dumps(payload, ensure_ascii=False),
             }
 
         log_payload_lazy(
@@ -479,16 +496,6 @@ class OpenAIServingResponses(OpenAIServing):
                 except Exception:
                     continue
 
-        vocab_size = getattr(tokenizer, "vocab_size", None)
-        if isinstance(vocab_size, int) and 0 < vocab_size <= 300000:
-            for token_id in range(vocab_size):
-                try:
-                    token_text = tokenizer.decode([token_id])
-                except Exception:
-                    continue
-                if any(token_text.endswith(s) for s in strings):
-                    newline_ids.add(token_id)
-
         ids_list = sorted(newline_ids)
         setattr(tokenizer, "_vllm_newline_token_ids", ids_list)
         return ids_list
@@ -508,23 +515,7 @@ class OpenAIServingResponses(OpenAIServing):
             sampling_params.extra_args = {}
         extra = sampling_params.extra_args
 
-        if chat_template_kwargs.get("enable_thinking", True):
-            extra.setdefault("disable_spec_decode", True)
-
         reasoning_budget = chat_template_kwargs.get("reasoning_budget")
-        if (
-            reasoning_budget is None
-            and sampling_params.structured_outputs is not None
-            and chat_template_kwargs.get("enable_thinking", True) is not False
-        ):
-            # Structured outputs cannot be constrained until reasoning ends.
-            # Reserve answer tokens and cap internal reasoning so Responses
-            # matches Chat behavior instead of returning missing/invalid JSON.
-            max_tokens = getattr(sampling_params, "max_tokens", None) or 0
-            if max_tokens > 0:
-                reserve = max(64, min(256, max_tokens // 2))
-                reasoning_budget = min(4096, max(32, max_tokens - reserve))
-
         if reasoning_budget is None:
             return
 
@@ -705,8 +696,20 @@ class OpenAIServingResponses(OpenAIServing):
         if maybe_validation_error is not None:
             return maybe_validation_error
 
-        await _log_responses_request_payload(
-            raw_request, request, self.openai_serving_render)
+        headers_obj, request_context = _register_responses_request_logging_context(
+            raw_request, request)
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1" and raw_request is not None:
+            schedule_payload_log_task(
+                _log_responses_request_payload(
+                    raw_request,
+                    request,
+                    self.openai_serving_render,
+                    headers_obj=headers_obj,
+                    request_context=request_context,
+                ),
+                label="responses.request",
+                rid=request.request_id,
+            )
         classify_responses_request(request)
 
         # If the engine is dead, raise the engine's DEAD_ERROR.

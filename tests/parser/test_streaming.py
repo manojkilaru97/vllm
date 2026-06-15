@@ -12,8 +12,37 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.parser.abstract_parser import DelegatingParser
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
+from vllm.reasoning.nemotron_v3_reasoning_parser import NemotronV3ReasoningParser
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
+
+
+class FakeNemotronTokenizer:
+    token_by_id = {
+        1: "<think>",
+        13: "</think>",
+        100: "thinking",
+        101: '{"name":"capture","arguments":{}}',
+    }
+
+    def get_vocab(self):
+        return {token: token_id for token_id, token in self.token_by_id.items()}
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        tokens = self.convert_ids_to_tokens(token_ids)
+        if skip_special_tokens:
+            tokens = [
+                token
+                for token in tokens
+                if token not in ("<think>", "</think>")
+            ]
+        return self.convert_tokens_to_string(tokens)
+
+    def convert_ids_to_tokens(self, token_ids):
+        return [self.token_by_id[token_id] for token_id in token_ids]
+
+    def convert_tokens_to_string(self, tokens):
+        return "".join(tokens)
 
 
 class ThinkReasoningParser(BaseThinkingReasoningParser):
@@ -498,6 +527,40 @@ def test_parse_delta_text_marker_end_hands_off_to_tool_parser(tokenizer):
     result = parser.parse_delta(
         'thinking</think>{"name":"capture","arguments":{}}',
         [non_marker_id],
+        request,
+        prompt_token_ids=[],
+    )
+
+    assert parser._stream_state.reasoning_ended
+    assert parser._stream_state.tool_call_text_started
+    assert parser._tool_parser.last_delta_text == '{"name":"capture","arguments":{}}'
+    assert result is not None
+    assert result.reasoning == "thinking"
+
+
+def test_parse_delta_stripped_nemotron_end_hands_off_to_tool_parser():
+    _WrappedParser.reasoning_parser_cls = NemotronV3ReasoningParser
+    _WrappedParser.tool_parser_cls = EchoToolParser
+    parser = _WrappedParser(FakeNemotronTokenizer())
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "capture",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+
+    result = parser.parse_delta(
+        'thinking{"name":"capture","arguments":{}}',
+        [100, 13, 101],
         request,
         prompt_token_ids=[],
     )

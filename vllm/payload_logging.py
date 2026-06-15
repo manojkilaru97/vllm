@@ -1,23 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import atexit
 import logging
 import os
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _ASYNC_ENV = "VLLM_PAYLOAD_LOG_ASYNC"
-_QUEUE: queue.SimpleQueue[
+_MAX_QUEUE_ENV = "VLLM_PAYLOAD_LOG_MAX_QUEUE"
+_DEFAULT_MAX_QUEUE = 8192
+
+
+def _max_queue_size() -> int:
+    try:
+        value = int(os.getenv(_MAX_QUEUE_ENV, str(_DEFAULT_MAX_QUEUE)))
+    except (TypeError, ValueError):
+        value = _DEFAULT_MAX_QUEUE
+    return max(1, value)
+
+
+_QUEUE: queue.Queue[
     tuple[logging.Logger, str, dict[str, Any] | Callable[[], dict[str, Any] | None]]
-] = queue.SimpleQueue()
+] = queue.Queue(maxsize=_max_queue_size())
 _START_LOCK = threading.Lock()
 _STARTED = False
+_DROP_COUNT = 0
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
 def _async_enabled() -> bool:
@@ -59,6 +74,24 @@ def _ensure_worker() -> None:
         _STARTED = True
 
 
+def _enqueue(
+    payload_logger: logging.Logger,
+    event: str,
+    extra_or_builder: dict[str, Any] | Callable[[], dict[str, Any] | None],
+) -> None:
+    global _DROP_COUNT
+    try:
+        _QUEUE.put_nowait((payload_logger, event, extra_or_builder))
+    except queue.Full:
+        _DROP_COUNT += 1
+        if _DROP_COUNT == 1 or (_DROP_COUNT & (_DROP_COUNT - 1)) == 0:
+            logger.warning(
+                "Dropping payload log events because %s is full; dropped=%d",
+                _MAX_QUEUE_ENV,
+                _DROP_COUNT,
+            )
+
+
 def _flush_at_exit() -> None:
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
@@ -83,7 +116,7 @@ def log_payload(
         _emit(payload_logger, event, extra)
         return
     _ensure_worker()
-    _QUEUE.put((payload_logger, event, extra))
+    _enqueue(payload_logger, event, extra)
 
 
 def log_payload_lazy(
@@ -97,4 +130,51 @@ def log_payload_lazy(
         _emit(payload_logger, event, build_extra)
         return
     _ensure_worker()
-    _QUEUE.put((payload_logger, event, build_extra))
+    _enqueue(payload_logger, event, build_extra)
+
+
+def schedule_payload_log_task(
+    coro: Coroutine[Any, Any, None],
+    *,
+    label: str,
+    rid: str,
+) -> None:
+    """Run request-body capture outside the TTFT path and surface failures."""
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        logger.exception(
+            "Failed to schedule payload log task label=%s rid=%s",
+            label,
+            rid,
+        )
+        return
+
+    _BACKGROUND_TASKS.add(task)
+
+    def _done(completed: asyncio.Task[Any]) -> None:
+        _BACKGROUND_TASKS.discard(completed)
+        try:
+            exc = completed.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception(
+                "Failed to inspect payload log task label=%s rid=%s",
+                label,
+                rid,
+            )
+            return
+        if exc is not None:
+            logger.error(
+                "Payload log task failed label=%s rid=%s",
+                label,
+                rid,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    task.add_done_callback(_done)

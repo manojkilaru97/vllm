@@ -640,6 +640,8 @@ class Scheduler(SchedulerInterface):
                 if self._is_blocked_waiting_status(
                     request.status
                 ) and not self._try_promote_blocked_waiting_request(request):
+                    if request_id not in self.requests:
+                        continue
                     if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
@@ -1866,6 +1868,11 @@ class Scheduler(SchedulerInterface):
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
             stopped = check_stop(request, self.max_model_len)
+            current_token_id = request.output_token_ids[-1]
+            if current_token_id != output_token_id:
+                new_token_ids[num_new - 1] = current_token_id
+                del new_token_ids[num_new:]
+                break
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
@@ -2424,7 +2431,7 @@ class Scheduler(SchedulerInterface):
                     grammar_error,
                 )
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
-                return True
+                return False
 
             if not structured_output_req.grammar:
                 return False

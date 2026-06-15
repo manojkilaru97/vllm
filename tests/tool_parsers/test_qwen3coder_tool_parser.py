@@ -680,6 +680,114 @@ true
     assert isinstance(args["verbose"], bool)
 
 
+def test_extract_tool_calls_strips_parser_marker_suffix(qwen3_tokenizer):
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        )
+    ]
+    model_output = """<tool_call>
+<function=get_weather>
+<parameter=city>
+New York
+</</think>
+</tool_call>"""
+
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+    extracted = parser.extract_tool_calls(model_output, request=request)
+
+    assert extracted.tools_called
+    args = json.loads(extracted.tool_calls[0].function.arguments)
+    assert args["city"] == "New York"
+
+
+def test_extract_tool_calls_streaming_strips_parser_marker_suffix(qwen3_tokenizer):
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        )
+    ]
+    model_output = """<tool_call>
+<function=get_weather>
+<parameter=city>
+New York
+</think>
+</parameter>
+</function>
+</tool_call>"""
+
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+
+    tool_states = {}
+    for delta_message in stream_delta_message_generator(
+        parser, qwen3_tokenizer, model_output, request
+    ):
+        if delta_message.tool_calls:
+            for tool_call in delta_message.tool_calls:
+                idx = tool_call.index
+                if idx not in tool_states:
+                    tool_states[idx] = {"name": None, "arguments": ""}
+                if tool_call.function:
+                    if tool_call.function.name:
+                        tool_states[idx]["name"] = tool_call.function.name
+                    if tool_call.function.arguments is not None:
+                        tool_states[idx]["arguments"] += tool_call.function.arguments
+
+    assert len(tool_states) == 1
+    assert tool_states[0]["name"] == "get_weather"
+    args = json.loads(tool_states[0]["arguments"])
+    assert args["city"] == "New York"
+
+
+def test_extract_tool_calls_keeps_inline_marker_text(qwen3_tokenizer):
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "send_message",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"body": {"type": "string"}},
+                    "required": ["body"],
+                },
+            },
+        )
+    ]
+    model_output = """<tool_call>
+<function=send_message>
+<parameter=body>
+Use the literal <think> marker in docs.
+</parameter>
+</function>
+</tool_call>"""
+
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+    extracted = parser.extract_tool_calls(model_output, request=request)
+
+    assert extracted.tools_called
+    args = json.loads(extracted.tool_calls[0].function.arguments)
+    assert args["body"] == "Use the literal <think> marker in docs."
+
+
 @pytest.mark.parametrize(
     ids=[
         "no_tools",

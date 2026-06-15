@@ -69,7 +69,11 @@ from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
-from vllm.payload_logging import log_payload, log_payload_lazy
+from vllm.payload_logging import (
+    log_payload,
+    log_payload_lazy,
+    schedule_payload_log_task,
+)
 from vllm.payload_sanitization import prepare_request_payload_for_logging
 from vllm.payload_suppression import (
     build_suppressed_request_payload,
@@ -269,16 +273,6 @@ class OpenAIServingChat(OpenAIServing):
                 except Exception:
                     continue
 
-        vocab_size = getattr(tokenizer, "vocab_size", None)
-        if isinstance(vocab_size, int) and 0 < vocab_size <= 300000:
-            for token_id in range(vocab_size):
-                try:
-                    token_text = tokenizer.decode([token_id])
-                except Exception:
-                    continue
-                if any(token_text.endswith(s) for s in strings):
-                    newline_ids.add(token_id)
-
         ids_list = sorted(newline_ids)
         setattr(tokenizer, "_vllm_newline_token_ids", ids_list)
         return ids_list
@@ -303,22 +297,6 @@ class OpenAIServingChat(OpenAIServing):
         reasoning_budget = request_reasoning_budget
         if reasoning_budget is None:
             reasoning_budget = chat_template_kwargs.get("reasoning_budget")
-        if (
-            reasoning_budget is None
-            and request.structured_outputs is not None
-            and parser_chat_template_kwargs.get("enable_thinking", True) is not False
-        ):
-            # Structured outputs cannot be constrained until reasoning ends.
-            # Without an internal cap, thinking models can spend the full
-            # max_tokens budget before emitting </think>, leaving no room for
-            # the required JSON/tool payload. Reserve a small answer budget and
-            # cap the auto reasoning budget to keep EA structured-output
-            # requests fail-closed instead of returning missing/invalid JSON.
-            max_tokens = getattr(sampling_params, "max_tokens", None) or 0
-            if max_tokens > 0:
-                reserve = max(64, min(256, max_tokens // 2))
-                reasoning_budget = min(4096, max(32, max_tokens - reserve))
-
         if request_reasoning_budget is not None:
             parser_chat_template_kwargs["reasoning_budget"] = request_reasoning_budget
         if reasoning_budget is None:
@@ -426,12 +404,12 @@ class OpenAIServingChat(OpenAIServing):
             .chat_template_kwargs
         )
 
-    async def _log_chat_request_payload(
+    def _register_chat_request_logging_context(
         self,
         request: ChatCompletionRequest,
         raw_request: Request | None,
         rid: str,
-    ) -> None:
+    ) -> tuple[dict[str, str] | None, Any]:
         headers_obj = None
         if raw_request is not None:
             try:
@@ -446,6 +424,20 @@ class OpenAIServingChat(OpenAIServing):
                 stream=bool(request.stream),
             ),
         )
+        return headers_obj, request_context
+
+    async def _log_chat_request_payload(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None,
+        rid: str,
+        *,
+        headers_obj: dict[str, str] | None = None,
+        request_context: Any | None = None,
+    ) -> None:
+        if request_context is None:
+            headers_obj, request_context = self._register_chat_request_logging_context(
+                request, raw_request, rid)
         if os.getenv("VLLM_LOG_PAYLOADS", "1") != "1":
             return
         suppression_context = payload_suppression_context_for_request_id(rid)
@@ -661,7 +653,20 @@ class OpenAIServingChat(OpenAIServing):
                 chat_template_kwargs=chat_template_kwargs,
             )
         rid_hint = self._base_request_id(raw_request, request.request_id)
-        await self._log_chat_request_payload(request, raw_request, rid_hint)
+        headers_obj, request_context = self._register_chat_request_logging_context(
+            request, raw_request, rid_hint)
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            schedule_payload_log_task(
+                self._log_chat_request_payload(
+                    request,
+                    raw_request,
+                    rid_hint,
+                    headers_obj=headers_obj,
+                    request_context=request_context,
+                ),
+                label="chat.request",
+                rid=rid_hint,
+            )
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -838,6 +843,21 @@ class OpenAIServingChat(OpenAIServing):
         final_finish_reasons: list[str | None] = [None] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
+        log_rid = (
+            request_id[len("chatcmpl-") :]
+            if request_id.startswith("chatcmpl-")
+            else request_id
+        )
+        payload_logging_enabled = os.getenv("VLLM_LOG_PAYLOADS", "1") == "1"
+        stream_suppression_context = (
+            payload_suppression_context_for_request_id(log_rid)
+            if payload_logging_enabled
+            else None
+        )
+        should_accumulate_payload_log = (
+            payload_logging_enabled and stream_suppression_context is None
+        )
+        output_logging_enabled = bool(self.enable_log_outputs and self.request_logger)
         tools_streamed = [False] * num_choices
 
         if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
@@ -851,8 +871,11 @@ class OpenAIServingChat(OpenAIServing):
             history_tool_call_cnt = 0
 
         previous_texts = [""] * num_choices
-        streamed_content_texts = [""] * num_choices
-        streamed_reasoning_texts = [""] * num_choices
+        streamed_content_seen = [False] * num_choices
+        streamed_content_parts: list[list[str]] | None = (
+            [[] for _ in range(num_choices)] if should_accumulate_payload_log else None
+        )
+        streamed_reasoning_parts: list[list[str]] = [[] for _ in range(num_choices)]
         pending_tool_whitespace_content = [""] * num_choices
         streamed_tool_calls: list[dict[int, dict[str, Any]]] = [
             {} for _ in range(num_choices)
@@ -1212,7 +1235,7 @@ class OpenAIServingChat(OpenAIServing):
                         if (
                             thinking_disabled
                             and not request.tools
-                            and not streamed_content_texts[i]
+                            and not streamed_content_seen[i]
                             and previous_texts[i] + delta_text
                         ):
                             if delta_message is None:
@@ -1221,7 +1244,7 @@ class OpenAIServingChat(OpenAIServing):
                             delta_message.reasoning = None
                         elif (
                             request.include_reasoning
-                            and not streamed_content_texts[i]
+                            and not streamed_content_seen[i]
                             and not delta_message.content
                             and not delta_message.tool_calls
                             and not tools_streamed[i]
@@ -1234,7 +1257,7 @@ class OpenAIServingChat(OpenAIServing):
                             # effectively empty answer. This applies even when
                             # tools were available, but only if no tool call was
                             # actually emitted.
-                            pending_reasoning = streamed_reasoning_texts[i] + (
+                            pending_reasoning = "".join(streamed_reasoning_parts[i]) + (
                                 delta_message.reasoning or ""
                             )
                             if pending_reasoning:
@@ -1349,41 +1372,51 @@ class OpenAIServingChat(OpenAIServing):
 
                     for choice_delta in choice_deltas:
                         if choice_delta.delta.tool_calls:
-                            for tool_delta in choice_delta.delta.tool_calls:
-                                tool_index = tool_delta.index or 0
-                                state = streamed_tool_calls[i].setdefault(
-                                    tool_index,
-                                    {
-                                        "id": tool_delta.id,
-                                        "type": tool_delta.type or "function",
-                                        "function": {
-                                            "name": None,
-                                            "arguments": "",
+                            if should_accumulate_payload_log:
+                                for tool_delta in choice_delta.delta.tool_calls:
+                                    tool_index = tool_delta.index or 0
+                                    state = streamed_tool_calls[i].setdefault(
+                                        tool_index,
+                                        {
+                                            "id": tool_delta.id,
+                                            "type": tool_delta.type or "function",
+                                            "function": {
+                                                "name": None,
+                                                "arguments": "",
+                                                "_argument_parts": [],
+                                            },
                                         },
-                                    },
-                                )
-                                if tool_delta.id:
-                                    state["id"] = tool_delta.id
-                                if tool_delta.type:
-                                    state["type"] = tool_delta.type
-                                if tool_delta.function is not None:
-                                    if tool_delta.function.name:
-                                        state["function"]["name"] = (
-                                            tool_delta.function.name
-                                        )
-                                    if tool_delta.function.arguments:
-                                        state["function"]["arguments"] += (
-                                            tool_delta.function.arguments
-                                        )
+                                    )
+                                    if tool_delta.id:
+                                        state["id"] = tool_delta.id
+                                    if tool_delta.type:
+                                        state["type"] = tool_delta.type
+                                    if tool_delta.function is not None:
+                                        if tool_delta.function.name:
+                                            state["function"]["name"] = (
+                                                tool_delta.function.name
+                                            )
+                                        if tool_delta.function.arguments:
+                                            state["function"]["_argument_parts"].append(
+                                                tool_delta.function.arguments
+                                            )
                         if choice_delta.delta.content:
-                            streamed_content_texts[i] += choice_delta.delta.content
+                            streamed_content_seen[i] = True
+                            if streamed_content_parts is not None:
+                                streamed_content_parts[i].append(
+                                    choice_delta.delta.content
+                                )
                         if (
                             choice_delta.delta.reasoning
                             and request.include_reasoning
                         ):
-                            streamed_reasoning_texts[i] += (
-                                choice_delta.delta.reasoning
-                            )
+                            if (
+                                should_accumulate_payload_log
+                                or not streamed_content_seen[i]
+                            ):
+                                streamed_reasoning_parts[i].append(
+                                    choice_delta.delta.reasoning
+                                )
                         chunk = ChatCompletionStreamResponse(
                             id=request_id,
                             object=chunk_object_type,
@@ -1451,12 +1484,9 @@ class OpenAIServingChat(OpenAIServing):
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
 
-            log_rid = (
-                request_id[len("chatcmpl-") :]
-                if request_id.startswith("chatcmpl-")
-                else request_id
-            )
-            if payload_suppression_context_for_request_id(log_rid) is not None:
+            if not payload_logging_enabled:
+                choices_list = None
+            elif stream_suppression_context is not None:
                 choices_list = [
                     {
                         "index": i,
@@ -1467,21 +1497,28 @@ class OpenAIServingChat(OpenAIServing):
             else:
                 choices_list = []
                 for i in range(num_choices):
-                    tool_calls = [
-                        streamed_tool_calls[i][idx]
-                        for idx in sorted(streamed_tool_calls[i])
-                        if streamed_tool_calls[i][idx].get("function", {}).get("name")
-                        or streamed_tool_calls[i][idx].get("function", {}).get(
-                            "arguments"
-                        )
-                    ]
+                    tool_calls = []
+                    for idx in sorted(streamed_tool_calls[i]):
+                        tool_call = streamed_tool_calls[i][idx]
+                        function = tool_call.get("function", {})
+                        argument_parts = function.pop("_argument_parts", [])
+                        if argument_parts:
+                            function["arguments"] = "".join(argument_parts)
+                        if function.get("name") or function.get("arguments"):
+                            tool_calls.append(tool_call)
                     message: dict[str, Any] = {
                         "role": self.get_chat_request_role(request),
                     }
-                    if streamed_content_texts[i] or not tool_calls:
-                        message["content"] = streamed_content_texts[i] or ""
-                    if streamed_reasoning_texts[i]:
-                        message["reasoning_content"] = streamed_reasoning_texts[i]
+                    content_text = (
+                        "".join(streamed_content_parts[i])
+                        if streamed_content_parts is not None
+                        else ""
+                    )
+                    reasoning_text = "".join(streamed_reasoning_parts[i])
+                    if content_text or not tool_calls:
+                        message["content"] = content_text
+                    if reasoning_text:
+                        message["reasoning_content"] = reasoning_text
                     if tool_calls:
                         message["tool_calls"] = tool_calls
                     choices_list.append(
@@ -1491,22 +1528,23 @@ class OpenAIServingChat(OpenAIServing):
                             "finish_reason": final_finish_reasons[i] or "stop",
                         }
                     )
-            self._log_chat_response_payload(
-                log_rid,
-                {
-                    "id": request_id,
-                    "object": "chat.completion",
-                    "created": created_time,
-                    "model": model_name,
-                    "choices": choices_list,
-                    "usage": request_metadata.final_usage_info.model_dump(),
-                    "stream": True,
-                },
-            )
+            if choices_list is not None:
+                self._log_chat_response_payload(
+                    log_rid,
+                    {
+                        "id": request_id,
+                        "object": "chat.completion",
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": choices_list,
+                        "usage": request_metadata.final_usage_info.model_dump(),
+                        "stream": True,
+                    },
+                )
 
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
-                if payload_suppression_context_for_request_id(request_id) is not None:
+                if stream_suppression_context is not None:
                     self.request_logger.log_outputs(
                         request_id=request_id,
                         outputs="",

@@ -3,6 +3,7 @@
 import itertools
 import json
 import multiprocessing
+import os
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -38,6 +39,13 @@ else:
 
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class StructuredOutputManager:
@@ -210,7 +218,10 @@ class StructuredOutputManager:
         if request_backend == "guidance" and isinstance(self.backend, XgrammarBackend):
             return self._compile_with_guidance(request_type, grammar_spec)
 
-        if self._should_use_guidance_for_xgrammar(request_type, grammar_spec):
+        if (
+            _env_flag("VLLM_GUIDANCE_FALLBACK_FOR_UNCONSTRAINED_STRINGS", False)
+            and self._should_use_guidance_for_xgrammar(request_type, grammar_spec)
+        ):
             schema = json.loads(grammar_spec)
             logger.info(
                 "using guidance for unconstrained string JSON schema request_id=%s",
@@ -240,6 +251,9 @@ class StructuredOutputManager:
             return self.backend.compile_grammar(request_type, grammar_spec)
         except Exception:
             if not isinstance(self.backend, XgrammarBackend):
+                raise
+
+            if not _env_flag("VLLM_GUIDANCE_FALLBACK_ON_XGRAMMAR_ERROR", False):
                 raise
 
             logger.warning(
