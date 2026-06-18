@@ -364,6 +364,14 @@ class AsyncLLM(EngineClient):
             request.reasoning_ended = reasoning_ended
         if reasoning_parser_kwargs is not None:
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
+        structured_output_request = getattr(request, "structured_output_request", None)
+        if structured_output_request is not None:
+            if reasoning_ended is not None:
+                structured_output_request.reasoning_ended = reasoning_ended
+            if reasoning_parser_kwargs is not None:
+                structured_output_request.reasoning_parser_kwargs = (
+                    reasoning_parser_kwargs
+                )
 
         self.input_processor.assign_request_id(request)
 
