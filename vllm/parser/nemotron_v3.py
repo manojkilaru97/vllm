@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import json
+import re
 from typing import TYPE_CHECKING
 
 from vllm.parser.qwen3 import Qwen3Parser, qwen3_config
@@ -104,6 +106,7 @@ class NemotronV3Parser(Qwen3Parser):
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
         reasoning, content = super().extract_reasoning(model_output, request)
+        content = self._repair_boundary_brace_leak(content)
 
         if content is None or not content.strip():
             if self._should_force_content(request):
@@ -114,3 +117,27 @@ class NemotronV3Parser(Qwen3Parser):
                 content = reasoning
 
         return reasoning, content
+
+    @staticmethod
+    def _repair_boundary_brace_leak(content: str | None) -> str | None:
+        """Repair a duplicate opening brace leaked at the reasoning->answer
+        boundary under speculative decoding (e.g. '{\n{"a":1}'). Only fires
+        when the original is invalid JSON and the repair makes it valid;
+        non-stream only (streamed bytes cannot be retracted)."""
+        if not content:
+            return content
+        stripped = content.lstrip()
+        match = re.match(r"\{\s*(\{)", stripped)
+        if not match:
+            return content
+        try:
+            json.loads(stripped)
+            return content
+        except Exception:
+            pass
+        repaired = stripped[match.start(1):]
+        try:
+            json.loads(repaired)
+        except Exception:
+            return content
+        return repaired

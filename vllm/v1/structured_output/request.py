@@ -25,6 +25,7 @@ class StructuredOutputRequest:
     _grammar_error: Exception | None = None
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
+    reasoning_checked_token_count: int = 0
     # Cached per request; do not share reasoning parsers across requests because
     # their behavior can depend on reasoning_parser_kwargs.
     reasoner: "ReasoningParser | None" = None

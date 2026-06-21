@@ -178,6 +178,10 @@ class RequestState:
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
 
+        # Cumulative per-request spec-decode stats (set on finish).
+        self.spec_decode_stats = None
+        self.scheduler_snapshot = None
+
         # Stream Interval
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
@@ -399,11 +403,36 @@ class RequestState:
         if finished and self.routed_experts_chunks:
             routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)
 
+        spec_decode = None
+        if finished and self.spec_decode_stats is not None:
+            spec_decode = self.spec_decode_stats.to_dict()
+
+        # Per-request context telemetry (finish only, off hot path).
+        scheduler_snapshot = self.scheduler_snapshot if finished else None
+        request_throughput = None
+        if finished and self.stats is not None:
+            import time as _time
+
+            e2e = self.stats.last_token_ts - self.stats.arrival_time
+            if e2e <= 0:
+                e2e = _time.time() - self.stats.arrival_time
+            if e2e <= 0:
+                e2e = 1e-9
+            draft_toks = spec_decode["num_draft_tokens"] if spec_decode else 0
+            request_throughput = {
+                "e2e_latency_seconds": e2e,
+                "generation_tokens_per_second": self.stats.num_generation_tokens / e2e,
+                "draft_tokens_per_second": draft_toks / e2e,
+            }
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
+            spec_decode=spec_decode,
+            scheduler_snapshot=scheduler_snapshot,
+            request_throughput=request_throughput,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -624,6 +653,10 @@ class OutputProcessor:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
                 )
+            if engine_core_output.spec_decode_stats is not None:
+                req_state.spec_decode_stats = engine_core_output.spec_decode_stats
+            if engine_core_output.scheduler_snapshot is not None:
+                req_state.scheduler_snapshot = engine_core_output.scheduler_snapshot
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

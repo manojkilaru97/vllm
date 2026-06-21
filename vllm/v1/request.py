@@ -20,7 +20,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
-from vllm.v1.metrics.stats import PrefillStats
+from vllm.v1.metrics.stats import PrefillStats, SpecDecodeStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
@@ -175,6 +175,7 @@ class Request:
         self.num_preemptions = 0
 
         self.prefill_stats: PrefillStats | None = PrefillStats()
+        self.spec_decode_stats: SpecDecodeStats | None = None
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
@@ -316,6 +317,11 @@ class Request:
         prefill_stats = self.prefill_stats
         self.prefill_stats = None
         return prefill_stats
+
+    def take_spec_decode_stats(self) -> SpecDecodeStats | None:
+        spec_decode_stats = self.spec_decode_stats
+        self.spec_decode_stats = None
+        return spec_decode_stats
 
     def __lt__(self, other: "Request") -> bool:
         """

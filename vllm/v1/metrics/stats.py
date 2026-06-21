@@ -274,6 +274,63 @@ class PrefillStats:
 
 
 @dataclass
+class SpecDecodeStats:
+    """Per-request speculative-decoding accounting (scheduler-step only)."""
+
+    num_speculative_tokens: int = 0
+    method: str = ""
+    num_drafts: int = 0
+    num_draft_tokens: int = 0
+    num_accepted_tokens: int = 0
+    accepted_tokens_per_position: list[int] = field(default_factory=list)
+    draft_tokens_per_position: list[int] = field(default_factory=list)
+
+    def observe(
+        self,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        num_speculative_tokens: int,
+        method: str,
+    ) -> None:
+        if not self.draft_tokens_per_position:
+            self.num_speculative_tokens = num_speculative_tokens
+            self.method = method
+            self.accepted_tokens_per_position = [0] * num_speculative_tokens
+            self.draft_tokens_per_position = [0] * num_speculative_tokens
+        self.num_drafts += 1
+        self.num_draft_tokens += num_draft_tokens
+        self.num_accepted_tokens += num_accepted_tokens
+        for i in range(min(num_draft_tokens, len(self.draft_tokens_per_position))):
+            self.draft_tokens_per_position[i] += 1
+        for i in range(min(num_accepted_tokens, len(self.accepted_tokens_per_position))):
+            self.accepted_tokens_per_position[i] += 1
+
+    def to_dict(self) -> dict:
+        nd = self.num_draft_tokens
+        return {
+            "enabled": True,
+            "num_speculative_tokens": self.num_speculative_tokens,
+            "method": self.method,
+            "num_drafts": self.num_drafts,
+            "num_draft_tokens": nd,
+            "num_accepted_tokens": self.num_accepted_tokens,
+            "num_rejected_tokens": nd - self.num_accepted_tokens,
+            "acceptance_rate": (self.num_accepted_tokens / nd) if nd else 0.0,
+            "acceptance_length": (1.0 + self.num_accepted_tokens / self.num_drafts)
+            if self.num_drafts
+            else 1.0,
+            "accepted_tokens_per_position": list(self.accepted_tokens_per_position),
+            "draft_tokens_per_position": list(self.draft_tokens_per_position),
+            "acceptance_rate_per_position": [
+                (a / d) if d else 0.0
+                for a, d in zip(
+                    self.accepted_tokens_per_position, self.draft_tokens_per_position
+                )
+            ],
+        }
+
+
+@dataclass
 class PromptTokenStats:
     """Breakdown of prompt tokens by source.
 
