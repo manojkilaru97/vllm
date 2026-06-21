@@ -216,7 +216,13 @@ class StructuredOutputManager:
         if request.sampling_params and request.sampling_params.structured_outputs:
             request_backend = request.sampling_params.structured_outputs._backend
         if request_backend == "guidance" and isinstance(self.backend, XgrammarBackend):
-            return self._compile_with_guidance(request_type, grammar_spec)
+            return self._compile_with_guidance(
+                request_type,
+                grammar_spec,
+                disable_any_whitespace=self._guidance_disable_any_whitespace(
+                    request_type, grammar_spec, request
+                ),
+            )
 
         if (
             _env_flag("VLLM_GUIDANCE_FALLBACK_FOR_UNCONSTRAINED_STRINGS", False)
@@ -297,6 +303,25 @@ class StructuredOutputManager:
         self._check_guidance_bitmask_compatibility(guidance_backend, grammar)
         return grammar
 
+    @staticmethod
+    def _guidance_disable_any_whitespace(
+        request_type: StructuredOutputOptions,
+        grammar_spec: str,
+        request: "Request",
+    ) -> bool | None:
+        if request_type == StructuredOutputOptions.JSON_OBJECT:
+            return True
+        if request_type != StructuredOutputOptions.JSON:
+            return None
+        try:
+            schema = json.loads(grammar_spec)
+        except Exception:
+            return None
+        return not (
+            _is_tool_call_array_schema(schema)
+            and _may_need_reasoning_handoff_whitespace(request)
+        )
+
     def _check_guidance_bitmask_compatibility(
         self,
         guidance_backend: GuidanceBackend,
@@ -341,6 +366,104 @@ class StructuredOutputManager:
         self, batch: list[tuple[StructuredOutputGrammar, int, bool]]
     ) -> Future:
         return self.executor_for_fillmask.submit(self._fill_bitmasks, batch)
+
+    def _find_reasoning_boundary_token_index(
+        self,
+        request: "Request",
+        token_ids: list[int],
+        *,
+        tokens_already_in_all_token_ids: bool,
+    ) -> int | None:
+        """Return the token index that ends reasoning within token_ids."""
+        if not token_ids:
+            return None
+
+        reasoner = self._get_reasoner(request)
+        if reasoner is None:
+            return None
+
+        if tokens_already_in_all_token_ids:
+            all_token_ids = request.all_token_ids
+            prefix_len = max(len(all_token_ids) - len(token_ids), 0)
+            prefix_token_ids = list(all_token_ids[:prefix_len])
+            full_token_ids = all_token_ids
+        else:
+            prefix_token_ids = list(request.all_token_ids)
+            full_token_ids = [*prefix_token_ids, *token_ids]
+
+        if not reasoner.is_reasoning_end_streaming(full_token_ids, token_ids):
+            return None
+
+        preview_token_ids = prefix_token_ids
+        for token_index, token_id in enumerate(token_ids):
+            preview_token_ids.append(token_id)
+            if reasoner.is_reasoning_end_streaming(
+                preview_token_ids, (token_id,)
+            ):
+                return token_index
+        return None
+
+    def token_ids_to_advance(
+        self, request: "Request", token_ids: list[int]
+    ) -> list[int]:
+        """Return accepted tokens that should advance the structured grammar."""
+        if not token_ids or not request.use_structured_output:
+            return []
+
+        reasoner = self._get_reasoner(request)
+        if reasoner is None or self.enable_in_reasoning:
+            return token_ids
+
+        structured_req = request.structured_output_request
+        assert structured_req is not None
+        if structured_req.reasoning_ended is None:
+            structured_req.reasoning_ended = reasoner.is_reasoning_end(
+                request.prompt_token_ids or []
+            )
+        if structured_req.reasoning_ended:
+            return token_ids
+
+        boundary_index = self._find_reasoning_boundary_token_index(
+            request,
+            token_ids,
+            tokens_already_in_all_token_ids=True,
+        )
+        structured_req.reasoning_checked_token_count = len(request.all_token_ids)
+        if boundary_index is None:
+            return []
+
+        structured_req.reasoning_ended = True
+        return token_ids[boundary_index + 1 :]
+
+    def validate_spec_tokens(
+        self, request: "Request", spec_token_ids: list[int]
+    ) -> list[int]:
+        """Filter speculative tokens against structured grammar when active."""
+        if not spec_token_ids or not request.use_structured_output:
+            return spec_token_ids
+
+        structured_req = request.structured_output_request
+        assert structured_req is not None
+        assert structured_req.grammar is not None
+
+        if self.should_advance(request) or structured_req.reasoning_ended:
+            return structured_req.grammar.validate_tokens(spec_token_ids)
+
+        if self.enable_in_reasoning or self._get_reasoner(request) is None:
+            return structured_req.grammar.validate_tokens(spec_token_ids)
+
+        boundary_index = self._find_reasoning_boundary_token_index(
+            request,
+            spec_token_ids,
+            tokens_already_in_all_token_ids=False,
+        )
+        if boundary_index is None:
+            return spec_token_ids
+
+        valid_after_boundary = structured_req.grammar.validate_tokens(
+            spec_token_ids[boundary_index + 1 :]
+        )
+        return spec_token_ids[: boundary_index + 1] + valid_after_boundary
 
     def grammar_bitmask(
         self,
@@ -415,17 +538,66 @@ class StructuredOutputManager:
                     assert structured_output_request.grammar is not None
                 grammar = structured_output_request.grammar
                 apply_bitmask = self.should_fill_bitmask(request)
+                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
+                reasoning_boundary_spec_index: int | None = None
+                crossed_reasoning_boundary = False
+                rejected_post_boundary_spec = False
+                if req_tokens and not apply_bitmask and not self.enable_in_reasoning:
+                    reasoning_boundary_spec_index = (
+                        self._find_reasoning_boundary_token_index(
+                            request,
+                            req_tokens,
+                            tokens_already_in_all_token_ids=False,
+                        )
+                    )
 
                 state_advancements = 0
-                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
-                for token in itertools.chain(req_tokens, (-1,)):
+                for spec_index, token in enumerate(itertools.chain(req_tokens, (-1,))):
+                    is_reasoning_boundary_token = (
+                        reasoning_boundary_spec_index is not None
+                        and token != -1
+                        and spec_index == reasoning_boundary_spec_index
+                    )
+                    if (
+                        reasoning_boundary_spec_index is not None
+                        and spec_index > reasoning_boundary_spec_index
+                        and not rejected_post_boundary_spec
+                    ):
+                        crossed_reasoning_boundary = True
+                        apply_bitmask = True
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
                     if token == -1:
                         # Stop advancing the grammar once we hit a padding token.
                         apply_bitmask = False
-                    if apply_bitmask and not grammar.is_terminated():
+                    elif is_reasoning_boundary_token:
+                        # A speculative token ended reasoning. Do not feed that
+                        # boundary token into the grammar, but do apply the
+                        # structured-output FSM to subsequent speculative
+                        # positions in this same MTP batch.
+                        apply_bitmask = True
+                        crossed_reasoning_boundary = True
+                    if (
+                        apply_bitmask
+                        and not is_reasoning_boundary_token
+                        and not grammar.is_terminated()
+                    ):
                         accepted = grammar.accept_tokens(req_id, [token])
-                        assert accepted, (token, req_id, scheduled_spec_decode_tokens)
+                        if not accepted:
+                            if crossed_reasoning_boundary:
+                                # Draft tokens after a reasoning boundary were
+                                # not prevalidated because the persistent request
+                                # state is still in reasoning. The bitmask for
+                                # this position will reject the invalid draft;
+                                # later draft positions are ignored after that.
+                                apply_bitmask = False
+                                rejected_post_boundary_spec = True
+                                cumulative_index += 1
+                                continue
+                            assert accepted, (
+                                token,
+                                req_id,
+                                scheduled_spec_decode_tokens,
+                            )
                         state_advancements += 1
                     cumulative_index += 1
                 if state_advancements > 0:
@@ -457,6 +629,9 @@ class StructuredOutputManager:
                 request.structured_output_request.reasoning_ended = (
                     reasoner.is_reasoning_end(request.prompt_token_ids or [])
                 )
+                request.structured_output_request.reasoning_checked_token_count = len(
+                    request.prompt_token_ids or []
+                )
             return request.structured_output_request.reasoning_ended
         return True
 
@@ -480,6 +655,12 @@ class StructuredOutputManager:
             return True
 
         structured_req = request.structured_output_request
+        prompt_len = len(request.prompt_token_ids or [])
+        if structured_req.reasoning_ended is None:
+            structured_req.reasoning_ended = reasoner.is_reasoning_end(
+                request.prompt_token_ids or []
+            )
+            structured_req.reasoning_checked_token_count = prompt_len
         if structured_req.reasoning_ended:
             return True
 
@@ -489,9 +670,16 @@ class StructuredOutputManager:
         start = (
             delta_from if delta_from >= 0 else max(len(all_token_ids) + delta_from, 0)
         )
+        if self.vllm_config.speculative_config is not None:
+            # Under spec decode, num_computed_tokens can include rejected draft
+            # tokens that are absent from all_token_ids. Use the request-local
+            # checked cursor instead of a computed-token window so a boundary
+            # buried in a multi-token acceptance is seen exactly once.
+            start = max(prompt_len, structured_req.reasoning_checked_token_count)
         if reasoner.is_reasoning_end_streaming(
             all_token_ids, itertools.islice(all_token_ids, start, None)
         ):
+            structured_req.reasoning_checked_token_count = len(all_token_ids)
             structured_req.reasoning_ended = True
 
             # Reasoning just ended this step. Defer FSM advance until the next
@@ -507,6 +695,8 @@ class StructuredOutputManager:
                 == StructuredOutputOptions.STRUCTURAL_TAG
             ):
                 return True
+        else:
+            structured_req.reasoning_checked_token_count = len(all_token_ids)
 
         return False
 

@@ -51,7 +51,7 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
-from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats, SpecDecodeStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -211,6 +211,9 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        self._spec_method = (
+            getattr(speculative_config, "method", "") or "" if speculative_config else ""
+        )
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
@@ -1374,6 +1377,12 @@ class Scheduler(SchedulerInterface):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
+                # Per-request spec accounting (integer adds, scheduler step only).
+                if request.spec_decode_stats is None:
+                    request.spec_decode_stats = SpecDecodeStats()
+                request.spec_decode_stats.observe(
+                    num_draft_tokens, num_accepted, self.num_spec_tokens, self._spec_method
+                )
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1415,17 +1424,25 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
+            if new_token_ids and request.use_structured_output:
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
-                if not struct_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
-                    req_id, new_token_ids
+                structured_token_ids = (
+                    self.structured_output_manager.token_ids_to_advance(
+                        request, new_token_ids
+                    )
+                )
+                if (
+                    structured_token_ids
+                    and not struct_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
+                        req_id, structured_token_ids
+                    )
                 ):
                     logger.warning(
                         "Unexpected: grammar rejected tokens %s for request %s. "
                         "Failing the request at the last accepted prefix.",
-                        new_token_ids,
+                        structured_token_ids,
                         req_id,
                     )
                     # The sampled token was already appended before grammar
@@ -1524,6 +1541,19 @@ class Scheduler(SchedulerInterface):
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
+                        spec_decode_stats=(
+                            request.take_spec_decode_stats()
+                            if finish_reason is not None
+                            else None
+                        ),
+                        scheduler_snapshot=(
+                            {
+                                "num_running_reqs": len(self.running),
+                                "num_waiting_reqs": len(self.waiting),
+                            }
+                            if finish_reason is not None
+                            else None
+                        ),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
@@ -1719,9 +1749,9 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            if self.structured_output_manager.should_advance(request):
-                metadata = request.structured_output_request
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+            spec_token_ids = self.structured_output_manager.validate_spec_tokens(
+                request, spec_token_ids
+            )
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
@@ -1748,10 +1778,9 @@ class Scheduler(SchedulerInterface):
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
             # Filter out spec tokens which do not adhere to the grammar.
-            if self.structured_output_manager.should_advance(request):
-                metadata = request.structured_output_request
-                assert metadata is not None and metadata.grammar is not None
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
+            spec_token_ids = self.structured_output_manager.validate_spec_tokens(
+                request, spec_token_ids
+            )
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:

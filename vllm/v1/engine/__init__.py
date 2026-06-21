@@ -15,7 +15,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
+from vllm.v1.metrics.stats import PrefillStats, SchedulerStats, SpecDecodeStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
 
@@ -187,6 +187,8 @@ class EngineCoreOutput(
     trace_headers: Mapping[str, str] | None = None
 
     prefill_stats: PrefillStats | None = None
+    spec_decode_stats: SpecDecodeStats | None = None
+    scheduler_snapshot: dict[str, Any] | None = None
 
     routed_experts: np.ndarray | None = None
     # The number of NaNs in logits.

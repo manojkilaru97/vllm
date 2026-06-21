@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import re
 from collections.abc import Iterable, Sequence
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -198,4 +200,31 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
                 self.strip_reasoning_boundary_content("", final_content) or None
             )
 
+        final_content = self._repair_boundary_brace_leak(final_content)
         return reasoning, final_content
+
+    @staticmethod
+    def _repair_boundary_brace_leak(content: str | None) -> str | None:
+        """Repair a duplicate opening brace leaked at the reasoning->answer
+        boundary under speculative decoding (e.g. '{\\n{"a":1}'). Valid JSON
+        never starts with '{' immediately followed by '{' (keys are strings),
+        so this is airtight: only fires when the original is invalid JSON and
+        dropping the stray brace makes it valid. Non-stream only (streamed bytes
+        cannot be retracted)."""
+        if not content:
+            return content
+        stripped = content.lstrip()
+        match = re.match(r"\{\s*(\{)", stripped)
+        if not match:
+            return content
+        try:
+            json.loads(stripped)
+            return content  # already valid; do not touch
+        except Exception:
+            pass
+        repaired = stripped[match.start(1):]
+        try:
+            json.loads(repaired)
+        except Exception:
+            return content  # repair did not yield valid JSON; leave unchanged
+        return repaired

@@ -3,9 +3,11 @@
 
 """Unit tests for reasoning-aware structured output functionality (PR #25515)."""
 
+import json
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
 from vllm.v1.request import Request
@@ -62,6 +64,7 @@ class TestReasoningStructuredOutput:
         request = Mock(spec=Request)
         request.structured_output_request = Mock()
         request.structured_output_request.reasoning_ended = None
+        request.structured_output_request.reasoning_checked_token_count = 0
         request.structured_output_request.grammar = Mock()
         request.structured_output_request.reasoning_parser_kwargs = None
         request.structured_output_request.reasoner = None
@@ -258,3 +261,362 @@ class TestReasoningStructuredOutput:
 
         # Should return True since reasoning has ended
         assert result is True
+
+    def test_should_advance_spec_decode_scans_full_output(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        """Under spec decode, num_computed_tokens counts draft tokens absent from
+        all_token_ids, so the windowed delta can land past a </think> buried in a
+        multi-token acceptance. The fix scans the full output region instead."""
+        req = mock_request_with_structured_output
+        req.prompt_token_ids = [1, 2, 3, 4, 5]
+        req.all_token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        # Overshoot: window start would be 11-4=7 -> delta=[8], missing 6,7.
+        req.num_computed_tokens = 11
+        req.num_output_placeholders = 4
+        req.structured_output_request.reasoning_ended = False
+        req.structured_output_request.structured_output_key = (
+            StructuredOutputOptions.JSON,
+            "{}",
+        )
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.return_value = True
+        req.structured_output_request.reasoner = reasoner
+        manager_with_reasoner.vllm_config.speculative_config = Mock()
+
+        manager_with_reasoner.should_advance(req)
+
+        # The delta passed must be the FULL output region, not the narrow window.
+        call = reasoner.is_reasoning_end_streaming.call_args
+        delta = list(call.args[1])
+        assert delta == [6, 7, 8], f"expected full output region, got {delta}"
+        # reasoning_ended flips even though </think> was buried mid-batch.
+        assert req.structured_output_request.reasoning_ended is True
+
+    def test_should_advance_spec_decode_uses_checked_cursor(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        req = mock_request_with_structured_output
+        req.prompt_token_ids = [1, 2, 3, 4, 5]
+        req.all_token_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        req.num_computed_tokens = 13
+        req.num_output_placeholders = 4
+        req.structured_output_request.reasoning_ended = False
+        req.structured_output_request.reasoning_checked_token_count = 7
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.return_value = False
+        req.structured_output_request.reasoner = reasoner
+        manager_with_reasoner.vllm_config.speculative_config = Mock()
+
+        manager_with_reasoner.should_advance(req)
+
+        call = reasoner.is_reasoning_end_streaming.call_args
+        delta = list(call.args[1])
+        assert delta == [8, 9]
+        assert req.structured_output_request.reasoning_checked_token_count == 9
+
+    def test_should_advance_without_spec_uses_window(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        """Without spec decode, the original 1-token windowed delta is used."""
+        req = mock_request_with_structured_output
+        req.prompt_token_ids = [1, 2, 3, 4, 5]
+        req.all_token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        req.num_computed_tokens = 8
+        req.num_output_placeholders = 1
+        req.structured_output_request.reasoning_ended = False
+        req.structured_output_request.structured_output_key = (
+            StructuredOutputOptions.JSON,
+            "{}",
+        )
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.return_value = False
+        req.structured_output_request.reasoner = reasoner
+        manager_with_reasoner.vllm_config.speculative_config = None
+
+        manager_with_reasoner.should_advance(req)
+
+        call = reasoner.is_reasoning_end_streaming.call_args
+        delta = list(call.args[1])
+        # window start = 8 - 1 = 7 -> delta = all_token_ids[7:] = [8]
+        assert delta == [8], f"expected windowed delta, got {delta}"
+
+    def test_token_ids_to_advance_returns_post_boundary_suffix(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        req = mock_request_with_structured_output
+        new_token_ids = [10, 99, 123, 124]
+        req.all_token_ids = [1, 2, 3, *new_token_ids]
+        req.structured_output_request.reasoning_ended = False
+
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.side_effect = (
+            lambda input_ids, delta_ids: 99 in list(delta_ids)
+        )
+        req.structured_output_request.reasoner = reasoner
+
+        token_ids = manager_with_reasoner.token_ids_to_advance(req, new_token_ids)
+
+        assert token_ids == [123, 124]
+        assert req.structured_output_request.reasoning_ended is True
+        assert [
+            list(call.args[1])
+            for call in reasoner.is_reasoning_end_streaming.call_args_list
+        ] == [[10, 99, 123, 124], [10], [99]]
+
+    def test_token_ids_to_advance_ignores_unfinished_reasoning_tokens(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        req = mock_request_with_structured_output
+        new_token_ids = [10, 11, 12]
+        req.all_token_ids = [1, 2, 3, *new_token_ids]
+        req.structured_output_request.reasoning_ended = False
+
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.return_value = False
+        req.structured_output_request.reasoner = reasoner
+
+        token_ids = manager_with_reasoner.token_ids_to_advance(req, new_token_ids)
+
+        assert token_ids == []
+        assert req.structured_output_request.reasoning_ended is False
+
+    def test_validate_spec_tokens_constrains_post_boundary_suffix(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        req = mock_request_with_structured_output
+        req.all_token_ids = [1, 2, 3]
+        req.num_computed_tokens = len(req.all_token_ids)
+        req.num_output_placeholders = 0
+        req.structured_output_request.reasoning_ended = False
+
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.side_effect = (
+            lambda input_ids, delta_ids: 99 in list(delta_ids)
+        )
+        req.structured_output_request.reasoner = reasoner
+        req.structured_output_request.grammar.validate_tokens.return_value = [123]
+
+        spec_token_ids = manager_with_reasoner.validate_spec_tokens(
+            req, [10, 99, 123, 124]
+        )
+
+        assert spec_token_ids == [10, 99, 123]
+        assert req.structured_output_request.reasoning_ended is False
+        req.structured_output_request.grammar.validate_tokens.assert_called_once_with(
+            [123, 124]
+        )
+
+    def test_validate_spec_tokens_after_accepted_reasoning_boundary(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        req = mock_request_with_structured_output
+        req.all_token_ids = [1, 2, 3, 10, 99]
+        req.prompt_token_ids = [1, 2, 3]
+        req.num_computed_tokens = len(req.all_token_ids)
+        req.num_output_placeholders = 3
+        req.structured_output_request.reasoning_ended = False
+        req.structured_output_request.structured_output_key = (
+            StructuredOutputOptions.JSON,
+            "{}",
+        )
+
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.side_effect = (
+            lambda input_ids, delta_ids: 99 in list(delta_ids)
+        )
+        req.structured_output_request.reasoner = reasoner
+        req.structured_output_request.grammar.validate_tokens.return_value = [123]
+        manager_with_reasoner.vllm_config.speculative_config = Mock()
+
+        spec_token_ids = manager_with_reasoner.validate_spec_tokens(req, [123, 124])
+
+        assert spec_token_ids == [123]
+        assert req.structured_output_request.reasoning_ended is True
+        req.structured_output_request.grammar.validate_tokens.assert_called_once_with(
+            [123, 124]
+        )
+
+    def test_guidance_json_schema_uses_compact_whitespace(
+        self, mock_request_with_structured_output
+    ):
+        schema = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+        }
+
+        disable_any_whitespace = (
+            StructuredOutputManager._guidance_disable_any_whitespace(
+                StructuredOutputOptions.JSON,
+                json.dumps(schema),
+                mock_request_with_structured_output,
+            )
+        )
+
+        assert disable_any_whitespace is True
+
+    def test_guidance_tool_array_keeps_reasoning_handoff_whitespace(
+        self, mock_request_with_structured_output
+    ):
+        schema = {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "parameters": {"type": "object"},
+                        },
+                        "required": ["name", "parameters"],
+                    }
+                ]
+            },
+        }
+        mock_request_with_structured_output.structured_output_request.reasoning_ended = (
+            False
+        )
+
+        disable_any_whitespace = (
+            StructuredOutputManager._guidance_disable_any_whitespace(
+                StructuredOutputOptions.JSON,
+                json.dumps(schema),
+                mock_request_with_structured_output,
+            )
+        )
+
+        assert disable_any_whitespace is False
+
+    def test_grammar_bitmask_constrains_spec_tokens_after_reasoning_boundary(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        req = mock_request_with_structured_output
+        req.all_token_ids = [1, 2, 3]
+        req.structured_output_request.reasoning_ended = False
+
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.side_effect = (
+            lambda input_ids, delta_ids: 99 in list(delta_ids)
+        )
+        req.structured_output_request.reasoner = reasoner
+
+        manager_with_reasoner.vllm_config.speculative_config = Mock(
+            num_speculative_tokens=3
+        )
+        manager_with_reasoner._grammar_bitmask = torch.full(
+            (4, 2), -1, dtype=torch.int32
+        )
+
+        grammar = req.structured_output_request.grammar
+
+        def fill_bitmask(mask, index):
+            mask[index].fill_(index)
+
+        grammar.fill_bitmask.side_effect = fill_bitmask
+        grammar.accept_tokens.return_value = True
+
+        bitmask = manager_with_reasoner.grammar_bitmask(
+            {"req": req}, ["req"], {"req": [10, 99, 123]}
+        )
+
+        assert bitmask.tolist() == [[-1, -1], [-1, -1], [2, 2], [3, 3]]
+        assert [call.args for call in grammar.accept_tokens.call_args_list] == [
+            ("req", [123])
+        ]
+        grammar.rollback.assert_called_once_with(1)
+        assert req.structured_output_request.reasoning_ended is False
+        assert [
+            list(call.args[1])
+            for call in reasoner.is_reasoning_end_streaming.call_args_list
+        ] == [[10, 99, 123], [10], [99]]
+
+    def test_grammar_bitmask_tolerates_invalid_post_boundary_spec_token(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        req = mock_request_with_structured_output
+        req.all_token_ids = [1, 2, 3]
+        req.structured_output_request.reasoning_ended = False
+
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.side_effect = (
+            lambda input_ids, delta_ids: 99 in list(delta_ids)
+        )
+        req.structured_output_request.reasoner = reasoner
+
+        manager_with_reasoner.vllm_config.speculative_config = Mock(
+            num_speculative_tokens=3
+        )
+        manager_with_reasoner._grammar_bitmask = torch.full(
+            (4, 2), -1, dtype=torch.int32
+        )
+
+        grammar = req.structured_output_request.grammar
+
+        def fill_bitmask(mask, index):
+            mask[index].fill_(index)
+
+        grammar.fill_bitmask.side_effect = fill_bitmask
+        grammar.accept_tokens.return_value = False
+
+        bitmask = manager_with_reasoner.grammar_bitmask(
+            {"req": req}, ["req"], {"req": [99, 321, 322]}
+        )
+
+        assert bitmask.tolist() == [[-1, -1], [1, 1], [-1, -1], [-1, -1]]
+        assert [call.args for call in grammar.accept_tokens.call_args_list] == [
+            ("req", [321])
+        ]
+        grammar.rollback.assert_not_called()
+
+    def test_grammar_bitmask_checks_reasoning_boundary_once_on_common_path(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        req = mock_request_with_structured_output
+        req.all_token_ids = [1, 2, 3]
+        req.structured_output_request.reasoning_ended = False
+
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.return_value = False
+        req.structured_output_request.reasoner = reasoner
+
+        manager_with_reasoner.vllm_config.speculative_config = Mock(
+            num_speculative_tokens=3
+        )
+        manager_with_reasoner._grammar_bitmask = torch.full(
+            (4, 2), -1, dtype=torch.int32
+        )
+
+        grammar = req.structured_output_request.grammar
+
+        bitmask = manager_with_reasoner.grammar_bitmask(
+            {"req": req}, ["req"], {"req": [10, 11, 12]}
+        )
+
+        assert bitmask.tolist() == [[-1, -1], [-1, -1], [-1, -1], [-1, -1]]
+        assert [
+            list(call.args[1])
+            for call in reasoner.is_reasoning_end_streaming.call_args_list
+        ] == [[10, 11, 12]]
+        grammar.accept_tokens.assert_not_called()
+        grammar.rollback.assert_not_called()
