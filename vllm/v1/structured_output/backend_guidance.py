@@ -19,6 +19,11 @@ from vllm.v1.structured_output.backend_types import (
     StructuredOutputOptions,
 )
 from vllm.v1.structured_output.request import get_structured_output_key
+from vllm.v1.structured_output.token_bitmask_utils import (
+    get_quote_boundary_token_ids,
+    make_token_clear_mask,
+    token_allowed,
+)
 
 if TYPE_CHECKING:
     import llguidance
@@ -99,6 +104,13 @@ class GuidanceBackend(StructuredOutputBackend):
             self.ll_tokenizer = llguidance_hf.from_tokenizer(
                 self.tokenizer, max(self.vocab_size, len(self.tokenizer))
             )
+        self.quote_token_id, quote_prefixed_token_ids = get_quote_boundary_token_ids(
+            self.tokenizer
+        )
+        self.quote_boundary_clear_mask = make_token_clear_mask(
+            self.ll_tokenizer.vocab_size,
+            quote_prefixed_token_ids,
+        )
 
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
@@ -120,6 +132,8 @@ class GuidanceBackend(StructuredOutputBackend):
             ll_matcher=ll_matcher,
             ll_tokenizer=self.ll_tokenizer,
             vocab_size=self.vocab_size,
+            quote_token_id=self.quote_token_id,
+            quote_boundary_clear_mask=self.quote_boundary_clear_mask,
         )
 
         r.check_error()
@@ -142,6 +156,8 @@ class GuidanceGrammar(StructuredOutputGrammar):
     printed_error: bool = False
     terminated: bool = False
     rollback_lag: int = 0
+    quote_token_id: int | None = None
+    quote_boundary_clear_mask: torch.Tensor | None = None
 
     def check_error(self):
         if not self.printed_error:
@@ -206,7 +222,17 @@ class GuidanceGrammar(StructuredOutputGrammar):
         # this will automatically return [EOS] mask if the matcher is stopped
         # or otherwise in an error state
         llguidance_torch.fill_next_token_bitmask(self.ll_matcher, bitmask, idx)
+        self._mask_quote_boundary_crossing_tokens(bitmask[idx])
         self.check_error()
+
+    def _mask_quote_boundary_crossing_tokens(self, bitmask: torch.Tensor) -> None:
+        if self.quote_token_id is None or self.quote_boundary_clear_mask is None:
+            return
+        if not token_allowed(bitmask, self.quote_token_id):
+            return
+        # Preserve JSON quote boundaries as separate tokens. Content remains
+        # legal immediately after the standalone quote is accepted.
+        bitmask.bitwise_and_(self.quote_boundary_clear_mask)
 
     def is_terminated(self) -> bool:
         return self.terminated
