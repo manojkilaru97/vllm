@@ -17,6 +17,11 @@ from vllm.v1.structured_output.backend_types import (
     StructuredOutputGrammar,
     StructuredOutputOptions,
 )
+from vllm.v1.structured_output.token_bitmask_utils import (
+    get_quote_boundary_token_ids,
+    make_token_clear_mask,
+    token_allowed,
+)
 from vllm.v1.structured_output.utils import (
     choice_as_grammar,
     convert_lark_to_ebnf,
@@ -66,6 +71,13 @@ class XgrammarBackend(StructuredOutputBackend):
             max_threads=8,
             cache_enabled=True,
             cache_limit_bytes=vllm.envs.VLLM_XGRAMMAR_CACHE_MB * 1024 * 1024,
+        )
+        self.quote_token_id, quote_prefixed_token_ids = get_quote_boundary_token_ids(
+            self.tokenizer
+        )
+        self.quote_boundary_clear_mask = make_token_clear_mask(
+            self.vocab_size,
+            quote_prefixed_token_ids,
         )
 
         self.num_speculative_tokens = 0
@@ -145,6 +157,8 @@ class XgrammarBackend(StructuredOutputBackend):
             ),
             vocab_size=self.vocab_size,
             ctx=ctx,
+            quote_token_id=self.quote_token_id,
+            quote_boundary_clear_mask=self.quote_boundary_clear_mask,
         )
 
     def allocate_token_bitmask(self, max_num_seqs: int):
@@ -170,6 +184,8 @@ class XgrammarGrammar(StructuredOutputGrammar):
         default_factory=lambda: 0, repr=False, hash=False, init=False
     )
     _is_terminated: bool = field(default=False, repr=False, hash=False)
+    quote_token_id: int | None = None
+    quote_boundary_clear_mask: torch.Tensor | None = None
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
@@ -216,6 +232,16 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(bitmask, idx)
+        self._mask_quote_boundary_crossing_tokens(bitmask[idx])
+
+    def _mask_quote_boundary_crossing_tokens(self, bitmask: torch.Tensor) -> None:
+        if self.quote_token_id is None or self.quote_boundary_clear_mask is None:
+            return
+        if not token_allowed(bitmask, self.quote_token_id):
+            return
+        # Preserve JSON quote boundaries as separate tokens. Content remains
+        # legal immediately after the standalone quote is accepted.
+        bitmask.bitwise_and_(self.quote_boundary_clear_mask)
 
     def is_terminated(self) -> bool:
         return self._is_terminated
