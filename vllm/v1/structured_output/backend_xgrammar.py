@@ -243,9 +243,25 @@ class XgrammarGrammar(StructuredOutputGrammar):
             return
         if not token_allowed(bitmask, self.quote_token_id):
             return
-        # Preserve JSON quote boundaries as separate tokens. Content remains
-        # legal immediately after the standalone quote is accepted.
+        # Only clear quote-prefixed tokens (e.g. '"}') when the quote would OPEN
+        # a new string -- the boundary where an MTP draft token can cross
+        # syntax->content and corrupt the value ({"answer":"}). At string-CLOSE
+        # states the same tokens ('",', '"]', '"}') are the legitimate
+        # close-and-continue tokens; clearing them there strands greedy decode
+        # inside the string -> runaway / under-filled strings and arrays.
+        # Discriminate via the matcher: accepting one quote at an open state
+        # enters an empty string where a second quote ('""') is still legal; at
+        # a close state the quote terminates the string and a second is not.
+        if not self._quote_opens_string():
+            return
         bitmask.bitwise_and_(self.quote_boundary_clear_mask)
+
+    def _quote_opens_string(self) -> bool:
+        if not self.matcher.accept_token(self.quote_token_id):
+            return False
+        reopened = self.matcher.accept_token(self.quote_token_id)
+        self.matcher.rollback(2 if reopened else 1)
+        return reopened
 
     def is_terminated(self) -> bool:
         return self._is_terminated
