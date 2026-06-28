@@ -674,7 +674,9 @@ class SamplingParams(
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(tokenizer)
         self._validate_spec_decode(speculative_config)
-        self._validate_structured_outputs(structured_outputs_config, tokenizer)
+        self._validate_structured_outputs(
+            structured_outputs_config, tokenizer, speculative_config
+        )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs
@@ -795,6 +797,7 @@ class SamplingParams(
         self,
         structured_outputs_config: StructuredOutputsConfig | None,
         tokenizer: TokenizerLike | None,
+        speculative_config: "SpeculativeConfig | None" = None,
     ) -> None:
         if structured_outputs_config is None or self.structured_outputs is None:
             return
@@ -923,7 +926,9 @@ class SamplingParams(
                         schema = json_mod.loads(so_params.json)
                     else:
                         schema = so_params.json
-                    if needs_guidance_json_schema:
+                    # Guidance desyncs under spec-decode (D8) -> runaway; keep
+                    # unconstrained-string schemas on spec-safe xgrammar when MTP on.
+                    if needs_guidance_json_schema and speculative_config is None:
                         raise ValueError(
                             "Unconstrained string JSON schemas use guidance in auto "
                             "mode to avoid valid-but-wrong string continuations."
