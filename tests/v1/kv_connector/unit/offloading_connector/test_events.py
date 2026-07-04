@@ -72,13 +72,18 @@ def _group_config(
     group_idx: int = 0,
     block_size: int = 4,
     block_size_factor: int = 1,
+    hash_block_size_factor: int | None = None,
     sliding_window_size_in_blocks: int | None = None,
 ) -> GroupOffloadConfig:
     return GroupOffloadConfig(
         group_idx=group_idx,
         gpu_block_size=block_size,
         offloaded_block_size=block_size * block_size_factor,
-        hash_block_size_factor=block_size_factor,
+        hash_block_size_factor=(
+            block_size_factor
+            if hash_block_size_factor is None
+            else hash_block_size_factor
+        ),
         sliding_window_size_in_blocks=sliding_window_size_in_blocks,
         kv_event_group_spec=_FULL_ATTENTION_EVENT_SPEC,
     )
@@ -146,6 +151,44 @@ def test_take_events_publishes_routable_block_stored():
     assert batch2[0].parent_block_hash == batch1[-1].block_hashes[-1]
 
     assert len(tracker._pending_event_metadata) == 6
+
+
+def test_take_events_fine_hash_granularity_emits_gpu_block_windows():
+    """DeepSeek V4 hybrid shape: request hashes are finer than the GPU block
+    (hash_block_size < gpu_block_size). Emitted stores must be windowed to
+    one tail hash per GPU block with block_size=gpu_block_size, or external
+    routers reject every block."""
+    block_size = 4
+    hbf = 4  # hash granularity of 1 token, offloaded chunk = 1 GPU block
+    tracker = _tracker()
+    group_config = _group_config(
+        block_size=block_size, block_size_factor=1, hash_block_size_factor=hbf
+    )
+    req = _request(
+        block_hashes=[_hash(i) for i in range(2 * hbf)],
+        token_count=block_size * 2,
+    )
+    keys = _record_chunks(tracker, req, group_config, num_chunks=2)
+
+    stored = list(tracker.take_events([_stored_event(keys)]))
+    assert len(stored) == 2
+
+    for chunk_idx, event in enumerate(stored):
+        assert isinstance(event, BlockStored)
+        tail = _hash((chunk_idx + 1) * hbf - 1)
+        assert event.block_hashes == [_wire_hash(tail)]
+        assert event.block_size == block_size
+        assert event.token_ids == list(
+            range(chunk_idx * block_size + 1, (chunk_idx + 1) * block_size + 1)
+        )
+    assert stored[0].parent_block_hash is None
+    assert stored[1].parent_block_hash == _wire_hash(_hash(hbf - 1))
+
+    removed = list(tracker.take_events([_removed_event(keys)]))
+    assert len(removed) == 1
+    assert sorted(removed[0].block_hashes) == sorted(
+        [_wire_hash(_hash(hbf - 1)), _wire_hash(_hash(2 * hbf - 1))]
+    )
 
 
 def test_take_events_factor_gt_1_chunk_store_and_remove():
