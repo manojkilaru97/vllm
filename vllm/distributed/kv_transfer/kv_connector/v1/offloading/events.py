@@ -65,7 +65,9 @@ class _OffloadEventMetadata:
     time and kept until the matching eviction event. ``medium`` is forwarded
     from the OffloadingEvent."""
 
-    # The chunk's constituent block hashes; the last one is the OffloadKey.
+    # The chunk's per-GPU-block hashes; the last one is the OffloadKey.
+    # External consumers index at GPU-block granularity, so per-window tail
+    # hashes are captured instead of raw hash_block_size sub-hashes.
     block_hashes: tuple[BlockHash, ...]
     parent_block_hash: BlockHash | None
     token_ids: tuple[int, ...]
@@ -144,14 +146,21 @@ class OffloadingEventsTracker:
         group_config: "GroupOffloadConfig",
         offload_block_idx: int,
     ) -> _OffloadEventMetadata:
-        """Build the payload snapshot for one offloaded chunk: its
-        constituent per-block hashes, the whole chunk's tokens, and the
-        per-block ``block_size``."""
+        """Build the payload snapshot for one offloaded chunk: one hash per
+        GPU-block window, the whole chunk's tokens, and the GPU block size.
+
+        Request hashes are at ``hash_block_size`` granularity, but external
+        KV consumers (Dynamo) index full GPU blocks, so per-window tail
+        hashes are emitted with ``block_size=gpu_block_size``.
+        """
         hbf = group_config.hash_block_size_factor
         assert hbf > 0
         assert offload_block_idx >= 0
-        # per-block token count (= the GPU/hash block size)
+        gpu_block_size = group_config.gpu_block_size
         sub_block_size = group_config.offloaded_block_size // hbf
+        assert gpu_block_size % sub_block_size == 0
+        # Number of hash-granularity sub-blocks per GPU-block window.
+        window = gpu_block_size // sub_block_size
         # chunk c covers hash-blocks [c*hbf, (c+1)*hbf); its tail block's hash
         # is the chunk's OffloadKey.
         first_hash_idx = offload_block_idx * hbf
@@ -159,10 +168,13 @@ class OffloadingEventsTracker:
         assert first_hash_idx >= 0
         assert last_hash_idx <= len(req.block_hashes)
         chunk_hashes: list[BlockHash] = []
-        for block_hash in req.block_hashes[first_hash_idx:last_hash_idx]:
+        for sub_idx in range(
+            first_hash_idx + window - 1, last_hash_idx, window
+        ):
+            block_hash = req.block_hashes[sub_idx]
             assert block_hash is not None
             chunk_hashes.append(block_hash)
-        assert len(chunk_hashes) == hbf
+        assert len(chunk_hashes) == hbf // window
 
         if group_config.sliding_window_size_in_blocks is not None:
             # record_store filters these out before calling this helper.
@@ -190,7 +202,7 @@ class OffloadingEventsTracker:
             block_hashes=tuple(chunk_hashes),
             parent_block_hash=parent_block_hash,
             token_ids=token_ids,
-            block_size=sub_block_size,
+            block_size=gpu_block_size,
             lora_id=lora_id,
             lora_name=lora_name,
             extra_keys=None,
