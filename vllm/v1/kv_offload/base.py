@@ -107,6 +107,16 @@ The class provides the following primitives:
 """
 
 
+@dataclass(frozen=True)
+class OffloadingKVEventsConfig:
+    # Global vLLM KV event publishing flag. When false, connector-specific
+    # event capture must stay inert because take_events() is not drained.
+    enable_kv_cache_events: bool
+    # OffloadingConnector opt-in for self-describing BlockStored payloads.
+    # Effective only when enable_kv_cache_events is true.
+    self_describing_kv_events: bool
+
+
 class OffloadingManager(ABC):
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
@@ -342,6 +352,15 @@ class OffloadingSpec(ABC):
         kv_transfer_config = vllm_config.kv_transfer_config
         assert kv_transfer_config is not None
         self.extra_config = kv_transfer_config.kv_connector_extra_config
+        kv_events_config = vllm_config.kv_events_config
+        self.kv_events_config = OffloadingKVEventsConfig(
+            enable_kv_cache_events=(
+                kv_events_config is not None and kv_events_config.enable_kv_cache_events
+            ),
+            self_describing_kv_events=bool(
+                self.extra_config.get("self_describing_kv_events", False)
+            ),
+        )
 
         parallel_config = vllm_config.parallel_config
         context_parallel_factor = (
