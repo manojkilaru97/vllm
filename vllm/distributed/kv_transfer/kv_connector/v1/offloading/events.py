@@ -115,7 +115,18 @@ class OffloadingEventsTracker:
             return
         if group_config.sliding_window_size_in_blocks is not None:
             return
-        meta = self._build_event_metadata(req, group_config, offload_block_idx)
+        # Fail open: a snapshot failure must degrade to a placeholder event,
+        # never take down the engine-side connector scheduler.
+        try:
+            meta = self._build_event_metadata(req, group_config, offload_block_idx)
+        except (AssertionError, IndexError) as e:
+            logger.warning_once(
+                "OffloadingEventsTracker: failed to snapshot event metadata "
+                "(req hashes/tokens out of sync with offload index); the "
+                "affected chunks will emit placeholder events. First error: %s",
+                e,
+            )
+            return
         self._pending_event_metadata[offload_key] = meta
 
     def take_events(self, events: Iterable[OffloadingEvent]) -> Iterable[KVCacheEvent]:
