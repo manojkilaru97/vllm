@@ -261,6 +261,8 @@ def _maybe_wait_for_collector():
 
 def _get_otlp_exporter(protocol: str, exporter_type: str, exporter_class: str):
     import importlib
+    # Spec value "http/protobuf" maps to the "http" exporter module.
+    protocol = protocol.split("/")[0]
     module_name = f"opentelemetry.exporter.otlp.proto.{protocol}.{exporter_type}"
     module = importlib.import_module(module_name)
     return getattr(module, exporter_class)()
