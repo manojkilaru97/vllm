@@ -119,7 +119,7 @@ class OffloadingEventsTracker:
         # never take down the engine-side connector scheduler.
         try:
             meta = self._build_event_metadata(req, group_config, offload_block_idx)
-        except (AssertionError, IndexError) as e:
+        except Exception as e:
             logger.warning_once(
                 "OffloadingEventsTracker: failed to snapshot event metadata "
                 "(req hashes/tokens out of sync with offload index); the "

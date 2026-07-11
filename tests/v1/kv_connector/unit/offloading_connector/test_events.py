@@ -358,6 +358,24 @@ def test_reset_cache_clears_side_table():
     assert not tracker._pending_event_metadata
 
 
+def test_record_store_fails_open_on_hash_token_desync():
+    """Regression: out-of-sync hashes/tokens must not raise into the engine."""
+    tracker = _tracker()
+    group_config = _group_config(block_size=4)
+    # Fewer hashes/tokens than offload_block_idx requires → AssertionError.
+    req = _request(block_hashes=[_hash(0)], token_count=2)
+    key = make_offload_key(_hash(0), 0)
+
+    tracker.record_store(req, group_config, offload_block_idx=0, offload_key=key)
+    assert key not in tracker._pending_event_metadata
+
+    events = list(tracker.take_events([_stored_event([key])]))
+    assert len(events) == 1
+    assert isinstance(events[0], BlockStored)
+    assert events[0].block_size == 0
+    assert events[0].token_ids == []
+
+
 def test_tiering_rejects_self_describing_kv_events():
     vllm_config = create_vllm_config(
         block_size=4,

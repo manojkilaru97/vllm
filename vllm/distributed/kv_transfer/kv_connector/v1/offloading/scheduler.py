@@ -60,6 +60,8 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    # Workers that reported an unsuccessful transfer for this job.
+    failed_count: int = 0
     # Store src block IDs whose ref_cnt protects them while the request
     # runs. Only registered in _block_id_to_pending_jobs on request_finished.
     non_sliding_window_block_ids: list[int] | None = None
@@ -379,8 +381,26 @@ class OffloadingConnectorScheduler:
         return job_id
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
+        # Fail open on stale SWA/async bookkeeping: a missing entry must not
+        # KeyError-kill the engine (see deepseek-v4 SWA offload RCCA).
         for bid in block_ids or ():
-            pending = self._block_id_to_pending_jobs[bid]
+            pending = self._block_id_to_pending_jobs.get(bid)
+            if pending is None:
+                logger.warning_once(
+                    "OffloadingConnector: stale pending-job cleanup for "
+                    "block_id=%s job_id=%s (already gone)",
+                    bid,
+                    job_id,
+                )
+                continue
+            if job_id not in pending:
+                logger.warning_once(
+                    "OffloadingConnector: job_id=%s missing from pending set "
+                    "for block_id=%s during cleanup",
+                    job_id,
+                    bid,
+                )
+                continue
             pending.remove(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
@@ -1104,7 +1124,14 @@ class OffloadingConnectorScheduler:
                 self._connector_stats.aggregate(transfer_stats)
 
         for job_id, count in meta.completed_jobs.items():
-            assert count > 0
+            if count <= 0:
+                logger.warning_once(
+                    "OffloadingConnector: ignoring non-positive completion "
+                    "count %s for job %s",
+                    count,
+                    job_id,
+                )
+                continue
             if job_id < self._stale_job_threshold:
                 logger.debug(
                     "Skipping stale completed job %d (pre-reset counter: %d)",
@@ -1112,32 +1139,67 @@ class OffloadingConnectorScheduler:
                     self._stale_job_threshold,
                 )
                 continue
-            job_status = self._jobs[job_id]
+            job_status = self._jobs.get(job_id)
+            if job_status is None:
+                logger.warning_once(
+                    "OffloadingConnector: completion for unknown job %s; "
+                    "ignoring",
+                    job_id,
+                )
+                continue
             job_status.pending_count -= count
+            failed = meta.failed_jobs.get(job_id, 0)
+            if failed:
+                job_status.failed_count += failed
             if job_status.pending_count > 0:
                 continue
-            assert job_status.pending_count == 0
+            if job_status.pending_count < 0:
+                logger.warning_once(
+                    "OffloadingConnector: job %s over-completed "
+                    "(pending_count=%s); treating as done",
+                    job_id,
+                    job_status.pending_count,
+                )
+                job_status.pending_count = 0
 
-            req_status = self._req_status[job_status.req_id]
-            if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
-            else:
-                self.manager.complete_load(job_status.keys, req_status.req_context)
-                if self._blocks_being_loaded:
-                    self._blocks_being_loaded.difference_update(job_status.keys)
+            req_status = self._req_status.get(job_status.req_id)
+            success = job_status.failed_count == 0
+            if not success:
+                logger.warning(
+                    "OffloadingConnector: transfer job %s finished with "
+                    "%s worker failure(s) (store=%s); dropping chunk",
+                    job_id,
+                    job_status.failed_count,
+                    job_status.is_store,
+                )
+            if req_status is not None:
+                if job_status.is_store:
+                    self.manager.complete_store(
+                        job_status.keys, req_status.req_context, success=success
+                    )
+                else:
+                    # complete_load has no success flag; always release refs
+                    # so the request can resume (GPU contents may be partial).
+                    self.manager.complete_load(
+                        job_status.keys, req_status.req_context
+                    )
+                    if self._blocks_being_loaded:
+                        self._blocks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:
                 # Sliding window blocks are tracked from store creation
                 # and must be cleaned up unconditionally.
                 self._remove_pending_job(job_id, job_status.sliding_window_block_ids)
                 # Non-sliding-window blocks are only tracked after
                 # request_finished, so only clean up for finished requests.
-                if req_status.req.is_finished():
+                if req_status is not None and req_status.req.is_finished():
                     self._remove_pending_job(
                         job_id, job_status.non_sliding_window_block_ids
                     )
 
             del self._jobs[job_id]
-            req_status.transfer_jobs.remove(job_id)
+            if req_status is None:
+                continue
+            req_status.transfer_jobs.discard(job_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
                 # Deferred from request_finished: the request's last in-flight
                 # job is now done, so fire the finalize hook here, after the

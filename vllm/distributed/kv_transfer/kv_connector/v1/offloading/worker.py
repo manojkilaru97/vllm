@@ -268,10 +268,20 @@ class OffloadingConnectorWorker:
 
         self._register_handlers(canonical_kv_caches)
 
+    def _submit_transfer(self, job_id: int, transfer_spec: TransferSpec) -> None:
+        # Fail open: a submit failure must still complete the job so the
+        # scheduler can release fences / pending blocks (never hang or assert).
+        success = self.worker.transfer_async(job_id, transfer_spec)
+        if not success:
+            logger.warning(
+                "Failed to submit offload transfer job %d; reporting failure",
+                job_id,
+            )
+            self._connector_worker_meta.mark_completed(job_id, success=False)
+
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
+            self._submit_transfer(job_id, transfer_spec)
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
@@ -279,14 +289,12 @@ class OffloadingConnectorWorker:
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
+            self._submit_transfer(job_id, transfer_spec)
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
-            success = self.worker.transfer_async(job_id, entry.transfer_spec)
-            assert success
+            self._submit_transfer(job_id, entry.transfer_spec)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -307,10 +315,22 @@ class OffloadingConnectorWorker:
         """
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
             is_load = job_id in self._load_jobs
+            if not transfer_result.success:
+                # Fail open: drop the offloaded chunk rather than kill the
+                # engine. Still unblock any request waiting on a load.
+                logger.warning(
+                    "Offload transfer job %d failed (load=%s); "
+                    "reporting failure to scheduler",
+                    job_id,
+                    is_load,
+                )
+                self._connector_worker_meta.mark_completed(job_id, success=False)
+                req_id = self._load_jobs.pop(job_id, None)
+                if req_id is not None:
+                    finished_recving.add(req_id)
+                continue
             if (
                 transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
