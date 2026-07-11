@@ -3,7 +3,26 @@
 
 import pytest
 
+from vllm.model_executor.models.config import (
+    MODELS_CONFIG_MAP,
+    NemotronHNanoVLV2Config,
+)
 from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
+
+
+def test_nano_nemotron_vl_supports_mamba_prefix_caching():
+    assert NemotronH_Nano_VL_V2.supports_mamba_prefix_caching
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronH_Super_Omni_Reasoning_V3",
+    ],
+)
+def test_nemotron_omni_uses_nemotron_video_backend(architecture):
+    assert MODELS_CONFIG_MAP[architecture] is NemotronHNanoVLV2Config
 
 
 class _TextOnlyMultiModalConfig:

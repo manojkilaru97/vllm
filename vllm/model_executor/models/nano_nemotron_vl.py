@@ -29,6 +29,7 @@ from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
     MultiModalEmbeddings,
+    SupportsMambaPrefixCaching,
     SupportsMultiModal,
     SupportsMultiModalPruning,
 )
@@ -620,12 +621,14 @@ class NanoNemotronVLMultiModalProcessor(
         for idx, metadata in enumerate(metadata_list):
             video_bytes = metadata.get("original_video_bytes")
             if video_bytes is None or len(video_bytes) == 0:
-                raise ValueError(
-                    "Cannot extract audio from video: original_video_bytes is "
-                    "missing or empty. When using use_audio_in_video=True, "
-                    "video must be loaded with keep_video_bytes=True (e.g. via "
-                    "the chat API with a model that sets use_audio_in_video)."
+                # Dummy/profiling videos carry no encoded bytes; skip audio
+                # extraction instead of raising (docstring: silently skipped).
+                logger.debug(
+                    "Video %d: no original_video_bytes; skipping audio extraction.",
+                    idx,
                 )
+                has_audio.append(False)
+                continue
             try:
                 audio_items.append(load_audio_pyav(BytesIO(video_bytes)))
                 has_audio.append(True)
@@ -828,7 +831,9 @@ class NanoNemotronVLDummyInputsBuilder(
             )
         }
 
-        if self.info.supports_video:
+        num_videos = mm_counts.get("video", 0)
+
+        if self.info.supports_video and num_videos > 0:
             config = self.info.get_hf_config()
             image_size: int = config.force_image_size
 
@@ -857,7 +862,6 @@ class NanoNemotronVLDummyInputsBuilder(
             ):
                 assert num_frames > 0
                 target_num_frames = num_frames
-            num_videos = mm_counts.get("video", 0)
             video_overrides = mm_options.get("video")
             dummy_video = {
                 "video": self._get_dummy_videos(
@@ -873,20 +877,25 @@ class NanoNemotronVLDummyInputsBuilder(
 
         if sound_config := self.info.sound_config:
             num_audios = mm_counts.get("audio", 0)
-            audio_overrides = mm_options.get("audio") if mm_options else None
-            tokens_per_audio = max(1, seq_len // max(num_audios, 1))
-            max_audio_num_samples = MAX_AUDIO_LEN_S * sound_config.sampling_rate
-            calculated_max_audio_num_samples = ParakeetExtractor.audio_length(
-                sound_config, tokens_per_audio
-            )
-            audio_len = min(max_audio_num_samples, calculated_max_audio_num_samples)
-            dummy_audio = {
-                "audio": self._get_dummy_audios(
-                    length=audio_len,
-                    num_audios=num_audios,
-                    overrides=audio_overrides,
+            if num_audios > 0:
+                audio_overrides = mm_options.get("audio") if mm_options else None
+                tokens_per_audio = max(1, seq_len // max(num_audios, 1))
+                max_audio_num_samples = MAX_AUDIO_LEN_S * sound_config.sampling_rate
+                calculated_max_audio_num_samples = ParakeetExtractor.audio_length(
+                    sound_config, tokens_per_audio
                 )
-            }
+                audio_len = min(
+                    max_audio_num_samples, calculated_max_audio_num_samples
+                )
+                dummy_audio = {
+                    "audio": self._get_dummy_audios(
+                        length=audio_len,
+                        num_audios=num_audios,
+                        overrides=audio_overrides,
+                    )
+                }
+            else:
+                dummy_audio = {}
         else:
             dummy_audio = {}
 
@@ -899,7 +908,12 @@ class NanoNemotronVLDummyInputsBuilder(
     dummy_inputs=NanoNemotronVLDummyInputsBuilder,
 )
 class NemotronH_Nano_VL_V2(
-    nn.Module, HasInnerState, IsHybrid, SupportsMultiModal, SupportsMultiModalPruning
+    nn.Module,
+    HasInnerState,
+    IsHybrid,
+    SupportsMambaPrefixCaching,
+    SupportsMultiModal,
+    SupportsMultiModalPruning,
 ):
     requires_sequential_video_encoding = True
     """Temporarily needed for dynamic res video w/ conv3d, doesn't support bs>1 yet"""
