@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from math import prod
+
 import torch
 from torch import nn
 
@@ -591,7 +593,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Triton's autotuner includes tensor dtypes in its cache key,
         # so state_dtype must match what real inference uses.
-        _, ssm_state_dtype = self.get_state_dtype()
+        conv_state_dtype, ssm_state_dtype = self.get_state_dtype()
 
         # SSD kernel autotune keys depend on dtype and head dimensions,
         # not on sequence length or batch size, so a single shape suffices.
@@ -662,6 +664,84 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     use_initial_states,
                     exc_info=True,
                 )
+
+        # The profile pass above exercises prefill only. With speculative
+        # decoding, the first real decode otherwise JIT-compiles the varlen
+        # causal-conv update after KV cache allocation. Long-context models
+        # can leave too little free HBM to load that kernel and fail their
+        # first request with CUDA OOM. Compile the exact spec-decode variant
+        # while memory is still plentiful.
+        decode_tokens = max(self.num_spec + 1, 1)
+        conv_state_len = self.conv_kernel_size - 1 + self.num_spec
+        assert self.cache_config is not None
+        mamba_block_size = self.cache_config.mamba_block_size
+        assert mamba_block_size is not None
+        max_state_blocks = (
+            self.model_config.max_model_len + mamba_block_size - 1
+        ) // mamba_block_size + self.num_spec
+
+        state_shapes = self.get_state_shape()
+        state_dtypes = self.get_state_dtype()
+        page_size_bytes = self.cache_config.mamba_page_size_padded
+        if page_size_bytes is None:
+            page_size_bytes = sum(
+                prod(shape) * torch.empty((), dtype=state_dtype).element_size()
+                for shape, state_dtype in zip(state_shapes, state_dtypes)
+            )
+        page_stride = page_size_bytes // torch.empty(
+            (), dtype=conv_state_dtype
+        ).element_size()
+        # Avoid a single cache line: Triton specializes integer arguments equal
+        # to one, while the runtime KV cache always contains many lines.
+        num_warmup_cache_lines = 2
+        conv_state_storage = torch.zeros(
+            num_warmup_cache_lines * page_stride,
+            device=device,
+            dtype=conv_state_dtype,
+        )
+        conv_state_stride = (
+            (page_stride, conv_state_len, 1)
+            if is_conv_state_dim_first()
+            else (page_stride, 1, self.tped_conv_size)
+        )
+        conv_state = torch.as_strided(
+            conv_state_storage,
+            size=(num_warmup_cache_lines, self.tped_conv_size, conv_state_len),
+            stride=conv_state_stride,
+        )
+        try:
+            causal_conv1d_update(
+                x=torch.zeros(
+                    decode_tokens,
+                    self.tped_conv_size,
+                    device=device,
+                    dtype=dtype,
+                ),
+                conv_state=conv_state,
+                weight=self.conv_weights,
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                conv_state_indices=torch.zeros(
+                    1, max_state_blocks, device=device, dtype=torch.int32
+                ),
+                num_accepted_tokens=torch.ones(1, device=device, dtype=torch.int32),
+                query_start_loc=torch.tensor(
+                    [0, decode_tokens], device=device, dtype=torch.int32
+                ),
+                max_query_len=max_state_blocks,
+                block_idx_last_scheduled_token=torch.zeros(
+                    1, device=device, dtype=torch.int32
+                ),
+                initial_state_idx=torch.zeros(1, device=device, dtype=torch.int32),
+            )
+            current_platform.synchronize()
+        except Exception:
+            logger.warning(
+                "Mamba2 speculative decode kernel warmup failed for layer %s. "
+                "First inference may experience a latency spike or OOM.",
+                self.prefix,
+                exc_info=True,
+            )
 
         logger.debug("Mamba2 SSD kernel warmup completed for layer %s", self.prefix)
         torch.accelerator.empty_cache()

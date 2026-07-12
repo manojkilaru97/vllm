@@ -765,7 +765,7 @@ def _causal_conv1d_update_kernel(
     dim: tl.constexpr,
     seqlen: tl.constexpr,
     state_len: tl.constexpr,
-    num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
+    num_cache_lines: int,  # runtime value varies with available KV cache memory
     # Strides
     stride_x_seq: tl.constexpr,
     stride_x_dim: tl.constexpr,
