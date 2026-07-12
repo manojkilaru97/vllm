@@ -115,7 +115,11 @@ class XgrammarBackend(StructuredOutputBackend):
         *,
         any_whitespace: bool,
     ) -> StructuredOutputGrammar:
+        preserve_tool_call_quote_boundaries = False
         if request_type == StructuredOutputOptions.JSON:
+            preserve_tool_call_quote_boundaries = _is_tool_call_array_schema(
+                grammar_spec
+            )
             ctx = self.compiler.compile_json_schema(
                 grammar_spec, any_whitespace=any_whitespace
             )
@@ -159,6 +163,7 @@ class XgrammarBackend(StructuredOutputBackend):
             ctx=ctx,
             quote_token_id=self.quote_token_id,
             quote_boundary_clear_mask=self.quote_boundary_clear_mask,
+            preserve_tool_call_quote_boundaries=preserve_tool_call_quote_boundaries,
         )
 
     def allocate_token_bitmask(self, max_num_seqs: int):
@@ -186,6 +191,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
     _is_terminated: bool = field(default=False, repr=False, hash=False)
     quote_token_id: int | None = None
     quote_boundary_clear_mask: torch.Tensor | None = None
+    preserve_tool_call_quote_boundaries: bool = False
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
@@ -248,7 +254,10 @@ class XgrammarGrammar(StructuredOutputGrammar):
         # Discriminate via the matcher: accepting one quote at an open state
         # enters an empty string where a second quote ('""') is still legal; at
         # a close state the quote terminates the string and a second is not.
-        if not self._quote_opens_string():
+        if (
+            not self.preserve_tool_call_quote_boundaries
+            and not self._quote_opens_string()
+        ):
             return
         bitmask.bitwise_and_(self.quote_boundary_clear_mask)
 
@@ -265,6 +274,31 @@ class XgrammarGrammar(StructuredOutputGrammar):
     def reset(self):
         self.num_processed_tokens = 0
         self.matcher.reset()
+
+
+def _is_tool_call_array_schema(grammar_spec: str) -> bool:
+    try:
+        schema = json.loads(grammar_spec)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(schema, dict) or schema.get("type") != "array":
+        return False
+    items = schema.get("items")
+    if not isinstance(items, dict):
+        return False
+    candidates = items.get("anyOf")
+    if not isinstance(candidates, list):
+        candidates = [items]
+    return any(
+        isinstance(candidate, dict)
+        and isinstance(candidate.get("properties"), dict)
+        and "name" in candidate["properties"]
+        and (
+            "parameters" in candidate["properties"]
+            or "arguments" in candidate["properties"]
+        )
+        for candidate in candidates
+    )
 
 
 # cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc
