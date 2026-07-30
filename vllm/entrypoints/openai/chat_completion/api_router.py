@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import logging
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -22,8 +23,19 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.logger import init_logger
+from vllm.payload_logging import (
+    is_payload_logging_enabled,
+    log_payload,
+    log_payload_lazy,
+)
+from vllm.payload_sanitization import maybe_redact_mm_payload
+from vllm.payload_suppression import (
+    build_suppressed_error_payload,
+    payload_suppression_context_from_headers,
+)
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 router = APIRouter()
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
@@ -61,6 +73,46 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
+        rid = raw_request.headers.get("X-Request-Id", "")
+        if rid and is_payload_logging_enabled():
+            try:
+                endpoint = handler.__class__.__name__
+                headers_obj = {k: v for k, v in raw_request.headers.items()}
+                suppression_context = payload_suppression_context_from_headers(
+                    headers_obj
+                )
+                if suppression_context is not None:
+                    log_payload(
+                        payload_logger,
+                        "openai.response",
+                        extra={
+                            "rid": rid,
+                            "request_id": rid,
+                            "endpoint": endpoint,
+                            "payload_suppressed": True,
+                            "suppression_reason": suppression_context.reason,
+                            "nca_id": suppression_context.nca_id,
+                            "payload": build_suppressed_error_payload(
+                                generator, suppression_context
+                            ),
+                        },
+                    )
+                    return JSONResponse(
+                        content=generator.model_dump(),
+                        status_code=generator.error.code,
+                    )
+                log_payload_lazy(
+                    payload_logger,
+                    "openai.response",
+                    build_extra=lambda: {
+                        "rid": rid,
+                        "request_id": rid,
+                        "endpoint": endpoint,
+                        "payload": maybe_redact_mm_payload(generator.model_dump()),
+                    },
+                )
+            except Exception:
+                pass
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
