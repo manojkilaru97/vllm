@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
+import logging
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from copy import copy
 from http import HTTPStatus
 from typing import Any, Final
@@ -48,6 +50,10 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     get_user_message,
     has_custom_tools,
     render_for_completion,
+)
+from vllm.entrypoints.openai.request_metrics import (
+    classify_responses_request,
+    summarize_request_payload,
 )
 from vllm.entrypoints.openai.responses.context import (
     ConversationContext,
@@ -99,6 +105,20 @@ from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import Parser, ParserManager
+from vllm.payload_logging import (
+    is_payload_logging_enabled,
+    log_payload,
+    log_payload_lazy,
+    schedule_payload_log_task,
+)
+from vllm.payload_sanitization import prepare_request_payload_for_logging
+from vllm.payload_suppression import (
+    build_suppressed_request_payload,
+    build_suppressed_response_payload_from_obj,
+    payload_suppression_context_for_request_id,
+    register_request_logging_context,
+    request_logging_context_from_headers,
+)
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
@@ -106,6 +126,144 @@ from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
+
+
+def _register_responses_request_logging_context(
+    raw_request: Request | None,
+    request: ResponsesRequest,
+) -> tuple[dict[str, str] | None, Any]:
+    headers = None
+    if raw_request is not None:
+        with suppress(Exception):
+            headers = dict(raw_request.headers.items())
+    context = register_request_logging_context(
+        request.request_id,
+        request_logging_context_from_headers(
+            headers,
+            model=request.model,
+            stream=bool(request.stream),
+        ),
+    )
+    return headers, context
+
+
+async def _log_responses_request_payload(
+    raw_request: Request,
+    request: ResponsesRequest,
+    serving_render: OnlineRenderer,
+    headers: dict[str, str] | None,
+    context: Any,
+) -> None:
+    if not is_payload_logging_enabled():
+        return
+    rid = request.request_id
+    suppression = payload_suppression_context_for_request_id(rid)
+    if suppression is not None:
+        log_payload(
+            payload_logger,
+            "openai.request",
+            extra={
+                "rid": rid,
+                "request_id": rid,
+                "endpoint": OpenAIServingResponses.__name__,
+                "payload_suppressed": context.payload_suppressed,
+                "suppression_reason": suppression.reason,
+                "nca_id": suppression.nca_id,
+                "payload": build_suppressed_request_payload(request, suppression),
+            },
+        )
+        return
+
+    try:
+        body = await raw_request.body()
+    except Exception:
+        body = b""
+    try:
+        allowed_local_media_path = serving_render.model_config.allowed_local_media_path
+    except Exception:
+        allowed_local_media_path = ""
+
+    def build_extra() -> dict[str, Any] | None:
+        payload = None
+        if body:
+            with suppress(Exception):
+                payload = json.loads(body)
+        if payload is None:
+            try:
+                payload = request.model_dump(mode="json", by_alias=True)
+            except Exception:
+                return None
+        summary = summarize_request_payload(payload)
+        return {
+            "rid": rid,
+            "request_id": rid,
+            "endpoint": OpenAIServingResponses.__name__,
+            "input_image_count": summary.image_count,
+            "input_video_count": summary.video_count,
+            "input_audio_count": summary.audio_count,
+            "input_tool_count": summary.tool_count,
+            "has_images": summary.has_images,
+            "has_videos": summary.has_videos,
+            "has_audios": summary.has_audios,
+            "has_tools": summary.has_tools,
+            "has_tool_calls_enabled": summary.has_tool_calls_enabled,
+            "has_structured_output": summary.has_structured_output,
+            **(
+                {"tool_choice": summary.tool_choice}
+                if summary.tool_choice is not None
+                else {}
+            ),
+            **(
+                {"structured_output_kind": summary.structured_output_kind}
+                if summary.structured_output_kind is not None
+                else {}
+            ),
+            "payload": prepare_request_payload_for_logging(
+                payload,
+                headers=headers,
+                allowed_local_media_path=allowed_local_media_path,
+            ),
+            "headers": headers,
+        }
+
+    log_payload_lazy(payload_logger, "openai.request", build_extra=build_extra)
+
+
+def _log_responses_response_payload(
+    rid: str,
+    response: ResponsesResponse,
+) -> None:
+    if not is_payload_logging_enabled():
+        return
+    suppression = payload_suppression_context_for_request_id(rid)
+    if suppression is not None:
+        log_payload(
+            payload_logger,
+            "openai.response",
+            extra={
+                "rid": rid,
+                "request_id": rid,
+                "endpoint": OpenAIServingResponses.__name__,
+                "payload_suppressed": True,
+                "suppression_reason": suppression.reason,
+                "nca_id": suppression.nca_id,
+                "payload": build_suppressed_response_payload_from_obj(
+                    response, suppression
+                ),
+            },
+        )
+    else:
+        log_payload_lazy(
+            payload_logger,
+            "openai.response",
+            build_extra=lambda: {
+                "rid": rid,
+                "request_id": rid,
+                "endpoint": OpenAIServingResponses.__name__,
+                "payload": response.model_dump(mode="json", by_alias=True),
+            },
+        )
 
 
 def _extract_allowed_tools_from_mcp_requests(
@@ -352,6 +510,24 @@ class OpenAIServingResponses(GenerateBaseServing):
         maybe_validation_error = self._validate_create_responses_input(request)
         if maybe_validation_error is not None:
             return maybe_validation_error
+
+        if is_payload_logging_enabled() and raw_request is not None:
+            headers, context = _register_responses_request_logging_context(
+                raw_request, request
+            )
+            schedule_payload_log_task(
+                _log_responses_request_payload(
+                    raw_request,
+                    request,
+                    self.online_renderer,
+                    headers,
+                    context,
+                ),
+                label="responses.request",
+                rid=request.request_id,
+            )
+        if is_payload_logging_enabled():
+            classify_responses_request(request)
 
         # If the engine is dead, raise the engine's DEAD_ERROR.
         # This is required for the streaming case, where we return a
@@ -941,6 +1117,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 # If the response is already cancelled, don't update it.
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
+        _log_responses_response_payload(request.request_id, response)
         return response
 
     def _topk_logprobs(

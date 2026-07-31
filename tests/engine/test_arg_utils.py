@@ -9,7 +9,13 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import Field
 
-from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
+from vllm.config import (
+    AttentionConfig,
+    CompilationConfig,
+    ModelConfig,
+    VllmConfig,
+    config,
+)
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
@@ -204,6 +210,14 @@ def test_get_kwargs():
     assert json_tip in kwargs["json_tip"]["help"]
     # nested config should construct the nested config
     assert kwargs["nested_config"]["type"]('{"field": 2}') == NestedConfig(2)  # type: ignore[call-arg]
+
+
+def test_vllm_config_kwargs_do_not_infer_device():
+    kwargs = get_kwargs(VllmConfig)
+
+    # The aggregate device config is not a CLI argument. Constructing it here
+    # would require an accelerator merely to create the argument parser.
+    assert kwargs["device_config"]["default"] is None
 
 
 def test_jit_monitor_verbose_arg():

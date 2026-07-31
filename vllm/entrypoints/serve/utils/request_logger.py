@@ -8,6 +8,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.payload_suppression import payload_suppression_context_for_request_id
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 
@@ -41,9 +42,13 @@ class RequestLogger:
         params: SamplingParams | PoolingParams | BeamSearchParams | None,
         lora_request: LoRARequest | None,
     ) -> None:
+        suppression_context = payload_suppression_context_for_request_id(request_id)
         if logger.isEnabledFor(logging.DEBUG):
             max_log_len = self.max_log_len
-            if max_log_len is not None:
+            if suppression_context is not None:
+                prompt = None
+                prompt_token_ids = None
+            elif max_log_len is not None:
                 if prompt is not None:
                     prompt = prompt[:max_log_len]
 
@@ -59,6 +64,17 @@ class RequestLogger:
                 prompt_token_ids,
                 prompt_embeds.shape if prompt_embeds is not None else None,
             )
+
+        if suppression_context is not None:
+            logger.info(
+                "Received request %s: payload suppressed for nca_id: %s, "
+                "params: %s, lora_request: %s.",
+                request_id,
+                suppression_context.nca_id,
+                params,
+                lora_request,
+            )
+            return
 
         logger.info(
             "Received request %s: params: %s, lora_request: %s.",
@@ -76,8 +92,12 @@ class RequestLogger:
         is_streaming: bool = False,
         delta: bool = False,
     ) -> None:
+        suppression_context = payload_suppression_context_for_request_id(request_id)
         max_log_len = self.max_log_len
-        if max_log_len is not None:
+        if suppression_context is not None:
+            outputs = "[payload suppressed]"
+            output_token_ids = None
+        elif max_log_len is not None:
             if outputs is not None:
                 outputs = outputs[:max_log_len]
 

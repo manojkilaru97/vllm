@@ -3,9 +3,12 @@
 
 import asyncio
 import io
+import json
+import logging
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from collections.abc import Sequence as GenericSequence
+from contextlib import suppress
 from http import HTTPStatus
 from typing import Any, Final, cast
 
@@ -49,6 +52,10 @@ from vllm.entrypoints.openai.engine.protocol import (
     UsageInfo,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.request_metrics import (
+    classify_chat_request,
+    summarize_request_payload,
+)
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.tool_calls_utils import (
@@ -60,6 +67,21 @@ from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
+from vllm.payload_logging import (
+    is_payload_logging_enabled,
+    log_payload,
+    log_payload_lazy,
+    payload_log_max_response_chars,
+    schedule_payload_log_task,
+)
+from vllm.payload_sanitization import prepare_request_payload_for_logging
+from vllm.payload_suppression import (
+    build_suppressed_request_payload,
+    build_suppressed_response_payload,
+    payload_suppression_context_for_request_id,
+    register_request_logging_context,
+    request_logging_context_from_headers,
+)
 from vllm.renderers import ChatParams
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
@@ -68,6 +90,7 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tool_parser
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
@@ -209,6 +232,308 @@ class OpenAIServingChat(GenerateBaseServing):
             .chat_template_kwargs
         )
 
+    def _register_chat_request_logging_context(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None,
+        rid: str,
+    ) -> tuple[dict[str, str] | None, Any]:
+        headers = None
+        if raw_request is not None:
+            with suppress(Exception):
+                headers = dict(raw_request.headers.items())
+        context = register_request_logging_context(
+            rid,
+            request_logging_context_from_headers(
+                headers,
+                model=request.model,
+                stream=bool(request.stream),
+            ),
+        )
+        return headers, context
+
+    async def _log_chat_request_payload(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None,
+        rid: str,
+        headers: dict[str, str] | None,
+        context: Any,
+    ) -> None:
+        if not is_payload_logging_enabled():
+            return
+        suppression = payload_suppression_context_for_request_id(rid)
+        if suppression is not None:
+            log_payload(
+                payload_logger,
+                "openai.request",
+                extra={
+                    "rid": rid,
+                    "request_id": rid,
+                    "endpoint": self.__class__.__name__,
+                    "payload_suppressed": context.payload_suppressed,
+                    "suppression_reason": suppression.reason,
+                    "nca_id": suppression.nca_id,
+                    "payload": build_suppressed_request_payload(request, suppression),
+                },
+            )
+            return
+
+        body = b""
+        if raw_request is not None:
+            with suppress(Exception):
+                body = await raw_request.body()
+        try:
+            allowed_local_media_path = (
+                self.openai_serving_render.model_config.allowed_local_media_path
+            )
+        except Exception:
+            allowed_local_media_path = ""
+
+        def build_extra() -> dict[str, Any] | None:
+            payload = None
+            if body:
+                with suppress(Exception):
+                    payload = json.loads(body)
+            if payload is None:
+                try:
+                    payload = request.model_dump(mode="json")
+                except Exception:
+                    return None
+            summary = summarize_request_payload(payload)
+            return {
+                "rid": rid,
+                "request_id": rid,
+                "endpoint": self.__class__.__name__,
+                "input_image_count": summary.image_count,
+                "input_video_count": summary.video_count,
+                "input_audio_count": summary.audio_count,
+                "input_tool_count": summary.tool_count,
+                "has_images": summary.has_images,
+                "has_videos": summary.has_videos,
+                "has_audios": summary.has_audios,
+                "has_tools": summary.has_tools,
+                "has_tool_calls_enabled": summary.has_tool_calls_enabled,
+                "has_structured_output": summary.has_structured_output,
+                **(
+                    {"tool_choice": summary.tool_choice}
+                    if summary.tool_choice is not None
+                    else {}
+                ),
+                **(
+                    {"structured_output_kind": summary.structured_output_kind}
+                    if summary.structured_output_kind is not None
+                    else {}
+                ),
+                "payload": prepare_request_payload_for_logging(
+                    payload,
+                    headers=headers,
+                    allowed_local_media_path=allowed_local_media_path,
+                ),
+                "headers": headers,
+            }
+
+        log_payload_lazy(payload_logger, "openai.request", build_extra=build_extra)
+
+    def _log_chat_response_payload(
+        self,
+        rid: str,
+        payload: dict[str, Any] | Callable[[], dict[str, Any]],
+    ) -> None:
+        if not is_payload_logging_enabled():
+            return
+        suppression = payload_suppression_context_for_request_id(rid)
+        if suppression is not None:
+            safe_payload = build_suppressed_response_payload(
+                None if callable(payload) else payload,
+                suppression,
+            )
+            log_payload(
+                payload_logger,
+                "openai.response",
+                extra={
+                    "rid": rid,
+                    "request_id": rid,
+                    "endpoint": self.__class__.__name__,
+                    "payload_suppressed": True,
+                    "suppression_reason": suppression.reason,
+                    "nca_id": suppression.nca_id,
+                    "payload": safe_payload,
+                },
+            )
+        elif callable(payload):
+            log_payload_lazy(
+                payload_logger,
+                "openai.response",
+                build_extra=lambda: {
+                    "rid": rid,
+                    "request_id": rid,
+                    "endpoint": self.__class__.__name__,
+                    "payload": payload(),
+                },
+            )
+        else:
+            log_payload(
+                payload_logger,
+                "openai.response",
+                extra={
+                    "rid": rid,
+                    "request_id": rid,
+                    "endpoint": self.__class__.__name__,
+                    "payload": payload,
+                },
+            )
+
+    async def _logged_chat_stream(
+        self,
+        stream: AsyncGenerator[str, None],
+        rid: str,
+    ) -> AsyncGenerator[str, None]:
+        response_id = f"chatcmpl-{rid}"
+        model = None
+        usage = None
+        saw_chunk = False
+        tap_failed = False
+        accumulated_chars = 0
+        max_response_chars = payload_log_max_response_chars()
+        choices_by_index: dict[int, dict[str, Any]] = {}
+        try:
+            async for item in stream:
+                yield item
+                if (
+                    not tap_failed
+                    and item.startswith("data: ")
+                    and item != "data: [DONE]\n\n"
+                ):
+                    try:
+                        chunk = json.loads(item[6:])
+                        if isinstance(chunk, dict):
+                            saw_chunk = True
+                            response_id = str(chunk.get("id") or response_id)
+                            model = chunk.get("model") or model
+                            usage = chunk.get("usage") or usage
+                            for choice in chunk.get("choices") or []:
+                                index = int(choice.get("index", 0))
+                                state = choices_by_index.setdefault(
+                                    index,
+                                    {
+                                        "role": "assistant",
+                                        "content": [],
+                                        "reasoning_content": [],
+                                        "tool_calls": {},
+                                        "finish_reason": None,
+                                    },
+                                )
+                                delta = choice.get("delta") or {}
+                                state["role"] = delta.get("role") or state["role"]
+                                fragments = [
+                                    (state["content"], delta.get("content")),
+                                    (
+                                        state["reasoning_content"],
+                                        delta.get("reasoning_content")
+                                        or delta.get("reasoning"),
+                                    ),
+                                ]
+                                for destination, value in fragments:
+                                    if value:
+                                        fragment = str(value)
+                                        accumulated_chars += len(fragment)
+                                        if accumulated_chars > max_response_chars:
+                                            raise OverflowError(
+                                                "stream payload logging limit exceeded"
+                                            )
+                                        destination.append(fragment)
+                                for position, tool_call in enumerate(
+                                    delta.get("tool_calls") or []
+                                ):
+                                    tool_index = int(tool_call.get("index", position))
+                                    accumulated = state["tool_calls"].setdefault(
+                                        tool_index,
+                                        {
+                                            "id": tool_call.get("id"),
+                                            "type": tool_call.get("type", "function"),
+                                            "function": {
+                                                "name": None,
+                                                "arguments": [],
+                                            },
+                                        },
+                                    )
+                                    if tool_call.get("id"):
+                                        accumulated["id"] = tool_call["id"]
+                                    if tool_call.get("type"):
+                                        accumulated["type"] = tool_call["type"]
+                                    function = tool_call.get("function") or {}
+                                    if function.get("name"):
+                                        accumulated["function"]["name"] = function[
+                                            "name"
+                                        ]
+                                    if function.get("arguments"):
+                                        fragment = str(function["arguments"])
+                                        accumulated_chars += len(fragment)
+                                        if accumulated_chars > max_response_chars:
+                                            raise OverflowError(
+                                                "stream payload logging limit exceeded"
+                                            )
+                                        accumulated["function"]["arguments"].append(
+                                            fragment
+                                        )
+                                if choice.get("finish_reason") is not None:
+                                    state["finish_reason"] = choice["finish_reason"]
+                    except Exception:
+                        tap_failed = True
+                        choices_by_index.clear()
+                        logger.warning(
+                            "Streaming response payload logging stopped for rid=%s",
+                            rid,
+                            exc_info=True,
+                        )
+        finally:
+            if saw_chunk:
+                try:
+                    choices = []
+                    for index in sorted(choices_by_index):
+                        state = choices_by_index[index]
+                        tool_calls = []
+                        for tool_index in sorted(state["tool_calls"]):
+                            tool_call = state["tool_calls"][tool_index]
+                            tool_call["function"]["arguments"] = "".join(
+                                tool_call["function"]["arguments"]
+                            )
+                            tool_calls.append(tool_call)
+                        content = "".join(state["content"])
+                        reasoning_content = "".join(state["reasoning_content"])
+                        message: dict[str, Any] = {
+                            "role": state["role"],
+                            "content": content or None,
+                            "tool_calls": tool_calls,
+                        }
+                        if reasoning_content:
+                            message["reasoning_content"] = reasoning_content
+                        choices.append(
+                            {
+                                "index": index,
+                                "message": message,
+                                "finish_reason": state["finish_reason"],
+                            }
+                        )
+                    self._log_chat_response_payload(
+                        rid,
+                        {
+                            "id": response_id,
+                            "object": "chat.completion",
+                            "model": model,
+                            "choices": choices,
+                            "usage": usage,
+                            **({"payload_truncated": True} if tap_failed else {}),
+                        },
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to finalize streaming response payload log rid=%s",
+                        rid,
+                        exc_info=True,
+                    )
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -269,15 +594,28 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
+        rid_hint = self._base_request_id(raw_request, request.request_id)
+        if is_payload_logging_enabled():
+            headers, context = self._register_chat_request_logging_context(
+                request, raw_request, rid_hint
+            )
+            schedule_payload_log_task(
+                self._log_chat_request_payload(
+                    request, raw_request, rid_hint, headers, context
+                ),
+                label="chat.request",
+                rid=rid_hint,
+            )
+
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
 
+        if is_payload_logging_enabled():
+            classify_chat_request(request)
         conversation, engine_inputs = result
 
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-        )
+        request_id = f"chatcmpl-{rid_hint}"
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
@@ -382,7 +720,7 @@ class OpenAIServingChat(GenerateBaseServing):
         (result_generator,) = generators
 
         if request.stream:
-            return self.chat_completion_stream_generator(
+            stream = self.chat_completion_stream_generator(
                 request,
                 result_generator,
                 request_id,
@@ -393,8 +731,11 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 mm_token_counts=mm_token_counts,
             )
+            if is_payload_logging_enabled():
+                return self._logged_chat_stream(stream, rid_hint)
+            return stream
 
-        return await self.chat_completion_full_generator(
+        response = await self.chat_completion_full_generator(
             request,
             result_generator,
             request_id,
@@ -405,6 +746,12 @@ class OpenAIServingChat(GenerateBaseServing):
             parser=parser,
             mm_token_counts=mm_token_counts,
         )
+        if isinstance(response, ChatCompletionResponse):
+            self._log_chat_response_payload(
+                rid_hint,
+                lambda: response.model_dump(mode="json"),
+            )
+        return response
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:

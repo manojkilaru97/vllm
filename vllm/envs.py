@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
     VLLM_LOGGING_COLOR: str = "auto"
+    VLLM_LOG_MM_INPUT_METADATA: bool = True
+    VLLM_LOG_AUDIO_INPUT_METADATA: bool = True
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
@@ -786,6 +788,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to log responses from API Server for debugging
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": lambda: (
         os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").lower() == "true"
+    ),
+    "VLLM_LOG_MM_INPUT_METADATA": lambda: bool(
+        int(os.getenv("VLLM_LOG_MM_INPUT_METADATA", "1"))
+    ),
+    "VLLM_LOG_AUDIO_INPUT_METADATA": lambda: bool(
+        int(os.getenv("VLLM_LOG_AUDIO_INPUT_METADATA", "1"))
     ),
     # S3 access information, used for tensorizer to load model from S3
     "S3_ACCESS_KEY_ID": lambda: os.environ.get("S3_ACCESS_KEY_ID", None),

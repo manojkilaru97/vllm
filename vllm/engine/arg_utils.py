@@ -304,6 +304,11 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
             if isinstance(default, FieldInfo):
                 if default.default_factory is None:
                     default = default.default
+                elif cls is VllmConfig and field.name == "device_config":
+                    # DeviceConfig infers the accelerator during construction.
+                    # CLI generation does not expose this aggregate field, and
+                    # frontends may legitimately build the parser without a GPU.
+                    default = None
                 else:
                     # VllmConfig's Fields have default_factory set to config classes.
                     # These could emit logs on init, which would be confusing.

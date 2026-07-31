@@ -163,11 +163,11 @@ def qwen3_config(
             # Malformed: </function> while still in TOOL_NAME (no closing >)
             (ParserState.TOOL_NAME, "FUNC_END"): Transition(
                 ParserState.TOOL_BETWEEN,
-                (EventType.TOOL_CALL_END,),
+                (),
             ),
             (ParserState.TOOL_ARGS, "FUNC_END"): Transition(
                 ParserState.TOOL_BETWEEN,
-                (EventType.TOOL_CALL_END,),
+                (),
             ),
             (ParserState.TOOL_ARGS, "PARAM_START"): Transition(
                 ParserState.TOOL_ARGS,
@@ -177,18 +177,27 @@ def qwen3_config(
                 ParserState.TOOL_ARGS,
                 (EventType.ARG_VALUE_CHUNK,),
             ),
+            (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TOOL_CALL_END,),
+            ),
+            # Recover parameters emitted after a premature </function>.
+            (ParserState.TOOL_BETWEEN, "PARAM_START"): Transition(
+                ParserState.TOOL_ARGS,
+                (EventType.ARG_VALUE_CHUNK,),
+            ),
             (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
                 ParserState.CONTENT,
-                (),
+                (EventType.TOOL_CALL_END,),
             ),
             # Consecutive tool call without closing </tool_call>
             (ParserState.TOOL_BETWEEN, "TOOL_START"): Transition(
                 ParserState.TOOL_PREAMBLE,
-                (EventType.TOOL_CALL_START,),
+                (EventType.TOOL_CALL_END, EventType.TOOL_CALL_START),
             ),
             (ParserState.TOOL_BETWEEN, "FUNC_PREFIX"): Transition(
                 ParserState.TOOL_NAME,
-                (EventType.TOOL_CALL_START,),
+                (EventType.TOOL_CALL_END, EventType.TOOL_CALL_START),
             ),
         },
         arg_converter=_qwen3_arg_converter,
