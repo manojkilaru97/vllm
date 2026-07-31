@@ -254,6 +254,42 @@ class TestNonStreaming:
         args1 = json.loads(result.tool_calls[1].function.arguments)
         assert args1 == {"city": "Paris"}
 
+    def test_parameter_after_premature_function_end(self, parser, mock_request):
+        text = (
+            "<tool_call>\n"
+            "<function=Bash>\n"
+            "<parameter=command>echo ok</parameter>\n"
+            "</function>\n"
+            "<parameter=description>Say ok</parameter>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"command": "echo ok", "description": "Say ok"}
+
+    def test_parameter_without_function_remains_content(self, parser, mock_request):
+        text = "<parameter=description>Say ok</parameter>"
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_tool_call_without_tool_end_finishes(self, parser, mock_request):
+        text = (
+            "<tool_call>\n"
+            "<function=Bash>\n"
+            "<parameter=command>echo ok</parameter>\n"
+            "</function>"
+        )
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"command": "echo ok"}
+
     def test_nested_json_array_parameter(self, parser, mock_request):
         text = (
             "<tool_call>\n"
@@ -502,6 +538,33 @@ class TestStreaming:
         assert "get_weather" in names
         assert "get_time" in names
 
+    def test_streaming_consecutive_calls_without_tool_end(self, parser, mock_request):
+        chunks = [
+            "<tool_call>\n",
+            "<function=get_weather>\n",
+            "<parameter=city>Tokyo</parameter>\n",
+            "</function>\n",
+            "<tool_call>\n",
+            "<function=get_time>\n",
+            "<parameter=timezone>Asia/Tokyo</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        args_by_index: dict[int, str] = {}
+        for delta, _ in results:
+            if delta and delta.tool_calls:
+                for tool_call in delta.tool_calls:
+                    function = tool_call.function
+                    if function and function.arguments:
+                        args_by_index[tool_call.index] = (
+                            args_by_index.get(tool_call.index, "") + function.arguments
+                        )
+
+        assert json.loads(args_by_index[0]) == {"city": "Tokyo"}
+        assert json.loads(args_by_index[1]) == {"timezone": "Asia/Tokyo"}
+
     def test_streaming_value_split_across_chunks(self, parser, mock_request):
         """Parameter value split across multiple chunks."""
         chunks = [
@@ -634,6 +697,42 @@ class TestStreaming:
 
         assert "Bash" in names
         assert "Read" in names
+
+    def test_streaming_parameter_after_premature_function_end(
+        self, mock_tokenizer, mock_request
+    ):
+        text = (
+            "<tool_call>\n"
+            "<function=Bash>\n"
+            "<parameter=command>echo ok</parameter>\n"
+            "</function>\n"
+            "<parameter=description>Say ok</parameter>\n"
+            "</tool_call>"
+        )
+        chunkings = [
+            list(text),
+            [
+                "<tool_call>\n",
+                "<function=Bash>\n",
+                "<parameter=command>echo ok</parameter>\n",
+                "</function>\n",
+                "<parameter=description>Say ok</parameter>\n",
+                "</tool_call>",
+            ],
+        ]
+
+        for chunks in chunkings:
+            parser = ParserEngine(
+                mock_tokenizer,
+                parser_engine_config=qwen3_config(thinking=False),
+            )
+            results = simulate_tool_streaming(parser, mock_request, chunks)
+
+            args_text = collect_tool_arguments(results)
+            assert json.loads(args_text) == {
+                "command": "echo ok",
+                "description": "Say ok",
+            }
 
 
 class TestArgConverter:
