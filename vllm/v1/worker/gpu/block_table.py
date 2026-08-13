@@ -163,7 +163,13 @@ class BlockTables:
         # Therefore, this method must return the persistent tensor
         # with the same memory address as that used during the model's forward pass,
         # rather than allocating a new tensor.
-        return tuple(block_table[:num_reqs] for block_table in self.input_block_tables)
+        # Keep the persistent CUDA-graph storage address, but clear stale real
+        # request rows before a dummy run. Hybrid Mamba metadata uses these
+        # rows as recurrent-state indices and can otherwise corrupt live cache
+        # blocks through IDs left by a previous batch.
+        return tuple(
+            block_table[:num_reqs].zero_() for block_table in self.input_block_tables
+        )
 
     def compute_slot_mappings(
         self,

@@ -144,6 +144,11 @@ class BlockTable:
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
+        # Clear the vacated source row. Padded dummy-run batches dereference
+        # these rows as Mamba state slots; stale block IDs can otherwise make
+        # a dummy run overwrite a block after it has been reallocated.
+        block_table_np[src, :num_blocks] = 0
+        self.num_blocks_per_row[src] = 0
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]

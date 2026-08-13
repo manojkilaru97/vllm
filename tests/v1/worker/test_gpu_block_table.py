@@ -130,3 +130,54 @@ def test_block_tables_apply_staged_writes_single_group():
         block_tables.block_tables[0].gpu[0, :2],
         torch.tensor([1, 2], dtype=torch.int32, device=device),
     )
+
+
+def test_v1_block_table_move_row_clears_vacated_row():
+    """Vacated rows must not retain block IDs used by Mamba dummy runs."""
+    from vllm.v1.worker.block_table import BlockTable
+
+    block_table = BlockTable(
+        block_size=16,
+        max_num_reqs=4,
+        max_num_blocks_per_req=8,
+        max_num_batched_tokens=64,
+        pin_memory=False,
+        device=torch.device("cuda"),
+        kernel_block_size=16,
+        cp_kv_cache_interleave_size=1,
+    )
+    block_table.add_row([7, 8, 9], row_idx=0)
+    block_table.add_row([4, 5], row_idx=1)
+
+    block_table.move_row(1, 0)
+
+    assert block_table.block_table.np[0, :2].tolist() == [4, 5]
+    assert block_table.num_blocks_per_row[0] == 2
+    assert block_table.num_blocks_per_row[1] == 0
+    assert (block_table.block_table.np[1] == 0).all()
+
+
+def test_get_dummy_block_tables_returns_zeroed_rows():
+    """Dummy runs must use null rows while preserving CUDA graph addresses."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16],
+        max_num_reqs=4,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[8],
+        device=device,
+        kernel_block_sizes=[16],
+    )
+    block_tables.append_block_ids(
+        req_index=0, new_block_ids=([1, 2],), overwrite=True
+    )
+    block_tables.apply_staged_writes()
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    block_tables.gather_block_tables(idx_mapping, num_reqs_padded=1)
+    torch.accelerator.synchronize()
+    assert block_tables.input_block_tables[0][0, 0].item() == 1
+
+    dummy = block_tables.get_dummy_block_tables(num_reqs=1)
+    torch.accelerator.synchronize()
+    assert (dummy[0] == 0).all()
+    assert dummy[0].data_ptr() == block_tables.input_block_tables[0].data_ptr()
