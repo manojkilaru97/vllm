@@ -1,0 +1,37 @@
+ARG BASE_IMAGE=nvcr.io/qc69jvmznzxy/llm_nim/ultra:dynamo-vllm-08-13-v026-output-cap-arm64
+FROM ${BASE_IMAGE}
+
+USER root
+
+COPY vllm/v1/worker/block_table.py /tmp/vllm-backport/vllm/v1/worker/block_table.py
+COPY vllm/v1/worker/gpu/block_table.py /tmp/vllm-backport/vllm/v1/worker/gpu/block_table.py
+COPY vllm/v1/worker/gpu_model_runner.py /tmp/vllm-backport/vllm/v1/worker/gpu_model_runner.py
+
+RUN python3 - <<'PY'
+import importlib.util
+import py_compile
+import shutil
+from pathlib import Path
+
+spec = importlib.util.find_spec("vllm")
+if spec is None or spec.submodule_search_locations is None:
+    raise RuntimeError("installed vllm package not found")
+
+package = Path(next(iter(spec.submodule_search_locations)))
+overlay = Path("/tmp/vllm-backport/vllm")
+for relative in (
+    Path("v1/worker/block_table.py"),
+    Path("v1/worker/gpu/block_table.py"),
+    Path("v1/worker/gpu_model_runner.py"),
+):
+    destination = package / relative
+    if not destination.is_file():
+        raise RuntimeError(f"expected installed file missing: {destination}")
+    shutil.copy2(overlay / relative, destination)
+    py_compile.compile(str(destination), doraise=True)
+
+shutil.rmtree(overlay.parent)
+PY
+
+LABEL org.opencontainers.image.revision="5d20b1a4f" \
+      ai.nvidia.ultra.mamba-prefix-cache-fix="vllm-pr-49757"
