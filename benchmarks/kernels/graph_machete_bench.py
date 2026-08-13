@@ -12,6 +12,7 @@ import seaborn as sns
 from torch.utils.benchmark import Measurement as TMeasurement
 
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.pickle_utils import load_pickle_file
 
 if __name__ == "__main__":
     parser = FlexibleArgumentParser(
@@ -23,7 +24,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     with open(args.filename, "rb") as f:
-        data = pickle.load(f)
+        data = load_pickle_file(f)
         raw_results: list[TMeasurement] = data["results"]
 
     results = defaultdict(lambda: list())

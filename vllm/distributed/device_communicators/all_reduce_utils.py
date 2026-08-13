@@ -20,6 +20,7 @@ import vllm.envs as envs
 from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.pickle_utils import load_pickle_file
 from vllm.utils.system_utils import update_environment_variables
 
 logger = init_logger(__name__)
@@ -416,7 +417,7 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
                     f"{returned.stderr.decode()}"
                 ) from e
             with open(output_file.name, "rb") as f:
-                result = pickle.load(f)
+                result = load_pickle_file(f)
         # Cache entries must be keyed by local indices (0..N-1) because
         # gpu_p2p_access_check() is called with local ranks.
         id_to_local = {device_id: local for local, device_id in enumerate(ids)}

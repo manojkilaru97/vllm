@@ -33,6 +33,7 @@ from vllm.logging_utils import logtime
 from vllm.tasks import ScoreType
 from vllm.transformers_utils.dynamic_module import try_get_class_from_dynamic_module
 from vllm.utils.hashing import safe_hash
+from vllm.utils.pickle_utils import load_pickle_file
 
 if TYPE_CHECKING:
     from vllm.config.model import AttnTypeStr
@@ -1618,7 +1619,7 @@ def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
             ) from e
 
         with open(output_filepath, "rb") as f:
-            return pickle.load(f)
+            return load_pickle_file(f)
 
 
 def _run() -> None:
