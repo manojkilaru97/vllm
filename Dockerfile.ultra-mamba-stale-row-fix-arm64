@@ -6,6 +6,7 @@ USER root
 COPY vllm/v1/worker/block_table.py /tmp/vllm-backport/vllm/v1/worker/block_table.py
 COPY vllm/v1/worker/gpu/block_table.py /tmp/vllm-backport/vllm/v1/worker/gpu/block_table.py
 COPY vllm/v1/worker/gpu_model_runner.py /tmp/vllm-backport/vllm/v1/worker/gpu_model_runner.py
+COPY vllm/v1/core/sched/scheduler.py /tmp/vllm-backport/vllm/v1/core/sched/scheduler.py
 
 RUN python3 - <<'PY'
 import importlib.util
@@ -23,6 +24,7 @@ for relative in (
     Path("v1/worker/block_table.py"),
     Path("v1/worker/gpu/block_table.py"),
     Path("v1/worker/gpu_model_runner.py"),
+    Path("v1/core/sched/scheduler.py"),
 ):
     destination = package / relative
     if not destination.is_file():
@@ -33,5 +35,5 @@ for relative in (
 shutil.rmtree(overlay.parent)
 PY
 
-LABEL org.opencontainers.image.revision="5d20b1a4f" \
-      ai.nvidia.ultra.mamba-prefix-cache-fix="vllm-pr-49757"
+LABEL org.opencontainers.image.revision="5bd7a36a8" \
+      ai.nvidia.ultra.mamba-prefix-cache-fix="vllm-pr-49757,vllm-pr-51113"
