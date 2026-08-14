@@ -296,6 +296,7 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_DISABLE_MAMBA_PARTIAL_PREFIX_CACHE: bool = False
+    VLLM_PRIVATE_MAMBA_PREFIX_STATE: bool = False
 
 
 def get_default_cache_root():
@@ -1121,6 +1122,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # state block. Full scheduler-block-aligned prefix caching remains enabled.
     "VLLM_DISABLE_MAMBA_PARTIAL_PREFIX_CACHE": lambda: bool(
         int(os.getenv("VLLM_DISABLE_MAMBA_PARTIAL_PREFIX_CACHE", "0"))
+    ),
+    # Copy an aligned cached Mamba boundary into a request-private block before
+    # continuation while retaining normal attention prefix-cache reuse.
+    "VLLM_PRIVATE_MAMBA_PREFIX_STATE": lambda: bool(
+        int(os.getenv("VLLM_PRIVATE_MAMBA_PREFIX_STATE", "0"))
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

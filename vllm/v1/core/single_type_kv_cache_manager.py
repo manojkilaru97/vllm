@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -1471,31 +1472,70 @@ class MambaManager(SingleTypeKVCacheManager):
                 - len(new_computed_blocks)
                 - len(self.req_to_blocks[request_id])
             )
-            has_partial_hit = (
+            has_cow_hit = (
                 self._has_partial_local_hit(
                     new_computed_blocks, num_local_computed_tokens
                 )
                 or request_id in self._partial_hit_reqs
+                or self._needs_private_aligned_hit(
+                    new_computed_blocks, num_local_computed_tokens
+                )
             )
-            if has_partial_hit:
+            if has_cow_hit:
                 num_new_blocks = max(num_new_blocks, 0) + 1
             if num_new_blocks > 0:
                 if request_id in self._allocated_block_reqs:
                     # Old request. Needs at most 1 more blocks as we can reuse the
                     # speculative blocks in previous step.
-                    num_new_blocks = 1 + int(has_partial_hit)
+                    num_new_blocks = 1 + int(has_cow_hit)
                 else:
                     # First prefill. Allocate 1 block for running state, the
-                    # speculative blocks, and one extra block if a partial cache
-                    # hit must be copy-on-written before the new tokens run.
-                    num_new_blocks = (
-                        1 + self.num_speculative_blocks + int(has_partial_hit)
-                    )
+                    # speculative blocks, and one extra block if a cache hit
+                    # must be copy-on-written before the new tokens run.
+                    num_new_blocks = 1 + self.num_speculative_blocks + int(has_cow_hit)
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
             return num_new_blocks + num_evictable_computed_blocks
+
+    def _needs_private_aligned_hit(
+        self,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+    ) -> bool:
+        return (
+            envs.VLLM_PRIVATE_MAMBA_PREFIX_STATE
+            and self.mamba_cache_mode == "align"
+            and bool(new_computed_blocks)
+            and num_local_computed_tokens > 0
+            and num_local_computed_tokens % self.block_size == 0
+        )
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        private_aligned_hit = (
+            num_external_computed_tokens == 0
+            and self._needs_private_aligned_hit(
+                new_computed_blocks, num_local_computed_tokens
+            )
+        )
+        super().add_local_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if private_aligned_hit:
+            block_idx = num_local_computed_tokens // self.block_size - 1
+            source_block = self.req_to_blocks[request_id][block_idx]
+            assert not source_block.is_null
+            self._partial_hit_reqs[request_id] = (block_idx, source_block)
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
