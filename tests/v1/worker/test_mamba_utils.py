@@ -2198,6 +2198,9 @@ class TestPostprocessMambaFusedKernel:
         sd_source_temporal = torch.randn(
             cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
         )
+        dest_block_id = block_ids_per_req[0][mamba_state_idx[0]]
+        expected_conv = sd_source_conv.clone()
+        expected_conv[dest_block_id, :-1].copy_(sd_source_conv[dest_block_id, 1:])
 
         # SD GPU path. Default layout is SD.
         model_mamba_utils.get_conv_state_layout.cache_clear()
@@ -2226,6 +2229,13 @@ class TestPostprocessMambaFusedKernel:
         # Sanity: SD path actually modified the state (copy was performed).
         assert not torch.equal(sd_conv, sd_source_conv), (
             "SD baseline did not modify conv state; test setup is wrong"
+        )
+        torch.testing.assert_close(
+            sd_conv,
+            expected_conv,
+            rtol=0,
+            atol=0,
+            msg="SD conv shift did not preserve the untouched source snapshot",
         )
 
         # DS GPU path on the DS twin.
@@ -2260,11 +2270,10 @@ class TestPostprocessMambaFusedKernel:
         # DS bytes, un-permuted, should match the SD result.
         torch.testing.assert_close(
             ds_conv.permute(0, 2, 1).contiguous(),
-            sd_conv,
-            msg=(
-                "DS conv post-kernel does not match SD baseline; the DS "
-                "row-loop in postprocess_mamba_fused_kernel is wrong."
-            ),
+            expected_conv,
+            rtol=0,
+            atol=0,
+            msg=("DS conv shift did not preserve the untouched source snapshot."),
         )
         torch.testing.assert_close(
             ds_temporal,
