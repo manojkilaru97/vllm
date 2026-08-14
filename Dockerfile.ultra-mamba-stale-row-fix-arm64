@@ -43,5 +43,5 @@ for relative in (
 shutil.rmtree(overlay.parent)
 PY
 
-LABEL org.opencontainers.image.revision="8ff0c9756" \
-      ai.nvidia.ultra.mamba-prefix-cache-fix="vllm-pr-49757,vllm-pr-51113,vllm-pr-50729,vllm-pr-51766,coarse-prefix-guard"
+LABEL org.opencontainers.image.revision="a6600ad2c" \
+      ai.nvidia.ultra.mamba-prefix-cache-fix="vllm-pr-49757,vllm-pr-51113,vllm-pr-50729,vllm-pr-51766,coarse-prefix-guard,private-aligned-state"
