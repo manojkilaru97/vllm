@@ -39,5 +39,5 @@ for relative in (
 shutil.rmtree(overlay.parent)
 PY
 
-LABEL org.opencontainers.image.revision="77442747c" \
+LABEL org.opencontainers.image.revision="73bee3960" \
       ai.nvidia.ultra.mamba-prefix-cache-fix="vllm-pr-49757,vllm-pr-51113,vllm-pr-50729,vllm-pr-51766"
