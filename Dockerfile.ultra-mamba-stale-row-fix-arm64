@@ -7,6 +7,8 @@ COPY vllm/v1/worker/block_table.py /tmp/vllm-backport/vllm/v1/worker/block_table
 COPY vllm/v1/worker/gpu/block_table.py /tmp/vllm-backport/vllm/v1/worker/gpu/block_table.py
 COPY vllm/v1/worker/gpu_model_runner.py /tmp/vllm-backport/vllm/v1/worker/gpu_model_runner.py
 COPY vllm/v1/worker/mamba_utils.py /tmp/vllm-backport/vllm/v1/worker/mamba_utils.py
+COPY vllm/envs.py /tmp/vllm-backport/vllm/envs.py
+COPY vllm/v1/core/kv_cache_coordinator.py /tmp/vllm-backport/vllm/v1/core/kv_cache_coordinator.py
 COPY vllm/v1/core/sched/scheduler.py /tmp/vllm-backport/vllm/v1/core/sched/scheduler.py
 COPY vllm/v1/core/single_type_kv_cache_manager.py /tmp/vllm-backport/vllm/v1/core/single_type_kv_cache_manager.py
 
@@ -27,6 +29,8 @@ for relative in (
     Path("v1/worker/gpu/block_table.py"),
     Path("v1/worker/gpu_model_runner.py"),
     Path("v1/worker/mamba_utils.py"),
+    Path("envs.py"),
+    Path("v1/core/kv_cache_coordinator.py"),
     Path("v1/core/sched/scheduler.py"),
     Path("v1/core/single_type_kv_cache_manager.py"),
 ):
@@ -39,5 +43,5 @@ for relative in (
 shutil.rmtree(overlay.parent)
 PY
 
-LABEL org.opencontainers.image.revision="73bee3960" \
-      ai.nvidia.ultra.mamba-prefix-cache-fix="vllm-pr-49757,vllm-pr-51113,vllm-pr-50729,vllm-pr-51766"
+LABEL org.opencontainers.image.revision="8ff0c9756" \
+      ai.nvidia.ultra.mamba-prefix-cache-fix="vllm-pr-49757,vllm-pr-51113,vllm-pr-50729,vllm-pr-51766,coarse-prefix-guard"
