@@ -150,6 +150,57 @@ def test_hybrid_mamba_align_partial_hash_hit():
     assert manager.get_blocks("1").blocks[1][1].block_hash_num_tokens == 8
 
 
+def test_disable_mamba_partial_prefix_cache_keeps_aligned_hits(monkeypatch):
+    """The safety switch drops only an in-block tail, not prefix caching."""
+    monkeypatch.setenv("VLLM_DISABLE_MAMBA_PARTIAL_PREFIX_CACHE", "1")
+    hash_block_size = 2
+    mamba_block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=20,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    assert not manager.coordinator.enable_partial_hash_hits
+
+    producer = make_request("producer", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 6, num_computed, blocks) is not None
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request(
+        "consumer", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256
+    )
+    blocks, num_computed, _ = manager.get_computed_blocks(consumer)
+    assert num_computed == mamba_block_size
+    assert [len(group) for group in blocks.blocks] == [2, 1]
+
+
 def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
     hash_block_size = 2
     block_size = 2 * hash_block_size

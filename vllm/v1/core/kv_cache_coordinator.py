@@ -580,11 +580,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 )
         # Partial hash hits are limited to full-attention + mamba ("align")
         # without context parallelism.
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
-            for g in kv_cache_config.kv_cache_groups
+        self.enable_partial_hash_hits = (
+            dcp_world_size == 1
+            and any(
+                isinstance(g.kv_cache_spec, MambaSpec)
+                and g.kv_cache_spec.mamba_cache_mode == "align"
+                and g.kv_cache_spec.block_size > hash_block_size
+                for g in kv_cache_config.kv_cache_groups
+            )
+            and not envs.VLLM_DISABLE_MAMBA_PARTIAL_PREFIX_CACHE
         )
         self.verify_and_split_kv_cache_groups()
 
