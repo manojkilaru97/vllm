@@ -689,6 +689,14 @@ class SpeculativeConfig:
             )
             self.method = "mtp"
 
+        uses_target_nemotron_h_mtp = (
+            self.method == "mtp"
+            and self.model is None
+            and self.target_model_config is not None
+            and self.target_model_config.hf_text_config.model_type
+            in {"nemotron_h", "nemotron_h_puzzle"}
+        )
+
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
                 if self.target_model_config is None:
@@ -1034,10 +1042,14 @@ class SpeculativeConfig:
                     )
                 )
 
+                draft_max_model_len = self.draft_model_config.max_model_len
+                if uses_target_nemotron_h_mtp and self.max_model_len is None:
+                    draft_max_model_len = self.target_model_config.max_model_len
+
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,
-                        self.draft_model_config.max_model_len,
+                        draft_max_model_len,
                         self.target_model_config.max_model_len,
                     )
                 )
