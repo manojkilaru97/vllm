@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Test whether spec decoding handles the max model length properly."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from tests.utils import get_attn_backend_list_based_on_platform
@@ -108,3 +111,46 @@ def test_mtp_speculative_config_max_model_len(spec_max_model_len: int):
         max_model_len=spec_max_model_len,
     )
     assert spec_config.draft_model_config.max_model_len == spec_max_model_len
+
+
+def test_mtp_inherits_overridden_target_max_model_len(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    model_dir = tmp_path / "nemotron_h"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "max_position_embeddings": 128,
+                "num_hidden_layers": 1,
+                "hybrid_override_pattern": "M",
+                "mtp_hybrid_override_pattern": "E",
+                "num_nextn_predict_layers": 1,
+            }
+        )
+    )
+    target_max_model_len = 1_000_000
+    model_config = ModelConfig(
+        model=str(model_dir),
+        runner="generate",
+        max_model_len=target_max_model_len,
+    )
+    spec_config = SpeculativeConfig(
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(),
+        method="mtp",
+        num_speculative_tokens=1,
+    )
+    assert spec_config.draft_model_config.max_model_len == target_max_model_len
+
+    external_spec_config = SpeculativeConfig(
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(),
+        model=str(model_dir),
+        method="mtp",
+        num_speculative_tokens=1,
+    )
+    assert external_spec_config.draft_model_config.max_model_len == 128
