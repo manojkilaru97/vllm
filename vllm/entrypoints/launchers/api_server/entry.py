@@ -124,6 +124,16 @@ async def build_and_serve(
 
     Returns the shutdown task for the caller to await.
     """
+    if os.getenv("VLLM_LOG_PAYLOADS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        from vllm.payload_logging import configure_payload_logging
+
+        configure_payload_logging()
+
     # Get uvicorn log config (from file or with endpoint filter)
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
