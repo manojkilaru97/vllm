@@ -46,6 +46,11 @@ def init_entrypoints_middleware(
 
         app.add_middleware(ScalingMiddleware)
 
+    if envs.VLLM_LOG_PAYLOADS:
+        from vllm.payload_logging import PayloadLoggingMiddleware
+
+        app.add_middleware(PayloadLoggingMiddleware)
+
     if "realtime" in supported_tasks:
         # Add WebSocket metrics middleware
         from vllm.entrypoints.speech_to_text.realtime.metrics import (
