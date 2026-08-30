@@ -7,7 +7,10 @@ from itertools import islice
 from typing import TYPE_CHECKING
 
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
-from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
+from vllm.reasoning.abs_reasoning_parsers import (
+    ReasoningParser,
+    ReasoningTokenCounter,
+)
 from vllm.tokenizers import TokenizerLike
 
 if TYPE_CHECKING:
@@ -187,9 +190,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
         tokens do not drive the counter negative.
         """
         count = 0
-        # Some chat templates prefill the opening thinking marker in the
-        # prompt, so generated tokens begin inside the reasoning span.
-        depth = 0 if self.start_token_id in token_ids else 1
+        depth = 0
         for token_id in token_ids:
             if token_id == self.start_token_id:
                 depth += 1
@@ -201,3 +202,15 @@ class BaseThinkingReasoningParser(ReasoningParser):
             if depth > 0:
                 count += 1
         return count
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter:
+        counter = ReasoningTokenCounter(
+            start_sequences=((self.start_token_id,),),
+            end_sequences=((self.end_token_id,),),
+            initial_in_reasoning=True,
+        )
+        if prompt_token_ids is not None:
+            counter.seed(prompt_token_ids)
+        return counter

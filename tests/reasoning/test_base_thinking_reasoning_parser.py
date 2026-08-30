@@ -6,6 +6,7 @@ from transformers import AutoTokenizer
 
 from tests.reasoning.utils import run_reasoning_extraction
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 
 
@@ -178,9 +179,20 @@ class TestBaseThinkingReasoningParserMethods:
     def test_count_reasoning_tokens_with_prefilled_start(self, test_tokenizer):
         """Count reasoning when the prompt owns the opening marker."""
         parser = TestThinkingReasoningParser(test_tokenizer)
+        start = parser.start_token_id
         end = parser.end_token_id
-        token_ids = [11, 12, end, 99]
-        assert parser.count_reasoning_tokens(token_ids) == 2
+        counter = parser.create_reasoning_token_counter([start])
+        assert counter.update([11, 12, end, 99], finished=True) == 2
+
+    def test_incremental_counter_handles_split_markers(self):
+        counter = ReasoningTokenCounter(
+            start_sequences=((10, 11),),
+            end_sequences=((20, 21),),
+        )
+
+        assert counter.update([1, 10]) == 0
+        assert counter.update([11, 2, 3, 20]) == 2
+        assert counter.update([21, 4], finished=True) == 2
 
     def test_count_reasoning_tokens_nested(self, test_tokenizer):
         """Ensure nested thinking spans count all inner tokens safely."""

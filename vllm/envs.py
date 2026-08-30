@@ -715,7 +715,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Python package must be installed.
     "VLLM_USE_FASTOKENS": lambda: bool(int(os.getenv("VLLM_USE_FASTOKENS", "0"))),
     # Log complete OpenAI-compatible request and response payloads.
-    "VLLM_LOG_PAYLOADS": lambda: bool(int(os.getenv("VLLM_LOG_PAYLOADS", "0"))),
+    "VLLM_LOG_PAYLOADS": lambda: (
+        os.getenv("VLLM_LOG_PAYLOADS", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ),
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
         os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")

@@ -131,6 +131,37 @@ def _make_engine(
     )
 
 
+# ── Reasoning token usage ───────────────────────────────────────────
+
+
+class TestReasoningTokenUsage:
+    def test_counter_uses_prompt_state(self):
+        engine = _make_engine()
+        counter = engine.create_reasoning_token_counter([200])
+        assert counter is not None
+
+        assert counter.update([65, 66, 201, 67], finished=True) == 2
+
+    def test_counter_stays_closed_after_prompt_end(self):
+        engine = _make_engine()
+        counter = engine.create_reasoning_token_counter([200, 65, 201])
+        assert counter is not None
+
+        assert counter.update([66, 67], finished=True) == 0
+
+    def test_tool_start_implicitly_ends_reasoning(self):
+        config = _combined_config()
+        config.transitions[(ParserState.REASONING, "TOOL_START")] = Transition(
+            ParserState.TOOL_ARGS,
+            (EventType.REASONING_END, EventType.TOOL_CALL_START),
+        )
+        engine = _make_engine(config)
+        counter = engine.create_reasoning_token_counter([])
+        assert counter is not None
+
+        assert counter.update([65, 202, 66], finished=True) == 1
+
+
 # ── TestEventsToDelta ────────────────────────────────────────────────
 
 

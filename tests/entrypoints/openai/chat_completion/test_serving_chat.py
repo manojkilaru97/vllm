@@ -24,6 +24,8 @@ from vllm.entrypoints.generate.base.serving import build_per_request_timing_metr
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionUsageInfo,
+    CompletionTokenUsageInfo,
 )
 from vllm.entrypoints.openai.chat_completion.serving import (
     OpenAIServingChat,
@@ -31,8 +33,10 @@ from vllm.entrypoints.openai.chat_completion.serving import (
     _make_prompt_tokens_details,
 )
 from vllm.entrypoints.openai.engine.protocol import (
+    DeltaMessage,
     ErrorResponse,
     RequestResponseMetadata,
+    UsageInfo,
 )
 from vllm.entrypoints.openai.models.serving import (
     BaseModelPath,
@@ -45,6 +49,7 @@ from vllm.inputs import TokensPrompt
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import HarmonyParser
+from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.mistral import MistralRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -748,7 +753,7 @@ async def test_chat_nonstream_reasoning_token_usage():
     serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
     parser = MagicMock()
     parser.parse.return_value = ("reasoning", "answer", [])
-    parser.reasoning_parser.count_reasoning_tokens.return_value = 2
+    parser.create_reasoning_token_counter.return_value.update.return_value = 2
 
     response = await serving.chat_completion_full_generator(
         ChatCompletionRequest(
@@ -770,6 +775,21 @@ async def test_chat_nonstream_reasoning_token_usage():
     assert response.choices[0].message.reasoning is None
     assert response.usage.completion_tokens_details is not None
     assert response.usage.completion_tokens_details.reasoning_tokens == 2
+
+
+def test_reasoning_usage_details_are_chat_completions_only():
+    common_usage = UsageInfo(prompt_tokens=3, completion_tokens=2, total_tokens=5)
+    chat_usage = ChatCompletionUsageInfo(
+        prompt_tokens=3,
+        completion_tokens=2,
+        total_tokens=5,
+        completion_tokens_details=CompletionTokenUsageInfo(reasoning_tokens=1),
+    )
+
+    assert "completion_tokens_details" not in common_usage.model_dump()
+    assert chat_usage.model_dump()["completion_tokens_details"] == {
+        "reasoning_tokens": 1
+    }
 
 
 @pytest.mark.asyncio
@@ -813,6 +833,39 @@ async def test_chat_streaming_metrics_ride_on_usage_chunk():
         "reasoning_tokens": 0
     }
     assert usage_chunks[-1]["metrics"]["time_to_first_token_ms"] == pytest.approx(500.0)
+
+
+@pytest.mark.asyncio
+async def test_force_usage_stream_reports_incremental_reasoning_tokens():
+    serving = _build_minimal_metrics_serving_chat(
+        enable_per_request_metrics=False,
+        enable_force_include_usage=True,
+    )
+    parser = MagicMock()
+    parser.parse_delta.return_value = DeltaMessage(content="Hello")
+    counter = ReasoningTokenCounter(end_sequences=((101,),), initial_in_reasoning=True)
+    parser.create_reasoning_token_counter.return_value = counter
+    serving.parser_cls = MagicMock(return_value=parser)
+    serving.model_config = None
+
+    chunks = await _collect_metrics_stream_chunks(
+        serving,
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=True,
+        ),
+    )
+
+    usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
+    assert usage_chunks
+    assert usage_chunks[-1]["usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+        "completion_tokens_details": {"reasoning_tokens": 1},
+    }
 
 
 @dataclass
