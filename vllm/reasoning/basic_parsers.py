@@ -187,7 +187,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
         tokens do not drive the counter negative.
         """
         count = 0
-        depth = 0
+        # Some chat templates prefill the opening thinking marker in the
+        # prompt, so generated tokens begin inside the reasoning span.
+        depth = 0 if self.start_token_id in token_ids else 1
         for token_id in token_ids:
             if token_id == self.start_token_id:
                 depth += 1
