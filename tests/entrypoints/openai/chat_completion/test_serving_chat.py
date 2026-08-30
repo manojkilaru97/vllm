@@ -739,6 +739,37 @@ async def test_chat_per_request_metrics_follow_server_flag():
     )
     assert enabled_response.metrics is not None
     assert enabled_response.metrics.time_to_first_token_ms == pytest.approx(500.0)
+    assert enabled_response.usage.completion_tokens_details is not None
+    assert enabled_response.usage.completion_tokens_details.reasoning_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_nonstream_reasoning_token_usage():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    parser = MagicMock()
+    parser.parse.return_value = ("reasoning", "answer", [])
+    parser.reasoning_parser.count_reasoning_tokens.return_value = 2
+
+    response = await serving.chat_completion_full_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=False,
+            include_reasoning=False,
+        ),
+        _single_request_output(_make_metrics_request_output()),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+        parser=parser,
+    )
+
+    assert response.choices[0].message.reasoning is None
+    assert response.usage.completion_tokens_details is not None
+    assert response.usage.completion_tokens_details.reasoning_tokens == 2
 
 
 @pytest.mark.asyncio
@@ -778,6 +809,9 @@ async def test_chat_streaming_metrics_ride_on_usage_chunk():
 
     usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
     assert usage_chunks
+    assert usage_chunks[-1]["usage"]["completion_tokens_details"] == {
+        "reasoning_tokens": 0
+    }
     assert usage_chunks[-1]["metrics"]["time_to_first_token_ms"] == pytest.approx(500.0)
 
 
