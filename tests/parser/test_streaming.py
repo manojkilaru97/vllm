@@ -273,6 +273,50 @@ def test_parse_delta_reasoning_only_no_think_leak(tokenizer, request_obj):
     assert "<think>" not in content
 
 
+def test_reasoning_token_count_with_prefilled_start(tokenizer, request_obj):
+    """Count generated reasoning when the chat template owns ``<think>``."""
+    parser = make_parser(tokenizer, reasoning=True, tool=False)
+    parser.track_reasoning_tokens = True
+    reasoning_parser = parser.reasoning_parser
+    assert reasoning_parser is not None
+
+    output_text = "let me think about this</think>final answer"
+    output_token_ids = tokenizer.encode(output_text, add_special_tokens=False)
+    end_index = output_token_ids.index(reasoning_parser.end_token_id)
+
+    stream_text(
+        parser,
+        tokenizer,
+        output_text,
+        request_obj,
+        prompt_token_ids=[reasoning_parser.start_token_id],
+    )
+
+    assert parser.num_reasoning_tokens == end_index
+
+
+def test_reasoning_token_count_is_zero_when_prompt_closed_thinking(
+    tokenizer, request_obj
+):
+    parser = make_parser(tokenizer, reasoning=True, tool=False)
+    parser.track_reasoning_tokens = True
+    reasoning_parser = parser.reasoning_parser
+    assert reasoning_parser is not None
+
+    stream_text(
+        parser,
+        tokenizer,
+        "final answer only",
+        request_obj,
+        prompt_token_ids=[
+            reasoning_parser.start_token_id,
+            reasoning_parser.end_token_id,
+        ],
+    )
+
+    assert parser.num_reasoning_tokens == 0
+
+
 def test_parse_delta_reasoning_only_thinking_disabled(tokenizer, request_obj):
     """Regression test for vllm-project/vllm#40466.
 
