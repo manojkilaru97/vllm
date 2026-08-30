@@ -29,7 +29,10 @@ from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.parser.metrics import record_tool_parser_invocation
 from vllm.parser.utils import count_history_tool_calls
-from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
+from vllm.reasoning.abs_reasoning_parsers import (
+    ReasoningParser,
+    ReasoningTokenCounter,
+)
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser
@@ -57,7 +60,6 @@ class StreamState:
     # tracks whether function name has been fully returned in the stream yet
     function_name_returned: bool = False
     engine_based: bool = False
-    num_reasoning_tokens: int = 0
 
     def advance(
         self,
@@ -140,7 +142,6 @@ class Parser:
             ),
             engine_based=self._engine_based,
         )
-        self.track_reasoning_tokens = False
 
     @cached_property
     def vocab(self) -> dict[str, int]:
@@ -165,9 +166,12 @@ class Parser:
     def tool_parser(self, parser: ToolParser | None) -> None:
         self._tool_parser = parser
 
-    @property
-    def num_reasoning_tokens(self) -> int:
-        return self._stream_state.num_reasoning_tokens
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        if self._reasoning_parser is None:
+            return None
+        return self._reasoning_parser.create_reasoning_token_counter(prompt_token_ids)
 
     def _initialize_history_tool_call_cnt(
         self,
@@ -829,15 +833,6 @@ class DelegatingParser(Parser):
                 self._reasoning_parser.adjust_initial_state_from_prompt(
                     prompt_token_ids
                 )
-
-        if (
-            self.track_reasoning_tokens
-            and self._in_reasoning_phase(state)
-            and self._reasoning_parser is not None
-        ):
-            state.num_reasoning_tokens += self._reasoning_parser.count_reasoning_tokens(
-                delta_token_ids
-            )
 
         current_text, current_token_ids = state.advance(delta_text, delta_token_ids)
         delta_message: DeltaMessage | None = None

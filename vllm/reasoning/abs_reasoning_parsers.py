@@ -23,6 +23,94 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class ReasoningTokenCounter:
+    """Incrementally count generated tokens inside reasoning spans."""
+
+    def __init__(
+        self,
+        *,
+        start_sequences: Iterable[Sequence[int]] = (),
+        end_sequences: Iterable[Sequence[int]] = (),
+        initial_in_reasoning: bool = False,
+    ) -> None:
+        self._start_sequences = self._normalize_sequences(start_sequences)
+        self._end_sequences = self._normalize_sequences(end_sequences)
+        self._in_reasoning = initial_in_reasoning
+        self._pending: list[int] = []
+        self.total = 0
+
+    @staticmethod
+    def _normalize_sequences(
+        sequences: Iterable[Sequence[int]],
+    ) -> tuple[tuple[int, ...], ...]:
+        return tuple(
+            sorted(
+                {tuple(sequence) for sequence in sequences if sequence},
+                key=len,
+                reverse=True,
+            )
+        )
+
+    def seed(self, token_ids: Sequence[int]) -> None:
+        """Advance delimiter state through prompt tokens without counting them."""
+        self._consume(token_ids, finished=True, count_tokens=False)
+        self.total = 0
+
+    def update(self, token_ids: Sequence[int], *, finished: bool = False) -> int:
+        """Consume one generated-token delta and return the cumulative count."""
+        self._consume(token_ids, finished=finished, count_tokens=True)
+        return self.total
+
+    def _consume(
+        self,
+        token_ids: Sequence[int],
+        *,
+        finished: bool,
+        count_tokens: bool,
+    ) -> None:
+        tokens = self._pending + list(token_ids)
+        self._pending = []
+        index = 0
+        while index < len(tokens):
+            remaining = tokens[index:]
+            start = self._match(self._start_sequences, remaining)
+            if start is not None:
+                self._in_reasoning = True
+                index += len(start)
+                continue
+            end = self._match(self._end_sequences, remaining)
+            if end is not None:
+                self._in_reasoning = False
+                index += len(end)
+                continue
+            if not finished and self._is_marker_prefix(remaining):
+                self._pending = remaining
+                break
+            if count_tokens and self._in_reasoning:
+                self.total += 1
+            index += 1
+
+    @staticmethod
+    def _match(
+        sequences: tuple[tuple[int, ...], ...],
+        token_ids: Sequence[int],
+    ) -> tuple[int, ...] | None:
+        for sequence in sequences:
+            if (
+                len(sequence) <= len(token_ids)
+                and tuple(token_ids[: len(sequence)]) == sequence
+            ):
+                return sequence
+        return None
+
+    def _is_marker_prefix(self, token_ids: Sequence[int]) -> bool:
+        candidate = tuple(token_ids)
+        return any(
+            len(candidate) < len(sequence) and sequence[: len(candidate)] == candidate
+            for sequence in self._start_sequences + self._end_sequences
+        )
+
+
 class ReasoningParser:
     """
     Abstract reasoning parser class that should not be used directly.
@@ -142,6 +230,17 @@ class ReasoningParser:
 
         # By default, assume the parser cannot detect reasoning spans.
         return 0
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        """Create an incremental counter for Chat Completions usage.
+
+        Parsers opt in when they can classify generated token IDs without
+        changing parsing or response construction. The default keeps usage at
+        zero for parsers that do not expose token-level reasoning boundaries.
+        """
+        return None
 
     @abstractmethod
     def extract_reasoning(

@@ -320,12 +320,7 @@ def build_app(
     # Add scaling middleware to check for scaling state
     app.add_middleware(ScalingMiddleware)
 
-    if os.getenv("VLLM_LOG_PAYLOADS", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if envs.VLLM_LOG_PAYLOADS:
         from vllm.payload_logging import PayloadLoggingMiddleware
 
         app.add_middleware(PayloadLoggingMiddleware)
@@ -677,12 +672,7 @@ async def build_and_serve(
     Returns the shutdown task for the caller to await.
     """
 
-    if os.getenv("VLLM_LOG_PAYLOADS", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if envs.VLLM_LOG_PAYLOADS:
         from vllm.payload_logging import configure_payload_logging
 
         configure_payload_logging()

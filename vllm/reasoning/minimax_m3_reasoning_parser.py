@@ -5,6 +5,7 @@ from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 
 if TYPE_CHECKING:
@@ -309,6 +310,18 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
                 count += 1
             i += 1
         return count
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter:
+        counter = ReasoningTokenCounter(
+            start_sequences=(self._start_token_ids,),
+            end_sequences=(self._end_token_ids,),
+            initial_in_reasoning=self._initial_in_reasoning,
+        )
+        if prompt_token_ids is not None:
+            counter.seed(prompt_token_ids)
+        return counter
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         start_index = self._rfind_token_sequence(input_ids, self._start_token_ids)
