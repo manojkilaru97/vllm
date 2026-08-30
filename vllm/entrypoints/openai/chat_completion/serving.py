@@ -162,7 +162,8 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_log_deltas = enable_log_deltas
 
         self.enable_auto_tools: bool = enable_auto_tools
-        self._include_reasoning_tokens_details = bool(reasoning_parser)
+        # Always report completion_tokens_details (0 without a reasoning parser).
+        self._include_reasoning_tokens_details = True
         self.parser_cls = ParserManager.get_parser(
             tool_parser_name=tool_parser,
             reasoning_parser_name=reasoning_parser,
@@ -525,8 +526,6 @@ class OpenAIServingChat(GenerateBaseServing):
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
-        # TODO: Remove once all reasoning parsers use the Parser Engine.
-        generated_token_ids: list[list[int]] = [[] for _ in range(num_choices)]
         previous_reasoning_tokens = [0] * num_choices
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
@@ -569,6 +568,10 @@ class OpenAIServingChat(GenerateBaseServing):
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
+        if include_usage:
+            for processor in processors:
+                if processor.parser is not None:
+                    processor.parser.track_reasoning_tokens = True
 
         last_res: RequestOutput | None = None
         try:
@@ -716,16 +719,10 @@ class OpenAIServingChat(GenerateBaseServing):
                         res.prompt_token_ids,
                     )
 
-                    previous_texts[i] += delta_text
+                    if parser is not None:
+                        previous_reasoning_tokens[i] = parser.num_reasoning_tokens
 
-                    if parser is not None and self._include_reasoning_tokens_details:
-                        generated_token_ids[i].extend(output.token_ids)
-                        if include_continuous_usage:
-                            previous_reasoning_tokens[i] = (
-                                parser.count_reasoning_tokens(
-                                    tuple(generated_token_ids[i])
-                                )
-                            )
+                    previous_texts[i] += delta_text
 
                     # if the message delta is None (e.g. because it was a
                     # "control token" for tool calls or the parser otherwise
@@ -851,14 +848,6 @@ class OpenAIServingChat(GenerateBaseServing):
 
                     yield chunk
 
-            if self._include_reasoning_tokens_details and not include_continuous_usage:
-                for i, processor in enumerate(processors):
-                    parser = processor.parser
-                    if parser is not None and generated_token_ids[i]:
-                        previous_reasoning_tokens[i] = parser.count_reasoning_tokens(
-                            tuple(generated_token_ids[i])
-                        )
-
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
             if include_usage:
@@ -981,7 +970,7 @@ class OpenAIServingChat(GenerateBaseServing):
             )
 
         choices: list[ChatCompletionResponseChoice] = []
-        total_reasoning_tokens = 0
+        num_reasoning_tokens = 0
 
         role = self.get_chat_request_role(request)
         for i, output in enumerate(final_res.outputs):
@@ -1018,8 +1007,11 @@ class OpenAIServingChat(GenerateBaseServing):
                     enable_auto_tools=self.enable_auto_tools,
                     model_output_token_ids=token_ids,
                 )
+                if reasoning is not None and parser.reasoning_parser is not None:
+                    num_reasoning_tokens += (
+                        parser.reasoning_parser.count_reasoning_tokens(token_ids)
+                    )
                 suppress_metadata = not request.include_reasoning and parser is not None
-                total_reasoning_tokens += parser.count_reasoning_tokens(token_ids)
                 if suppress_metadata:
                     logprobs = None
             else:
@@ -1104,7 +1096,7 @@ class OpenAIServingChat(GenerateBaseServing):
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
             completion_tokens_details=_make_completion_tokens_details(
-                total_reasoning_tokens
+                num_reasoning_tokens
             )
             if self._include_reasoning_tokens_details
             else None,

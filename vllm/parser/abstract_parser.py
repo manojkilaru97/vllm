@@ -79,6 +79,7 @@ class StreamState:
     # tracks whether function name has been fully returned in the stream yet
     function_name_returned: bool = False
     engine_based: bool = False
+    num_reasoning_tokens: int = 0
 
     def advance(
         self,
@@ -172,6 +173,7 @@ class Parser:
             ),
             engine_based=self._engine_based,
         )
+        self.track_reasoning_tokens = False
 
     @property
     def reasoning_parser(self) -> ReasoningParser | None:
@@ -182,6 +184,10 @@ class Parser:
     def tool_parser(self) -> ToolParser | None:
         """The underlying tool parser, if any."""
         return self._tool_parser
+
+    @property
+    def num_reasoning_tokens(self) -> int:
+        return self._stream_state.num_reasoning_tokens
 
     def _initialize_history_tool_call_cnt(
         self,
@@ -880,6 +886,15 @@ class DelegatingParser(Parser):
                 self._reasoning_parser.adjust_initial_state_from_prompt(
                     prompt_token_ids
                 )
+
+        if (
+            self.track_reasoning_tokens
+            and self._in_reasoning_phase(state)
+            and self._reasoning_parser is not None
+        ):
+            state.num_reasoning_tokens += self._reasoning_parser.count_reasoning_tokens(
+                delta_token_ids
+            )
 
         current_text, current_token_ids = state.advance(delta_text, delta_token_ids)
         delta_message: DeltaMessage | None = None
