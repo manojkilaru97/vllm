@@ -175,6 +175,13 @@ class TestBaseThinkingReasoningParserMethods:
         token_ids = [0, start, 11, 12, end, 99]
         assert parser.count_reasoning_tokens(token_ids) == 2
 
+    def test_count_reasoning_tokens_with_prefilled_start(self, test_tokenizer):
+        """Count reasoning when the prompt owns the opening marker."""
+        parser = TestThinkingReasoningParser(test_tokenizer)
+        end = parser.end_token_id
+        token_ids = [11, 12, end, 99]
+        assert parser.count_reasoning_tokens(token_ids) == 2
+
     def test_count_reasoning_tokens_nested(self, test_tokenizer):
         """Ensure nested thinking spans count all inner tokens safely."""
         parser = TestThinkingReasoningParser(test_tokenizer)
