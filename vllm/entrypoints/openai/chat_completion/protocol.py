@@ -36,7 +36,11 @@ from vllm.entrypoints.generate.base.protocol import (
     validate_structural_tag_response_format,
     validate_structured_outputs_structural_tag,
 )
-from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
+from vllm.entrypoints.serve.engine.protocol import (
+    CompletionTokenUsageInfo,
+    OpenAIBaseModel,
+    UsageInfo,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
@@ -140,6 +144,12 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     weight_versions: list[WeightVersionSpan] | None = None
 
 
+class ChatCompletionUsageInfo(UsageInfo):
+    """Usage with reasoning details, reported only by Chat Completions."""
+
+    completion_tokens_details: CompletionTokenUsageInfo | None = None
+
+
 class ChatCompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: Literal["chat.completion"] = "chat.completion"
@@ -148,7 +158,8 @@ class ChatCompletionResponse(OpenAIBaseModel):
     choices: list[ChatCompletionResponseChoice]
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     system_fingerprint: str | None = None
-    usage: UsageInfo
+    # Other builders (batch, derender) still pass plain UsageInfo.
+    usage: ChatCompletionUsageInfo | UsageInfo
 
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
@@ -187,7 +198,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: list[ChatCompletionResponseStreamChoice]
-    usage: UsageInfo | None = Field(default=None)
+    usage: ChatCompletionUsageInfo | UsageInfo | None = Field(default=None)
     # Set only on the final chunk of a stream to mirror non-streaming responses
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None

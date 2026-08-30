@@ -276,7 +276,6 @@ def test_parse_delta_reasoning_only_no_think_leak(tokenizer, request_obj):
 def test_reasoning_token_count_with_prefilled_start(tokenizer, request_obj):
     """Count generated reasoning when the chat template owns ``<think>``."""
     parser = make_parser(tokenizer, reasoning=True, tool=False)
-    parser.track_reasoning_tokens = True
     reasoning_parser = parser.reasoning_parser
     assert reasoning_parser is not None
 
@@ -284,37 +283,29 @@ def test_reasoning_token_count_with_prefilled_start(tokenizer, request_obj):
     output_token_ids = tokenizer.encode(output_text, add_special_tokens=False)
     end_index = output_token_ids.index(reasoning_parser.end_token_id)
 
-    stream_text(
-        parser,
-        tokenizer,
-        output_text,
-        request_obj,
-        prompt_token_ids=[reasoning_parser.start_token_id],
-    )
+    counter = parser.create_reasoning_token_counter([reasoning_parser.start_token_id])
+    assert counter is not None
 
-    assert parser.num_reasoning_tokens == end_index
+    assert counter.update(output_token_ids, finished=True) == end_index
 
 
 def test_reasoning_token_count_is_zero_when_prompt_closed_thinking(
     tokenizer, request_obj
 ):
     parser = make_parser(tokenizer, reasoning=True, tool=False)
-    parser.track_reasoning_tokens = True
     reasoning_parser = parser.reasoning_parser
     assert reasoning_parser is not None
 
-    stream_text(
-        parser,
-        tokenizer,
-        "final answer only",
-        request_obj,
-        prompt_token_ids=[
+    counter = parser.create_reasoning_token_counter(
+        [
             reasoning_parser.start_token_id,
             reasoning_parser.end_token_id,
-        ],
+        ]
     )
+    assert counter is not None
 
-    assert parser.num_reasoning_tokens == 0
+    output_token_ids = tokenizer.encode("final answer only", add_special_tokens=False)
+    assert counter.update(output_token_ids, finished=True) == 0
 
 
 def test_parse_delta_reasoning_only_thinking_disabled(tokenizer, request_obj):

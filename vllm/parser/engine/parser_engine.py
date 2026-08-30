@@ -30,6 +30,7 @@ from vllm.parser.engine.parser_engine_config import (
     ParserState,
 )
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.renderers.chat_utils import get_tool_call_id_type, make_tool_call_id
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
@@ -201,6 +202,72 @@ class ParserEngine(Parser):
     @cached_property
     def vocab(self) -> dict[str, int]:
         return self.model_tokenizer.get_vocab()
+
+    def _terminal_token_sequences(self, terminal: str) -> list[tuple[int, ...]]:
+        config = self.parser_engine_config
+        token_text = config.token_id_terminals.get(terminal)
+        if (
+            token_text is not None
+            and (token_id := self.vocab.get(token_text)) is not None
+        ):
+            return [(token_id,)]
+        texts = token_text or config.terminals.get(terminal)
+        if texts is None:
+            return []
+        # v0.33 terminals may list several alternative spellings.
+        if isinstance(texts, str):
+            texts = (texts,)
+        sequences = []
+        for text in texts:
+            try:
+                ids = self.model_tokenizer.encode(text, add_special_tokens=False)
+            except TypeError:
+                ids = self.model_tokenizer.encode(text)
+            sequences.append(tuple(ids))
+        return sequences
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        if not self._has_reasoning:
+            return None
+
+        start_terminals = {"THINK_START"}
+        end_terminals = {"THINK_END"}
+        for (
+            state,
+            terminal,
+        ), transition in self.parser_engine_config.transitions.items():
+            if (
+                EventType.REASONING_START in transition.events
+                or transition.next_state == ParserState.REASONING
+                and state != ParserState.REASONING
+            ):
+                start_terminals.add(terminal)
+            if state == ParserState.REASONING and (
+                EventType.REASONING_END in transition.events
+                or transition.next_state != ParserState.REASONING
+            ):
+                end_terminals.add(terminal)
+
+        counter = ReasoningTokenCounter(
+            start_sequences=(
+                sequence
+                for terminal in start_terminals
+                for sequence in self._terminal_token_sequences(terminal)
+            ),
+            end_sequences=(
+                sequence
+                for terminal in end_terminals
+                for sequence in self._terminal_token_sequences(terminal)
+            ),
+            initial_in_reasoning=(
+                self.parser_engine_config.initial_state == ParserState.REASONING
+            ),
+        )
+        if prompt_token_ids is not None:
+            counter.seed(prompt_token_ids)
+        return counter
 
     # ── Engine lifecycle ──────────────────────────────────────────────
 

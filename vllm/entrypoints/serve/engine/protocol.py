@@ -137,4 +137,3 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
-    completion_tokens_details: CompletionTokenUsageInfo | None = None

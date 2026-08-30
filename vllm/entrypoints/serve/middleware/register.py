@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import importlib
 import inspect
-import os
 from argparse import Namespace
 
 from fastapi import FastAPI
@@ -47,12 +46,7 @@ def init_entrypoints_middleware(
 
         app.add_middleware(ScalingMiddleware)
 
-    if os.getenv("VLLM_LOG_PAYLOADS", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if envs.VLLM_LOG_PAYLOADS:
         from vllm.payload_logging import PayloadLoggingMiddleware
 
         app.add_middleware(PayloadLoggingMiddleware)
