@@ -169,9 +169,32 @@ class Parser:
     def create_reasoning_token_counter(
         self, prompt_token_ids: Sequence[int] | None
     ) -> ReasoningTokenCounter | None:
-        if self._reasoning_parser is None:
+        reasoning_parser = self._reasoning_parser
+        if reasoning_parser is None:
             return None
-        return self._reasoning_parser.create_reasoning_token_counter(prompt_token_ids)
+        if (
+            type(reasoning_parser).create_reasoning_token_counter
+            is ReasoningParser.create_reasoning_token_counter
+        ):
+            # Avoid scanning/copying the prompt for parsers that inherit the
+            # opt-out implementation and cannot produce a counter.
+            return None
+        if (
+            prompt_token_ids is not None
+            and reasoning_parser.is_reasoning_end_for_usage(prompt_token_ids)
+            # Engine tool adapters parse the post-reasoning phase with the
+            # full state machine and may legitimately transition back into
+            # reasoning. Legacy/no-tool paths permanently latch content mode.
+            and not (
+                self._tool_parser is not None
+                and self._tool_parser.can_reenter_reasoning
+            )
+        ):
+            # Do not mutate a plugin-provided counter: external reasoning
+            # plugins only promise the existing ``update`` interface. A
+            # standard closed counter is both compatible and authoritative.
+            return ReasoningTokenCounter()
+        return reasoning_parser.create_reasoning_token_counter(prompt_token_ids)
 
     def _initialize_history_tool_call_cnt(
         self,

@@ -25,6 +25,7 @@ from collections.abc import Sequence
 
 from transformers import PreTrainedTokenizerBase
 
+from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from vllm.reasoning.deepseek_v3_reasoning_parser import DeepSeekV3ReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
@@ -67,6 +68,21 @@ class PoolsideV1ReasoningParser(DeepSeekV3ReasoningParser):
             if tok_id == self._start_of_assistant_message_token_id:
                 return False
         return False
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        if isinstance(self._parser, IdentityReasoningParser):
+            return None
+
+        assert isinstance(self._parser, DeepSeekR1ReasoningParser)
+        return ReasoningTokenCounter(
+            start_sequences=((self._parser.start_token_id,),),
+            end_sequences=((self._parser.end_token_id,),),
+            initial_in_reasoning=(
+                prompt_token_ids is None or not self.is_reasoning_end(prompt_token_ids)
+            ),
+        )
 
 
 __all__ = ["PoolsideV1ReasoningParser"]

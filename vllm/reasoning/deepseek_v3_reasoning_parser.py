@@ -80,9 +80,6 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
             delta_token_ids,
         )
 
-    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
-        return self._parser.count_reasoning_tokens(token_ids)
-
     def create_reasoning_token_counter(
         self, prompt_token_ids: Sequence[int] | None
     ) -> ReasoningTokenCounter | None:

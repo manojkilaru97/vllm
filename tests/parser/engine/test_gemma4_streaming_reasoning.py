@@ -320,6 +320,24 @@ class TestGemma4PromptOpenReasoning:
                 f"Reasoning text leaked into content: {content!r}"
             )
 
+    def test_counter_uses_open_prompt_state(self, open_reasoning_parser, request_obj):
+        token_id, text = _OPEN_REASONING_GEN_SEQUENCE[0]
+        delta = open_reasoning_parser.parse_delta(
+            delta_text=text,
+            delta_token_ids=[token_id],
+            request=request_obj,
+            prompt_token_ids=self._prompt_ids_open_channel(),
+            finished=False,
+        )
+        counter = open_reasoning_parser.create_reasoning_token_counter(
+            self._prompt_ids_open_channel()
+        )
+
+        assert delta is not None
+        assert delta.reasoning == text
+        assert counter is not None
+        assert counter.update([token_id]) == 1
+
     def test_post_reasoning_text_in_content(
         self, open_reasoning_parser, open_reasoning_tokenizer, request_obj
     ):
@@ -1395,6 +1413,23 @@ class TestBareThoughtWithoutChannelOpener:
     @pytest.fixture
     def bare_thought_parser(self, bare_thought_tokenizer):
         return Gemma4Parser(bare_thought_tokenizer)
+
+    def test_bare_thought_counter_uses_injected_reasoning_state(
+        self, bare_thought_parser, request_obj
+    ):
+        token_id, text = BARE_THOUGHT_SEQUENCE[0]
+        prompt_token_ids = [CHANNEL_START_ID, CHANNEL_END_ID, NEW_TURN_ID]
+        bare_thought_parser.parse_delta(
+            delta_text=text,
+            delta_token_ids=[token_id],
+            request=request_obj,
+            prompt_token_ids=prompt_token_ids,
+            finished=False,
+        )
+        counter = bare_thought_parser.create_reasoning_token_counter(prompt_token_ids)
+
+        assert counter is not None
+        assert counter.update([token_id]) == 1
 
     def test_bare_thought_reasoning_then_tool_call(
         self, bare_thought_parser, bare_thought_tokenizer, request_obj

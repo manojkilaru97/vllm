@@ -10,6 +10,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.parser.abstract_parser import DelegatingParser
 from vllm.parser.engine.registered_adapters import Qwen3ParserReasoningAdapter
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
 
@@ -290,11 +291,24 @@ def test_reasoning_token_count_with_prefilled_start(tokenizer, request_obj):
 
 
 def test_reasoning_token_count_is_zero_when_prompt_closed_thinking(
-    tokenizer, request_obj
+    tokenizer, request_obj, monkeypatch
 ):
     parser = make_parser(tokenizer, reasoning=True, tool=False)
     reasoning_parser = parser.reasoning_parser
     assert reasoning_parser is not None
+
+    plugin_counter_created = False
+
+    def create_external_counter(prompt_token_ids):
+        nonlocal plugin_counter_created
+        plugin_counter_created = True
+        return SimpleNamespace(update=lambda token_ids, finished=False: 99)
+
+    monkeypatch.setattr(
+        reasoning_parser,
+        "create_reasoning_token_counter",
+        create_external_counter,
+    )
 
     counter = parser.create_reasoning_token_counter(
         [
@@ -303,9 +317,46 @@ def test_reasoning_token_count_is_zero_when_prompt_closed_thinking(
         ]
     )
     assert counter is not None
+    assert not plugin_counter_created
 
-    output_token_ids = tokenizer.encode("final answer only", add_special_tokens=False)
+    output_text = "<think>not parsed as reasoning</think>final answer"
+    output_token_ids = tokenizer.encode(output_text, add_special_tokens=False)
     assert counter.update(output_token_ids, finished=True) == 0
+
+    results = stream_text(
+        parser,
+        tokenizer,
+        output_text,
+        request_obj,
+        prompt_token_ids=[
+            reasoning_parser.start_token_id,
+            reasoning_parser.end_token_id,
+        ],
+    )
+    reasoning, content, _ = collect_fields(results)
+    assert reasoning == ""
+    assert content == output_text
+
+
+@pytest.mark.skip_global_cleanup
+def test_reasoning_counter_skips_prompt_scan_for_opted_out_parser(
+    tokenizer, monkeypatch
+):
+    parser = make_parser(tokenizer, reasoning=True, tool=False)
+    reasoning_parser = parser.reasoning_parser
+    assert reasoning_parser is not None
+    monkeypatch.setattr(
+        ThinkReasoningParser,
+        "create_reasoning_token_counter",
+        ReasoningParser.create_reasoning_token_counter,
+    )
+
+    def unexpected_prompt_scan(_input_ids):
+        raise AssertionError("counter-less parser must not scan the prompt")
+
+    monkeypatch.setattr(reasoning_parser, "is_reasoning_end", unexpected_prompt_scan)
+
+    assert parser.create_reasoning_token_counter([1, 2, 3]) is None
 
 
 def test_parse_delta_reasoning_only_thinking_disabled(tokenizer, request_obj):

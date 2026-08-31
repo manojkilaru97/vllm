@@ -156,6 +156,10 @@ class ParserEngineToolAdapter(ToolParser):
         super().__init__(tokenizer, tools)
         self._parser_engine = self._parser_engine_cls(tokenizer, tools, **kwargs)  # type: ignore[call-arg]
 
+    @property
+    def can_reenter_reasoning(self) -> bool:
+        return self._parser_engine.can_reenter_reasoning_from_content
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,

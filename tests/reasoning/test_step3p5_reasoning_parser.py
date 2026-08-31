@@ -5,6 +5,7 @@ import pytest
 
 from tests.reasoning.utils import run_reasoning_extraction
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
+from vllm.reasoning.step3p5_reasoning_parser import Step3p5ReasoningParser
 from vllm.tokenizers import get_tokenizer
 
 parser_name = "step3p5"
@@ -339,3 +340,18 @@ def test_step3p5_streaming_drops_leading_newline(step3p5_tokenizer):
 
     _, content = run_reasoning_extraction(parser, output_tokens, streaming=True)
     assert content == "Answer"
+
+
+@pytest.mark.skip_global_cleanup
+def test_usage_prompt_check_does_not_mutate_streaming_latch():
+    parser = object.__new__(Step3p5ReasoningParser)
+    parser.start_token_id = 10
+    parser.end_token_id = 20
+    parser._end_token_pending = False
+
+    assert parser.is_reasoning_end_for_usage([1, 20])
+    assert not parser._end_token_pending
+
+    counter = parser.create_reasoning_token_counter([1, 20])
+    assert counter.update([30], finished=True) == 0
+    assert not parser._end_token_pending

@@ -44,6 +44,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.parser.abstract_parser import DelegatingParser
+from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.tool_parsers.gptoss_tool_parser import GptOssToolParser
@@ -92,6 +93,16 @@ class ChunkResult:
     reasoning_token_count: int
 
 
+class _HarmonyReasoningTokenCounter(ReasoningTokenCounter):
+    def __init__(self, parser: HarmonyParser) -> None:
+        super().__init__()
+        self._parser = parser
+
+    def update(self, token_ids: Sequence[int], *, finished: bool = False) -> int:
+        self.total = self._parser._reasoning_token_count
+        return self.total
+
+
 class HarmonyParser(DelegatingParser):
     def __init__(self, tokenizer, tools=None, *args, **kwargs):
         super().__init__(tokenizer, tools, *args, **kwargs)
@@ -116,6 +127,8 @@ class HarmonyParser(DelegatingParser):
 
         # For error recovery
         self._current_message_tokens: list[int] = []
+        self._reasoning_token_count = 0
+        self._reasoning_generation_finished = False
 
     @property
     def _harmony_parser(self) -> StreamableParser:
@@ -162,6 +175,7 @@ class HarmonyParser(DelegatingParser):
         self._parser = None
         self._num_processed_messages = 0
         self._current_message_tokens.clear()
+        self._reasoning_generation_finished = True
 
         if msg is None:
             return segments
@@ -329,6 +343,9 @@ class HarmonyParser(DelegatingParser):
         return delta_message
 
     def process_chunk(self, token_ids: Sequence[int]) -> ChunkResult:
+        if self._reasoning_generation_finished:
+            self._reasoning_token_count = 0
+            self._reasoning_generation_finished = False
         if not token_ids:
             return ChunkResult(segments=[], reasoning_token_count=0)
 
@@ -364,10 +381,18 @@ class HarmonyParser(DelegatingParser):
 
             # TODO: Optionally merge and suppress empty Segments
 
+        self._reasoning_token_count += reasoning_token_count
         return ChunkResult(
             segments=segments,
             reasoning_token_count=reasoning_token_count,
         )
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        if self.reasoning_parser is None:
+            return None
+        return _HarmonyReasoningTokenCounter(self)
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
