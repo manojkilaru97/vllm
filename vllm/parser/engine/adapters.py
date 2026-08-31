@@ -210,6 +210,10 @@ class ParserEngineToolAdapter(ToolParser):
     def skip_reasoning_parsing(self, value: bool) -> None:
         self._parser_engine.skip_reasoning_parsing = value
 
+    @property
+    def can_reenter_reasoning(self) -> bool:
+        return self._parser_engine.can_reenter_reasoning_from_content
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,

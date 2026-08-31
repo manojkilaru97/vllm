@@ -158,8 +158,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     choices: list[ChatCompletionResponseChoice]
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     system_fingerprint: str | None = None
-    # Other builders (batch, derender) still pass plain UsageInfo.
-    usage: ChatCompletionUsageInfo | UsageInfo
+    usage: SerializeAsAny[UsageInfo]
 
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
@@ -198,7 +197,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: list[ChatCompletionResponseStreamChoice]
-    usage: ChatCompletionUsageInfo | UsageInfo | None = Field(default=None)
+    usage: SerializeAsAny[UsageInfo] | None = Field(default=None)
     # Set only on the final chunk of a stream to mirror non-streaming responses
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None

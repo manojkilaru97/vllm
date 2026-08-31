@@ -715,19 +715,24 @@ class OpenAIServingChat(GenerateBaseServing):
 
                     previous_texts[i] += delta_text
 
-                    if include_usage and parser is not None:
-                        if not reasoning_token_counters_initialized[i]:
-                            reasoning_token_counters[i] = (
-                                parser.create_reasoning_token_counter(
-                                    res.prompt_token_ids
-                                )
-                            )
-                            reasoning_token_counters_initialized[i] = True
-                        if (counter := reasoning_token_counters[i]) is not None:
-                            previous_reasoning_tokens[i] = counter.update(
-                                as_list(output.token_ids),
-                                finished=output.finish_reason is not None,
-                            )
+                    if (
+                        include_usage
+                        and parser is not None
+                        and not reasoning_token_counters_initialized[i]
+                    ):
+                        reasoning_token_counters[i] = (
+                            parser.create_reasoning_token_counter(res.prompt_token_ids)
+                        )
+                        reasoning_token_counters_initialized[i] = True
+                    if (
+                        include_usage
+                        and parser is not None
+                        and (counter := reasoning_token_counters[i]) is not None
+                    ):
+                        previous_reasoning_tokens[i] = counter.update(
+                            as_list(output.token_ids),
+                            finished=output.finish_reason is not None,
+                        )
 
                     # if the message delta is None (e.g. because it was a
                     # "control token" for tool calls or the parser otherwise
@@ -837,14 +842,14 @@ class OpenAIServingChat(GenerateBaseServing):
 
                     # handle usage stats if requested & if continuous
                     if include_continuous_usage:
-                        completion_tokens = processor.num_output_tokens
+                        completion_tokens = sum(p.num_output_tokens for p in processors)
                         chunk.usage = ChatCompletionUsageInfo(
                             prompt_tokens=num_prompt_tokens,
                             completion_tokens=completion_tokens,
-                            total_tokens=num_prompt_tokens + completion_tokens,
                             completion_tokens_details=_make_completion_tokens_details(
-                                previous_reasoning_tokens[i]
+                                sum(previous_reasoning_tokens)
                             ),
+                            total_tokens=num_prompt_tokens + completion_tokens,
                         )
 
                     yield chunk
@@ -1005,9 +1010,10 @@ class OpenAIServingChat(GenerateBaseServing):
                     model_output_token_ids=token_ids,
                 )
                 if (
-                    counter := parser.create_reasoning_token_counter(
-                        final_res.prompt_token_ids
-                    )
+                    # Non-streaming parsers classify the generated turn from
+                    # their configured initial state; they do not consume the
+                    # prompt. Keep usage accounting on that same state.
+                    counter := parser.create_reasoning_token_counter(None)
                 ) is not None:
                     num_reasoning_tokens += counter.update(token_ids, finished=True)
                 suppress_metadata = not request.include_reasoning and parser is not None

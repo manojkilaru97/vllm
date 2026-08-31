@@ -459,3 +459,21 @@ def test_token_id_helpers_enabled_mode():
     assert parser.count_reasoning_tokens(open_reasoning_ids) == len(
         tokenizer.encode("abc")
     )
+
+
+def test_counter_prompt_marker_does_not_enable_thinking_mode():
+    parser, tokenizer = make_parser()
+    prompt_ids = tokenizer.encode("<mm:think>prompt", add_special_tokens=False)
+    content_ids = tokenizer.encode("content", add_special_tokens=False)
+    counter = parser.create_reasoning_token_counter(prompt_ids)
+
+    assert counter.update(content_ids, finished=True) == 0
+
+
+def test_counter_closed_prompt_disables_prefilled_thinking_mode():
+    parser, tokenizer = make_parser({"thinking_mode": "enabled"})
+    prompt_ids = tokenizer.encode("<mm:think>old</mm:think>", add_special_tokens=False)
+    content_ids = tokenizer.encode("content", add_special_tokens=False)
+    counter = parser.create_reasoning_token_counter(prompt_ids)
+
+    assert counter.update(content_ids, finished=True) == 0

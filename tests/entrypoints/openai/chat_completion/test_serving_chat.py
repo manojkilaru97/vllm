@@ -936,6 +936,7 @@ async def test_chat_per_request_metrics_follow_server_flag():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
 async def test_chat_nonstream_reasoning_token_usage():
     serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
     parser = MagicMock()
@@ -962,6 +963,7 @@ async def test_chat_nonstream_reasoning_token_usage():
     assert response.choices[0].message.reasoning is None
     assert response.usage.completion_tokens_details is not None
     assert response.usage.completion_tokens_details.reasoning_tokens == 2
+    parser.create_reasoning_token_counter.assert_called_once_with(None)
 
 
 def test_reasoning_usage_details_are_chat_completions_only():
@@ -977,6 +979,89 @@ def test_reasoning_usage_details_are_chat_completions_only():
     assert chat_usage.model_dump()["completion_tokens_details"] == {
         "reasoning_tokens": 1
     }
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.skip_global_cleanup
+def test_chat_response_accepts_common_usage_without_losing_chat_details(stream: bool):
+    common_usage = UsageInfo(prompt_tokens=3, completion_tokens=2, total_tokens=5)
+    chat_usage = ChatCompletionUsageInfo(
+        prompt_tokens=3,
+        completion_tokens=2,
+        total_tokens=5,
+        completion_tokens_details=CompletionTokenUsageInfo(reasoning_tokens=1),
+    )
+    response_type = ChatCompletionStreamResponse if stream else ChatCompletionResponse
+
+    common_response = response_type(model="test-model", choices=[], usage=common_usage)
+    chat_response = response_type(model="test-model", choices=[], usage=chat_usage)
+
+    common_dump = common_response.model_dump()["usage"]
+    chat_dump = chat_response.model_dump()["usage"]
+    assert common_dump["prompt_tokens"] == 3
+    assert common_dump["completion_tokens"] == 2
+    assert common_dump["total_tokens"] == 5
+    assert "completion_tokens_details" not in common_dump
+    assert chat_dump["completion_tokens_details"] == {"reasoning_tokens": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_chat_continuous_usage_is_cumulative_across_choices():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    request_output = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="First",
+                token_ids=[100, 101],
+                cumulative_logprob=None,
+                logprobs=None,
+                finish_reason="stop",
+            ),
+            CompletionOutput(
+                index=1,
+                text="Second",
+                token_ids=[200, 201, 202],
+                cumulative_logprob=None,
+                logprobs=None,
+                finish_reason="stop",
+            ),
+        ],
+        finished=True,
+    )
+    usages = []
+    async for line in serving.chat_completion_stream_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=True,
+            n=2,
+            stream_options={
+                "include_usage": True,
+                "continuous_usage_stats": True,
+            },
+        ),
+        _single_request_output(request_output),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        payload = line.strip().removeprefix("data: ")
+        if payload and payload != "[DONE]":
+            usage = json.loads(payload).get("usage")
+            if usage:
+                usages.append(usage)
+
+    assert [usage["completion_tokens"] for usage in usages[-3:]] == [2, 5, 5]
+    assert usages[-1]["total_tokens"] == 8
 
 
 @pytest.mark.asyncio
@@ -1508,15 +1593,27 @@ async def test_streaming_logprobs_kept_when_parser_suppresses_delta(
     assert streamed_tokens == expected_tokens
 
 
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
 async def test_force_usage_stream_reports_incremental_reasoning_tokens():
     serving = _build_minimal_metrics_serving_chat(
         enable_per_request_metrics=False,
         enable_force_include_usage=True,
     )
     parser = MagicMock()
-    parser.parse_delta.return_value = DeltaMessage(content="Hello")
+    call_order = []
+
+    def create_counter(_prompt_token_ids):
+        call_order.append("counter")
+        return counter
+
+    def parse_delta(**_kwargs):
+        call_order.append("parse")
+        return DeltaMessage(content="Hello")
+
     counter = ReasoningTokenCounter(end_sequences=((101,),), initial_in_reasoning=True)
-    parser.create_reasoning_token_counter.return_value = counter
+    parser.create_reasoning_token_counter.side_effect = create_counter
+    parser.parse_delta.side_effect = parse_delta
     serving.parser_cls = MagicMock(return_value=parser)
     serving.model_config = None
 
@@ -1532,6 +1629,7 @@ async def test_force_usage_stream_reports_incremental_reasoning_tokens():
 
     usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
     assert usage_chunks
+    assert call_order[:2] == ["parse", "counter"]
     assert usage_chunks[-1]["usage"] == {
         "prompt_tokens": 3,
         "completion_tokens": 2,

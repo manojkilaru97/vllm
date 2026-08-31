@@ -272,3 +272,13 @@ def test_constructor_falls_back_to_outer_reasoning_effort(hy_v3_tokenizer):
 
     assert isinstance(parser, HYV3ReasoningParser)
     assert parser._identity_parser is None
+
+
+@pytest.mark.skip_global_cleanup
+def test_no_think_mode_does_not_count_content_as_reasoning(hy_v3_tokenizer):
+    parser = HYV3ReasoningParser(
+        hy_v3_tokenizer,
+        chat_template_kwargs={"reasoning_effort": "no_think"},
+    )
+
+    assert parser.create_reasoning_token_counter(None) is None
