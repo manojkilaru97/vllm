@@ -15,10 +15,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from vllm.parser.engine.parser_engine_config import ParserState
-from vllm.reasoning.abs_reasoning_parsers import (
-    ReasoningParser,
-    ReasoningTokenCounter,
-)
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
 if TYPE_CHECKING:
@@ -151,11 +148,6 @@ class ParserEngineReasoningAdapter(ReasoningParser):
             self.model_tokenizer.decode(token_ids), token_ids
         )
         return self._counting_parser_engine.count_reasoning_tokens(token_ids)
-
-    def create_reasoning_token_counter(
-        self, prompt_token_ids: Sequence[int] | None
-    ) -> ReasoningTokenCounter | None:
-        return self._parser_engine.create_reasoning_token_counter(prompt_token_ids)
 
 
 class ParserEngineToolAdapter(ToolParser):

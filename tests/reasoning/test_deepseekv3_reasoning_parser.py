@@ -10,6 +10,7 @@ from vllm.reasoning import ReasoningParserManager
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from vllm.reasoning.deepseek_v3_reasoning_parser import DeepSeekV3ReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
+from vllm.reasoning.poolside_v1_reasoning_parser import PoolsideV1ReasoningParser
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -34,6 +35,38 @@ def test_parser_selection(tokenizer, thinking, expected_parser_type):
     )
 
     assert isinstance(parser._parser, expected_parser_type)
+
+
+def test_responses_reasoning_count_remains_unchanged(tokenizer):
+    parser = DeepSeekV3ReasoningParser(
+        tokenizer, chat_template_kwargs={"thinking": True}
+    )
+    token_ids = tokenizer.encode("<think>reasoning</think>answer")
+
+    assert parser.count_reasoning_tokens(token_ids) == 0
+
+
+class _PoolsideTokenizer:
+    def __init__(self):
+        self.init_kwargs = {}
+        self._vocab = {"<think>": 1, "</think>": 2, "<assistant>": 3}
+
+    def get_vocab(self):
+        return self._vocab
+
+
+def test_poolside_counter_scopes_prompt_to_current_assistant_turn():
+    parser = PoolsideV1ReasoningParser(
+        _PoolsideTokenizer(), chat_template_kwargs={"thinking": True}
+    )
+
+    historical_close = parser.create_reasoning_token_counter([1, 2, 3])
+    current_turn_close = parser.create_reasoning_token_counter([3, 1, 2])
+
+    assert historical_close is not None
+    assert current_turn_close is not None
+    assert historical_close.update([10, 2, 11], finished=True) == 1
+    assert current_turn_close.update([10, 11], finished=True) == 0
 
 
 def test_deepseek_v4_reasoning_parser_alias():
