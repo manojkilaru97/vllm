@@ -777,7 +777,7 @@ async def test_chat_nonstream_reasoning_token_usage():
     assert response.choices[0].message.reasoning is None
     assert response.usage.completion_tokens_details is not None
     assert response.usage.completion_tokens_details.reasoning_tokens == 2
-    parser.create_reasoning_token_counter.assert_called_once_with(None)
+    parser.create_reasoning_token_counter.assert_called_once_with([1, 2, 3])
 
 
 def test_reasoning_usage_details_are_chat_completions_only():

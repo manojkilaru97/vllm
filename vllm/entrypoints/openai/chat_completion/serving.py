@@ -946,10 +946,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     model_output_token_ids=token_ids,
                 )
                 if (
-                    # Non-streaming parsers classify the generated turn from
-                    # their configured initial state; they do not consume the
-                    # prompt. Keep usage accounting on that same state.
-                    counter := parser.create_reasoning_token_counter(None)
+                    counter := parser.create_reasoning_token_counter(
+                        final_res.prompt_token_ids
+                    )
                 ) is not None:
                     num_reasoning_tokens += counter.update(token_ids, finished=True)
                 suppress_metadata = not request.include_reasoning and parser is not None
