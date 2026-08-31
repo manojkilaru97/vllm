@@ -183,8 +183,9 @@ class ParserEngine(Parser):
         if not self._has_reasoning:
             return None
 
-        start_terminals = {"THINK_START"}
-        end_terminals = {"THINK_END"}
+        start_terminals: set[str] = set()
+        end_terminals: set[str] = set()
+        neutral_terminals: set[str] = set()
         for (
             state,
             terminal,
@@ -200,6 +201,11 @@ class ParserEngine(Parser):
                 or transition.next_state != ParserState.REASONING
             ):
                 end_terminals.add(terminal)
+            if (
+                state == ParserState.REASONING
+                and transition.next_state == ParserState.REASONING
+            ):
+                neutral_terminals.add(terminal)
 
         counter = ReasoningTokenCounter(
             start_sequences=(
@@ -212,13 +218,44 @@ class ParserEngine(Parser):
                 for terminal in end_terminals
                 if (sequence := self._terminal_token_sequence(terminal))
             ),
-            initial_in_reasoning=(
-                self.parser_engine_config.initial_state == ParserState.REASONING
+            neutral_sequences=(
+                sequence
+                for terminal in neutral_terminals
+                if (sequence := self._terminal_token_sequence(terminal))
+            ),
+            initial_in_reasoning=self._reasoning_counter_starts_in_reasoning(
+                prompt_token_ids
             ),
         )
-        if prompt_token_ids is not None:
-            counter.seed(prompt_token_ids)
         return counter
+
+    def _reasoning_counter_starts_in_reasoning(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> bool:
+        if prompt_token_ids is not None and self.is_reasoning_end_for_usage(
+            prompt_token_ids
+        ):
+            return False
+        return self.parser_engine_config.initial_state == ParserState.REASONING
+
+    @property
+    def can_reenter_reasoning_from_content(self) -> bool:
+        """Whether reasoning is reachable after the tool adapter starts the
+        engine in content state.
+        """
+        reachable = {ParserState.CONTENT}
+        while True:
+            discovered: set[ParserState] = set()
+            for (state, _), transition in self.parser_engine_config.transitions.items():
+                if state not in reachable:
+                    continue
+                if transition.next_state == ParserState.REASONING:
+                    return True
+                if transition.next_state not in reachable:
+                    discovered.add(transition.next_state)
+            if not discovered:
+                return False
+            reachable.update(discovered)
 
     # ── Engine lifecycle ──────────────────────────────────────────────
 
@@ -668,6 +705,23 @@ class ParserEngine(Parser):
                     return False
             return False
         return self._reasoning_ended
+
+    def is_reasoning_end_for_usage(self, input_ids: Sequence[int]) -> bool:
+        """Inspect tokenized prompt state without reading live engine state."""
+        end_id = self._reasoning_end_token_id
+        if end_id is None:
+            # Text-only terminals are interpreted from generated text by the
+            # engine; the default prompt hook does not replay them.
+            return False
+        start_id = self._reasoning_start_token_id
+        if not input_ids:
+            return self.parser_engine_config.initial_state != ParserState.REASONING
+        for token_id in reversed(input_ids):
+            if token_id == end_id:
+                return True
+            if start_id is not None and token_id == start_id:
+                return False
+        return False
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         end_id = self._reasoning_end_token_id

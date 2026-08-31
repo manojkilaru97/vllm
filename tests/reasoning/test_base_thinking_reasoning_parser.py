@@ -184,6 +184,15 @@ class TestBaseThinkingReasoningParserMethods:
         counter = parser.create_reasoning_token_counter([start])
         assert counter.update([11, 12, end, 99], finished=True) == 2
 
+    @pytest.mark.skip_global_cleanup
+    def test_incremental_counter_reopens_after_closed_prompt(self, test_tokenizer):
+        parser = TestThinkingReasoningParser(test_tokenizer)
+        start = parser.start_token_id
+        end = parser.end_token_id
+        counter = parser.create_reasoning_token_counter([start, 11, end])
+
+        assert counter.update([start, 12, end, 99], finished=True) == 1
+
     def test_incremental_counter_handles_split_markers(self):
         counter = ReasoningTokenCounter(
             start_sequences=((10, 11),),
@@ -193,6 +202,44 @@ class TestBaseThinkingReasoningParserMethods:
         assert counter.update([1, 10]) == 0
         assert counter.update([11, 2, 3, 20]) == 2
         assert counter.update([21, 4], finished=True) == 2
+
+    @pytest.mark.skip_global_cleanup
+    def test_incremental_counter_handles_split_neutral_marker(self):
+        counter = ReasoningTokenCounter(
+            neutral_sequences=((10, 11),),
+            end_sequences=((20,),),
+            initial_in_reasoning=True,
+        )
+
+        assert counter.update([10]) == 0
+        assert counter.update([11, 2, 20, 10, 11, 3], finished=True) == 1
+
+    @pytest.mark.skip_global_cleanup
+    def test_incremental_counter_handles_long_reasoning_span(self):
+        class SliceTrackingList(list[int]):
+            slice_count = 0
+
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    type(self).slice_count += 1
+                    return type(self)(super().__getitem__(key))
+                return super().__getitem__(key)
+
+            def __add__(self, other):
+                return type(self)(super().__add__(other))
+
+        counter = ReasoningTokenCounter(
+            start_sequences=((10, 11),),
+            end_sequences=((20, 21),),
+        )
+        counter._pending = SliceTrackingList()
+        reasoning_tokens = [12] * 32_000
+
+        assert counter.update([10, 11, *reasoning_tokens, 20], finished=False) == len(
+            reasoning_tokens
+        )
+        assert SliceTrackingList.slice_count == 1
+        assert counter.update([21, 13], finished=True) == len(reasoning_tokens)
 
     def test_count_reasoning_tokens_nested(self, test_tokenizer):
         """Ensure nested thinking spans count all inner tokens safely."""

@@ -31,10 +31,12 @@ class ReasoningTokenCounter:
         *,
         start_sequences: Iterable[Sequence[int]] = (),
         end_sequences: Iterable[Sequence[int]] = (),
+        neutral_sequences: Iterable[Sequence[int]] = (),
         initial_in_reasoning: bool = False,
     ) -> None:
         self._start_sequences = self._normalize_sequences(start_sequences)
         self._end_sequences = self._normalize_sequences(end_sequences)
+        self._neutral_sequences = self._normalize_sequences(neutral_sequences)
         self._in_reasoning = initial_in_reasoning
         self._pending: list[int] = []
         self.total = 0
@@ -72,42 +74,56 @@ class ReasoningTokenCounter:
         self._pending = []
         index = 0
         while index < len(tokens):
-            remaining = tokens[index:]
-            start = self._match(self._start_sequences, remaining)
+            start = self._match_at(self._start_sequences, tokens, index)
             if start is not None:
                 self._in_reasoning = True
                 index += len(start)
                 continue
-            end = self._match(self._end_sequences, remaining)
+            end = self._match_at(self._end_sequences, tokens, index)
             if end is not None:
                 self._in_reasoning = False
                 index += len(end)
                 continue
-            if not finished and self._is_marker_prefix(remaining):
-                self._pending = remaining
+            if self._in_reasoning:
+                neutral = self._match_at(self._neutral_sequences, tokens, index)
+                if neutral is not None:
+                    index += len(neutral)
+                    continue
+            if not finished and self._is_marker_prefix_at(tokens, index):
+                # Only retain the small terminal suffix that may become a
+                # complete marker when the next delta arrives.
+                self._pending = tokens[index:]
                 break
             if count_tokens and self._in_reasoning:
                 self.total += 1
             index += 1
 
     @staticmethod
-    def _match(
+    def _match_at(
         sequences: tuple[tuple[int, ...], ...],
         token_ids: Sequence[int],
+        index: int,
     ) -> tuple[int, ...] | None:
         for sequence in sequences:
-            if (
-                len(sequence) <= len(token_ids)
-                and tuple(token_ids[: len(sequence)]) == sequence
+            if index + len(sequence) <= len(token_ids) and all(
+                token_ids[index + offset] == token_id
+                for offset, token_id in enumerate(sequence)
             ):
                 return sequence
         return None
 
-    def _is_marker_prefix(self, token_ids: Sequence[int]) -> bool:
-        candidate = tuple(token_ids)
+    def _is_marker_prefix_at(self, token_ids: Sequence[int], index: int) -> bool:
+        candidate_length = len(token_ids) - index
+        marker_sequences = self._start_sequences + self._end_sequences
+        if self._in_reasoning:
+            marker_sequences += self._neutral_sequences
         return any(
-            len(candidate) < len(sequence) and sequence[: len(candidate)] == candidate
-            for sequence in self._start_sequences + self._end_sequences
+            candidate_length < len(sequence)
+            and all(
+                token_ids[index + offset] == sequence[offset]
+                for offset in range(candidate_length)
+            )
+            for sequence in marker_sequences
         )
 
 
@@ -241,6 +257,14 @@ class ReasoningParser:
         zero for parsers that do not expose token-level reasoning boundaries.
         """
         return None
+
+    def is_reasoning_end_for_usage(self, input_ids: Sequence[int]) -> bool:
+        """Prompt-only reasoning state used to initialize usage counters.
+
+        Stateful parsers may override this so metadata accounting never
+        mutates live streaming state.
+        """
+        return self.is_reasoning_end(input_ids)
 
     @abstractmethod
     def extract_reasoning(

@@ -314,14 +314,17 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
     def create_reasoning_token_counter(
         self, prompt_token_ids: Sequence[int] | None
     ) -> ReasoningTokenCounter:
-        counter = ReasoningTokenCounter(
+        return ReasoningTokenCounter(
             start_sequences=(self._start_token_ids,),
             end_sequences=(self._end_token_ids,),
-            initial_in_reasoning=self._initial_in_reasoning,
+            initial_in_reasoning=(
+                self._initial_in_reasoning
+                and (
+                    prompt_token_ids is None
+                    or not self.is_reasoning_end_for_usage(prompt_token_ids)
+                )
+            ),
         )
-        if prompt_token_ids is not None:
-            counter.seed(prompt_token_ids)
-        return counter
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         start_index = self._rfind_token_sequence(input_ids, self._start_token_ids)

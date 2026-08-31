@@ -62,6 +62,11 @@ class ToolParser:
     structural_tag_model: str | None = None
     engine_based_streaming: bool = False
 
+    @property
+    def can_reenter_reasoning(self) -> bool:
+        """Whether this parser can emit reasoning after content mode starts."""
+        return False
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         if (

@@ -206,11 +206,11 @@ class BaseThinkingReasoningParser(ReasoningParser):
     def create_reasoning_token_counter(
         self, prompt_token_ids: Sequence[int] | None
     ) -> ReasoningTokenCounter:
-        counter = ReasoningTokenCounter(
+        return ReasoningTokenCounter(
             start_sequences=((self.start_token_id,),),
             end_sequences=((self.end_token_id,),),
-            initial_in_reasoning=True,
+            initial_in_reasoning=(
+                prompt_token_ids is None
+                or not self.is_reasoning_end_for_usage(prompt_token_ids)
+            ),
         )
-        if prompt_token_ids is not None:
-            counter.seed(prompt_token_ids)
-        return counter
