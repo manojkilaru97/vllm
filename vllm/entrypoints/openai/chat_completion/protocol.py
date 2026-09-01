@@ -590,16 +590,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
-        if self.max_completion_tokens is not None:
-            max_output_tokens: int | None = self.max_completion_tokens
-            max_output_tokens_param = "max_completion_tokens"
-        else:
-            max_output_tokens = self.max_tokens
-            max_output_tokens_param = "max_tokens"
+        max_output_tokens_param = (
+            "max_completion_tokens"
+            if self.max_completion_tokens is not None
+            else "max_tokens"
+        )
 
         return TokenizeParams(
             max_total_tokens=model_config.max_model_len,
-            max_output_tokens=max_output_tokens or 0,
+            # Validate that the prompt leaves room for a completion. The actual
+            # output limit is clamped to the remaining context after rendering,
+            # when the exact prompt token count is known.
+            max_output_tokens=1,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             truncation_side=self.truncation_side,
             add_special_tokens=self.add_special_tokens,

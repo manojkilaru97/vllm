@@ -1066,6 +1066,29 @@ async def test_serving_chat_should_set_correct_max_tokens():
     assert mock_engine.generate.call_args.args[1].max_tokens == 5
 
 
+@pytest.mark.parametrize("max_tokens_field", ["max_tokens", "max_completion_tokens"])
+@pytest.mark.asyncio
+async def test_serving_chat_clamps_output_to_remaining_context(max_tokens_field):
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine)
+    req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "what is 1+1?"}],
+        **{max_tokens_field: mock_engine.model_config.max_model_len},
+    )
+
+    with suppress(Exception):
+        await serving_chat.create_chat_completion(req)
+
+    mock_engine.generate.assert_called_once()
+    assert mock_engine.generate.call_args.args[1].max_tokens == 93
+
+
 @pytest.mark.asyncio
 async def test_serving_chat_truncate_prompt_tokens_max_token_accounting():
     """When truncate_prompt_tokens is set, max_tokens must be calculated using
@@ -1162,10 +1185,8 @@ async def test_serving_chat_truncation_side_controls_prompt_truncation():
 
 
 @pytest.mark.asyncio
-async def test_serving_chat_mistral_token_ids_prompt_is_validated():
-    """Regression test: when the Mistral tokenizer path returns token IDs
-    directly, we must still apply input length + max_tokens validation.
-    """
+async def test_serving_chat_mistral_token_ids_output_is_clamped():
+    """Mistral token-ID prompts clamp output to the remaining context."""
 
     mock_engine = MagicMock(spec=AsyncLLM)
     mock_engine.errored = False
@@ -1196,8 +1217,11 @@ async def test_serving_chat_mistral_token_ids_prompt_is_validated():
         max_tokens=10,
     )
 
-    with pytest.raises(VLLMValidationError):
+    with suppress(Exception):
         await serving_chat.create_chat_completion(req)
+
+    mock_engine.generate.assert_called_once()
+    assert mock_engine.generate.call_args.args[1].max_tokens == 5
 
 
 @pytest.mark.asyncio
