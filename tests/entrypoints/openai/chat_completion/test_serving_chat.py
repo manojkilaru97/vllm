@@ -2122,9 +2122,6 @@ async def test_serving_chat_mistral_token_ids_prompt_is_validated(
     sampling_params = mock_engine.generate.call_args.args[1]
     assert sampling_params.max_tokens == expected_max_tokens
 
-    mock_engine.generate.assert_called_once()
-    assert mock_engine.generate.call_args.args[1].max_tokens == 5
-
 
 @pytest.mark.asyncio
 async def test_serving_chat_mistral_token_ids_prompt_too_long_is_rejected(
