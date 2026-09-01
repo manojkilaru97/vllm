@@ -214,11 +214,11 @@ class SchedulerOffloadConfig(NamedTuple):
             if g.is_eagle_group
         }
 
-        use_eagle = (
+        use_eagle_block_drop = (
             vllm_config.speculative_config is not None
-            and vllm_config.speculative_config.use_eagle()
+            and vllm_config.speculative_config.use_eagle_block_drop()
         )
-        if use_eagle and not eagle_groups:
+        if use_eagle_block_drop and not eagle_groups:
             # No group is annotated as holding drafter layers. This happens
             # for shared-group MTP models (e.g. Qwen3.5-style), whose drafter
             # is a regular decoder layer merged into the target's

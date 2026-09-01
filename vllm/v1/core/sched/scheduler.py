@@ -244,6 +244,7 @@ class Scheduler(SchedulerInterface):
             )
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
@@ -269,6 +270,13 @@ class Scheduler(SchedulerInterface):
                 # anchor itself is the first prediction position (no separate bonus
                 # query), so it needs exactly num_spec_tokens lookahead slots.
                 self.num_lookahead_tokens = self.num_spec_tokens
+            self.use_eagle_block_drop = speculative_config.use_eagle_block_drop()
+            if self.use_eagle and not self.use_eagle_block_drop:
+                logger.warning(
+                    "EAGLE trailing prefix-cache block dropping is disabled. "
+                    "This is experimental and may affect speculative-token "
+                    "acceptance rates."
+                )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -279,7 +287,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.use_eagle_block_drop,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -391,7 +399,7 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.use_eagle_block_drop:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
