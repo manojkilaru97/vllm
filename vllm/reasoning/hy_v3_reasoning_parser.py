@@ -9,6 +9,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
+from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
 from vllm.tokenizers import TokenizerLike
@@ -82,6 +83,15 @@ class HYV3ReasoningParser(BaseThinkingReasoningParser):
             return self._identity_parser.extract_content_ids(input_ids)
 
         return super().extract_content_ids(input_ids)
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        if self._identity_parser is not None:
+            return self._identity_parser.create_reasoning_token_counter(
+                prompt_token_ids
+            )
+        return super().create_reasoning_token_counter(prompt_token_ids)
 
     def extract_reasoning(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"

@@ -8,6 +8,7 @@ DeltaMessage / ExtractedToolCallInformation protocol.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -129,6 +130,68 @@ def _make_engine(
         tools=tools,
         parser_engine_config=cfg,
     )
+
+
+# ── Reasoning token usage ───────────────────────────────────────────
+
+
+class TestReasoningTokenUsage:
+    def test_counter_uses_prompt_state(self):
+        engine = _make_engine()
+        counter = engine.create_reasoning_token_counter([200])
+        assert counter is not None
+
+        assert counter.update([65, 66, 201, 67], finished=True) == 2
+
+    def test_content_initial_counter_matches_live_parser_state(self):
+        config = replace(_combined_config(), initial_state=ParserState.CONTENT)
+        engine = _make_engine(config)
+        counter = engine.create_reasoning_token_counter([200])
+        assert counter is not None
+
+        # The default prompt-state hook is a no-op, so the live parser remains
+        # in CONTENT even if unrelated prompt text ends with a start marker.
+        assert counter.update([65, 66, 201, 67], finished=True) == 0
+
+    def test_text_terminal_counter_ignores_live_generated_state(self):
+        config = replace(
+            _combined_config(),
+            initial_state=ParserState.CONTENT,
+            token_id_terminals={
+                "TOOL_START": "<tool_call>",
+                "TOOL_END": "</tool_call>",
+            },
+        )
+        tokenizer = make_mock_tokenizer(_VOCAB)
+        tokenizer.encode.side_effect = lambda text, **_kwargs: {
+            "<think>": [210, 211],
+            "</think>": [212, 213],
+        }.get(text, [1, 2, 3])
+        engine = ParserEngine(tokenizer, parser_engine_config=config)
+        engine._reasoning_ended = True
+        counter = engine.create_reasoning_token_counter([99])
+        assert counter is not None
+
+        assert counter.update([210, 211, 65, 212, 213], finished=True) == 1
+
+    def test_counter_stays_closed_after_prompt_end(self):
+        engine = _make_engine()
+        counter = engine.create_reasoning_token_counter([200, 65, 201])
+        assert counter is not None
+
+        assert counter.update([66, 67], finished=True) == 0
+
+    def test_tool_start_implicitly_ends_reasoning(self):
+        config = _combined_config()
+        config.transitions[(ParserState.REASONING, "TOOL_START")] = Transition(
+            ParserState.TOOL_ARGS,
+            (EventType.REASONING_END, EventType.TOOL_CALL_START),
+        )
+        engine = _make_engine(config)
+        counter = engine.create_reasoning_token_counter([])
+        assert counter is not None
+
+        assert counter.update([65, 202, 66], finished=True) == 1
 
 
 # ── TestEventsToDelta ────────────────────────────────────────────────
@@ -887,9 +950,42 @@ class _CombinedTestEngine(ParserEngine):
 _CombinedReasoningAdapter, _CombinedToolAdapter = make_adapters(_CombinedTestEngine)
 
 
+class _NoReentryTestEngine(ParserEngine):
+    def __init__(self, tokenizer, tools=None, **kwargs):
+        config = _combined_config()
+        del config.transitions[(ParserState.CONTENT, "THINK_START")]
+        super().__init__(tokenizer, tools, parser_engine_config=config, **kwargs)
+
+
+_, _NoReentryToolAdapter = make_adapters(_NoReentryTestEngine)
+
+
 class _CombinedDelegating(DelegatingParser):
     reasoning_parser_cls = _CombinedReasoningAdapter
     tool_parser_cls = _CombinedToolAdapter
+
+
+class _NoReentryToolDelegating(DelegatingParser):
+    reasoning_parser_cls = _CombinedReasoningAdapter
+    tool_parser_cls = _NoReentryToolAdapter
+
+
+def test_engine_tool_adapter_counter_can_reenter_after_closed_prompt():
+    tokenizer = make_mock_tokenizer(_VOCAB)
+    parser = _CombinedDelegating(tokenizer)
+    counter = parser.create_reasoning_token_counter([200, 65, 201])
+    assert counter is not None
+
+    assert counter.update([200, 66, 201], finished=True) == 1
+
+
+def test_tool_adapter_without_reasoning_transition_keeps_counter_closed():
+    tokenizer = make_mock_tokenizer(_VOCAB)
+    parser = _NoReentryToolDelegating(tokenizer)
+    counter = parser.create_reasoning_token_counter([200, 65, 201])
+    assert counter is not None
+
+    assert counter.update([200, 66, 201], finished=True) == 0
 
 
 def _make_delegating_request():
@@ -954,6 +1050,15 @@ class _ReasoningOnlyDelegating(DelegatingParser):
 
     reasoning_parser_cls = _CombinedReasoningAdapter
     tool_parser_cls = None
+
+
+def test_reasoning_only_counter_stays_closed_after_closed_prompt():
+    tokenizer = make_mock_tokenizer(_VOCAB)
+    parser = _ReasoningOnlyDelegating(tokenizer)
+    counter = parser.create_reasoning_token_counter([200, 65, 201])
+    assert counter is not None
+
+    assert counter.update([200, 66, 201], finished=True) == 0
 
 
 class TestReasoningOnlyEndTokenLeak:

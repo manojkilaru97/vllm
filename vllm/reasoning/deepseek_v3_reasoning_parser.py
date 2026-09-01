@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from transformers import PreTrainedTokenizerBase
 
 from vllm.reasoning import ReasoningParser
+from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 
 from .identity_reasoning_parser import IdentityReasoningParser
@@ -78,6 +79,11 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
             current_token_ids,
             delta_token_ids,
         )
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        return self._parser.create_reasoning_token_counter(prompt_token_ids)
 
 
 class DeepSeekV3ReasoningWithThinkingParser(DeepSeekV3ReasoningParser):
