@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
+import logging
 from concurrent.futures import Future
 from unittest.mock import Mock
 
@@ -45,6 +47,28 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture
+def priority_trace_cpu_platform():
+    import vllm.platforms as vllm_platforms
+    from vllm.platforms import current_platform
+    from vllm.platforms.cpu import CpuPlatform
+
+    if current_platform.device_type:
+        yield
+        return
+
+    unset = object()
+    previous = vllm_platforms.__dict__.get("current_platform", unset)
+    vllm_platforms.current_platform = CpuPlatform()
+    try:
+        yield
+    finally:
+        if previous is unset:
+            del vllm_platforms.current_platform
+        else:
+            vllm_platforms.current_platform = previous
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -2677,6 +2701,65 @@ def test_priority_scheduling_basic_ordering():
     # req_1 (priority 0), req_2 (priority 1), req_0 (priority 2)
     scheduled_req_ids = [req.req_id for req in output.scheduled_new_reqs]
     assert scheduled_req_ids == ["1", "2", "0"]
+
+
+def test_priority_trace_records_waiting_candidates_and_first_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    priority_trace_cpu_platform,
+):
+    monkeypatch.setenv("VLLM_PRIORITY_TRACE", "1")
+    monkeypatch.setenv("VLLM_PRIORITY_TRACE_LIMIT", "10")
+    from vllm.v1.core.sched import priority_trace
+
+    priority_trace._reset_for_test()
+    scheduler = create_scheduler_with_priority(max_num_seqs=1)
+    requests = create_requests_with_priority(
+        num_requests=2,
+        priorities=[0, -1000],
+        arrival_times=[1.0, 2.0],
+        req_ids=["older", "urgent"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    with caplog.at_level(logging.INFO, logger="vllm.priority"):
+        output = scheduler.schedule()
+
+    records = [
+        json.loads(record.message.removeprefix("priority_trace "))
+        for record in caplog.records
+        if record.message.startswith("priority_trace ")
+    ]
+    allocation = next(
+        record for record in records if record["stage"] == "first_token_allocation"
+    )
+    assert [request.req_id for request in output.scheduled_new_reqs] == ["urgent"]
+    assert allocation["request_id"] == "urgent"
+    assert allocation["priority"] == -1000
+    assert allocation["scheduled_tokens"] > 0
+    assert allocation["scheduler_id"] == id(scheduler)
+    assert allocation["eligible_candidates"] == ["urgent", "older"]
+
+
+def test_priority_trace_does_not_change_scheduler_order(
+    monkeypatch: pytest.MonkeyPatch,
+    priority_trace_cpu_platform,
+):
+    def scheduled_ids(enabled: bool) -> list[str]:
+        monkeypatch.setenv("VLLM_PRIORITY_TRACE", "1" if enabled else "0")
+        scheduler = create_scheduler_with_priority(max_num_seqs=1)
+        requests = create_requests_with_priority(
+            num_requests=2,
+            priorities=[0, -1000],
+            arrival_times=[1.0, 2.0],
+            req_ids=["older", "urgent"],
+        )
+        for request in requests:
+            scheduler.add_request(request)
+        return [request.req_id for request in scheduler.schedule().scheduled_new_reqs]
+
+    assert scheduled_ids(False) == scheduled_ids(True) == ["urgent"]
 
 
 def test_priority_scheduling_arrival_time_tiebreaker():

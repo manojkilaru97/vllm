@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import heapq
+import itertools
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -71,6 +72,11 @@ class RequestQueue(ABC):
         """Iterate over the queue according to the policy."""
         pass
 
+    @abstractmethod
+    def peek_requests(self, limit: int) -> list[Request]:
+        """Return at most the first limit requests without mutation."""
+        pass
+
 
 class FCFSRequestQueue(deque[Request], RequestQueue):
     """A first-come-first-served queue that supports deque operations."""
@@ -126,6 +132,10 @@ class FCFSRequestQueue(deque[Request], RequestQueue):
     def __iter__(self) -> Iterator[Request]:
         """Iterate over the queue according to FCFS policy."""
         return super().__iter__()
+
+    def peek_requests(self, limit: int) -> list[Request]:
+        """Return a bounded arrival-ordered snapshot."""
+        return list(itertools.islice(self, limit))
 
 
 class PriorityRequestQueue(RequestQueue):
@@ -196,6 +206,10 @@ class PriorityRequestQueue(RequestQueue):
         heap_copy = self._heap[:]
         while heap_copy:
             yield heapq.heappop(heap_copy)
+
+    def peek_requests(self, limit: int) -> list[Request]:
+        """Return a bounded priority-ordered snapshot."""
+        return heapq.nsmallest(limit, self._heap)
 
 
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
