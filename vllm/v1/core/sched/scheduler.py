@@ -40,6 +40,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched import priority_trace
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -1544,6 +1545,8 @@ class Scheduler(SchedulerInterface):
                     skip_request(request_queue)
                     continue
 
+                first_token_allocation = request.status == RequestStatus.WAITING
+                eligible_candidates = self._priority_trace_waiting_candidates()
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
                 self.running.append(request)
@@ -1575,6 +1578,17 @@ class Scheduler(SchedulerInterface):
                 drafts_needed = drafts_needed or not self._drafts_unused(
                     request, num_computed_tokens, num_new_tokens
                 )
+                if first_token_allocation and num_new_tokens > 0:
+                    priority_trace.emit(
+                        "first_token_allocation",
+                        request_id=request_id,
+                        priority=request.priority,
+                        scheduler_id=id(self),
+                        scheduler_step=self.current_step,
+                        scheduled_tokens=num_new_tokens,
+                        eligible_candidates=eligible_candidates,
+                        x_request_id=(request.trace_headers or {}).get("x-request-id"),
+                    )
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
                     scheduled_spec_decode_tokens[request_id] = [
@@ -2714,6 +2728,16 @@ class Scheduler(SchedulerInterface):
         else:
             self.waiting.add_request(request)
 
+    def _priority_trace_waiting_candidates(self) -> list[str]:
+        if not priority_trace.is_enabled():
+            return []
+        return [
+            request.request_id
+            for queue in (self.kv_holding_waiting, self.waiting)
+            for request in queue.peek_requests(65)
+            if not self._is_blocked_waiting_status(request.status)
+        ][:65]
+
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
         if not request.resumable:
@@ -2951,6 +2975,14 @@ class Scheduler(SchedulerInterface):
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
                 )
+            priority_trace.emit(
+                "waiting",
+                request_id=request.request_id,
+                priority=request.priority,
+                scheduler_id=id(self),
+                scheduler_step=self.current_step,
+                x_request_id=(request.trace_headers or {}).get("x-request-id"),
+            )
             if self.connector is not None:
                 self.connector.on_new_request(request)
                 kv_transfer_params = request.kv_transfer_params
