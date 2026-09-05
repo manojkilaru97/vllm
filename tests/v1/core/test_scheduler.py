@@ -2762,6 +2762,63 @@ def test_priority_trace_does_not_change_scheduler_order(
     assert scheduled_ids(False) == scheduled_ids(True) == ["urgent"]
 
 
+def test_async_llm_maps_final_engine_child_ids_before_submission(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    from vllm.v1.core.sched import priority_trace
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    calls = []
+
+    def emit(stage, **fields):
+        calls.append(("trace", stage, fields))
+
+    class OutputProcessor:
+        def add_request(self, request, prompt, parent, index, queue):
+            calls.append(("output", request.request_id, index))
+
+    class EngineCore:
+        async def add_request_async(self, request):
+            calls.append(("engine", request.request_id))
+
+        def shutdown(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(priority_trace, "emit", emit)
+    llm = AsyncLLM.__new__(AsyncLLM)
+    llm.output_processor = OutputProcessor()
+    llm.engine_core = EngineCore()
+    llm.log_requests = False
+    parent = SimpleNamespace(external_req_id="context-id")
+
+    async def add_children():
+        for index in range(2):
+            request = SimpleNamespace(
+                request_id=f"{index}_context-id-random",
+                external_req_id="context-id",
+                priority=-1000,
+                trace_headers={"x-request-id": "client-id"},
+            )
+            await llm._add_request(request, None, parent, index, object())
+
+    asyncio.run(add_children())
+
+    mappings = [call for call in calls if call[:2] == ("trace", "engine_id_mapping")]
+    assert [call[2]["request_id"] for call in mappings] == [
+        "0_context-id-random",
+        "1_context-id-random",
+    ]
+    assert [call[2]["output_index"] for call in mappings] == [0, 1]
+    assert all(call[2]["external_request_id"] == "context-id" for call in mappings)
+    for mapping in mappings:
+        mapping_position = calls.index(mapping)
+        engine_position = calls.index(("engine", mapping[2]["request_id"]))
+        assert mapping_position < engine_position
+
+
 def test_priority_scheduling_arrival_time_tiebreaker():
     """Test that arrival time is used
     as tiebreaker when priorities are equal."""

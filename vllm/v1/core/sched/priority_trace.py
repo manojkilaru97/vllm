@@ -43,6 +43,8 @@ def emit(
     scheduled_tokens: int | None = None,
     eligible_candidates: list[str] | None = None,
     x_request_id: str | None = None,
+    external_request_id: str | None = None,
+    output_index: int | None = None,
 ) -> None:
     """Emit one bounded scheduler observation without request payloads."""
     global _emitted
@@ -77,6 +79,10 @@ def emit(
         record["candidates_truncated"] = len(eligible_candidates) > _MAX_CANDIDATES
     if x_request_id is not None:
         record["x_request_id"] = x_request_id[:128]
+    if external_request_id is not None:
+        record["external_request_id"] = external_request_id[:128]
+    if output_index is not None:
+        record["output_index"] = output_index
     _LOGGER.info("priority_trace %s", json.dumps(record, separators=(",", ":")))
 
 

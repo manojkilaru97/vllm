@@ -38,6 +38,7 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
+from vllm.v1.core.sched import priority_trace
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -429,6 +430,14 @@ class AsyncLLM(EngineClient):
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
+        priority_trace.emit(
+            "engine_id_mapping",
+            request_id=request.request_id,
+            external_request_id=request.external_req_id,
+            output_index=index,
+            priority=request.priority,
+            x_request_id=(request.trace_headers or {}).get("x-request-id"),
+        )
         await self.engine_core.add_request_async(request)
 
         if self.log_requests:
