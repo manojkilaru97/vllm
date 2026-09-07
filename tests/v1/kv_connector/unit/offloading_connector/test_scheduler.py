@@ -3204,3 +3204,219 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
     # Verify fence is empty after full lifecycle (cleanup happened).
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
     assert len(runner.connector_scheduler._jobs) == 0
+
+
+# Ported from upstream #52771 (issue #52735).
+class TestSharedGroupMTPOffload:
+    """Regression tests for issue #52735: OffloadingConnector must keep
+    serving when speculative decoding is enabled but no KV-cache group is
+    annotated as a drafter group (shared-group MTP models)."""
+
+    def test_no_annotation_marks_no_groups(self, request_runner):
+        """Spec decode on + zero annotated groups must NOT mark every group
+        as a drafter group; the full store->load roundtrip must match the
+        non-speculative behavior of test_two_groups_full_and_sliding_window."""
+        block_size = 4
+        kv_cache_groups = [
+            KVCacheGroupSpec(
+                ["layer0"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["layer1"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=8,
+                ),
+            ),
+        ]
+        runner = request_runner(
+            block_size=block_size,
+            num_gpu_blocks=100,
+            async_scheduling=True,
+            kv_cache_groups=kv_cache_groups,
+            speculative_config=_shared_kv_mtp_config(),
+        )
+        kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+        assert [c.is_eagle_group for c in kv_group_configs] == [False, False]
+
+        runner.new_request(token_ids=[0] * block_size * 3)
+        runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+            generate_store_output(keys)
+        )
+        runner.run(decoded_tokens=[0])
+        runner.run(
+            decoded_tokens=[0] * (block_size * 3 + 2),
+            expected_stored=(0, 1, 2, 3, 4, 5),
+        )
+        runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+        runner.scheduler.reset_prefix_cache()
+
+        runner.new_request(token_ids=[0] * (block_size * 3 + 1))
+        runner.manager.lookup.return_value = LookupResult.HIT
+        runner.run(
+            decoded_tokens=[EOS_TOKEN_ID],
+            expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
+        )
+
+
+class TestMambaHybridOffloadServing:
+    """Store->finish->lookup flows on a full-attention + mamba-align hybrid,
+    with a manager that only HITs keys that were actually stored. Guards the
+    two collapse routes of issue #52735."""
+
+    BLOCK = 4
+    MAMBA_BLOCK = 16
+    PROMPT_TOKENS = 28  # 7 hash blocks; 1 full mamba chunk
+
+    def _make_scheduler(self, speculative_config, mamba_eagle=False):
+        vllm_config = _make_vllm_config(
+            extra_config={"self_describing_kv_events": True}
+        )
+        vllm_config.cache_config.block_size = self.BLOCK
+        vllm_config.cache_config.prefix_match_unit = self.BLOCK
+        vllm_config.speculative_config = speculative_config
+        vllm_config.kv_events_config = KVEventsConfig(
+            enable_kv_cache_events=True, publisher="null"
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["full_layer"],
+                    FullAttentionSpec(
+                        block_size=self.BLOCK,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                    is_eagle_group=mamba_eagle,
+                ),
+                KVCacheGroupSpec(
+                    ["mamba_layer"],
+                    MambaSpec(
+                        block_size=self.MAMBA_BLOCK,
+                        shapes=((1, 1),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                ),
+            ],
+        )
+        spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+        return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+    def _roundtrip_served_tokens(self, scheduler) -> int:
+        """Request A: prompt-only store, finish; request A2: served tokens."""
+        stored: set = set()
+        scheduler.manager.lookup.side_effect = lambda key, ctx: (
+            LookupResult.HIT if key in stored else LookupResult.MISS
+        )
+        scheduler.manager.prepare_store.side_effect = lambda keys, ctx: (
+            generate_store_output(list(keys))
+        )
+
+        def complete_all_jobs():
+            job_ids = list(scheduler._jobs.keys())
+            for jid in job_ids:
+                stored.update(scheduler._jobs[jid].keys)
+            if job_ids:
+                scheduler.update_connector_output(
+                    KVConnectorOutput(
+                        kv_connector_worker_meta=OffloadingWorkerMetadata(
+                            completed_jobs={jid: 1 for jid in job_ids}
+                        )
+                    )
+                )
+
+        def make_request(req_id):
+            request = MagicMock()
+            request.request_id = req_id
+            request.kv_transfer_params = None
+            request.num_prompt_tokens = self.PROMPT_TOKENS
+            request.num_tokens = self.PROMPT_TOKENS
+            request.num_computed_tokens = 0
+            request.block_hashes = [
+                BlockHash(f"h{i}".encode())
+                for i in range(self.PROMPT_TOKENS // self.BLOCK)
+            ]
+            request.all_token_ids = list(range(self.PROMPT_TOKENS))
+            request.lora_request = None
+            request.is_finished.return_value = False
+            request.status = None
+            scheduler.on_new_request(request)
+            return request
+
+        req = make_request("A")
+        req_status = scheduler._req_status["A"]
+        req_status.num_locally_computed_tokens = 0
+        req_status.update_offload_keys()
+        assert scheduler._lookup(req_status) == 0  # cold
+
+        n_full = self.PROMPT_TOKENS // self.BLOCK
+        n_mamba = self.PROMPT_TOKENS // self.MAMBA_BLOCK
+        req_status.group_states[0].block_ids[:] = list(range(1, n_full + 1))
+        req_status.group_states[1].block_ids[:] = list(range(101, 101 + n_mamba + 1))
+
+        out = SimpleNamespace(
+            num_scheduled_tokens={"A": self.PROMPT_TOKENS},
+            finished_req_ids=set(),
+            kv_connector_block_state=KVConnectorBlockState(
+                block_ids={},
+                boundary_state_offloads={"A": [(1, 101, self.MAMBA_BLOCK)]},
+            ),
+        )
+        scheduler._build_partial_tail_store_jobs(out)
+        scheduler._build_store_jobs(out)
+        complete_all_jobs()
+
+        req.num_computed_tokens = self.PROMPT_TOKENS
+        req.num_tokens = self.PROMPT_TOKENS + 1
+        req.is_finished.return_value = True
+        req_status.update_offload_keys()
+        scheduler.request_finished(req)
+        out2 = SimpleNamespace(num_scheduled_tokens={}, finished_req_ids={"A"})
+        scheduler._build_store_jobs(out2)
+        complete_all_jobs()
+
+        make_request("A2")
+        rs2 = scheduler._req_status["A2"]
+        rs2.num_locally_computed_tokens = 0
+        rs2.update_offload_keys()
+        served = scheduler._lookup(rs2)
+        return served if served is not None else 0
+
+    def test_shared_group_mtp_serves_like_non_speculative(self):
+        """Route 1 of #52735: with spec decode on and no drafter annotation,
+        serving must equal the non-speculative baseline (was 0 before the
+        fix: the all-groups fallback marked the mamba group as a drafter and
+        the volatile-tail pop consumed its only servable chunk)."""
+        baseline = self._roundtrip_served_tokens(self._make_scheduler(None))
+        assert baseline == 16
+        served = self._roundtrip_served_tokens(
+            self._make_scheduler(_shared_kv_mtp_config())
+        )
+        assert served == baseline
+
+    def test_annotated_eagle_group_does_not_starve_coarse_sibling(self):
+        """Route 2 of #52735 (F1): a genuinely annotated eagle full-attention
+        group must not drag the confirmed boundary below a coarser sibling's
+        chunk granularity. The widened query makes the volatile-tail pop
+        land on an extra queried chunk, holding the boundary at 16 tokens
+        (was 0 before the fix: 4 hits -> pop -> 12 tokens < mamba chunk)."""
+        scheduler = self._make_scheduler(None, mamba_eagle=True)
+        assert [c.is_eagle_group for c in scheduler.config.kv_group_configs] == [
+            True,
+            False,
+        ]
+        assert self._roundtrip_served_tokens(scheduler) == 16
