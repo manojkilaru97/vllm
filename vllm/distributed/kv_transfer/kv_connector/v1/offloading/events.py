@@ -29,6 +29,7 @@ from vllm.distributed.kv_events import (
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    generate_block_hash_extra_keys,
     maybe_convert_block_hash,
     resolve_block_hashes,
     to_event_extra_keys,
@@ -92,11 +93,29 @@ class _OffloadEventMetadata:
     block_size: int
     lora_id: int | None
     lora_name: str | None
-    # Deferred: needs the same incremental curr_mm_idx handling as GPU events.
     extra_keys: tuple[tuple[Any, ...] | None, ...] | None
     group_idx: int
     kv_cache_spec: OffloadingEventGroupSpec
     active_residencies: set[tuple[Medium, str | None]]
+
+
+def _block_extra_keys(
+    req: Request, start_token: int, block_size: int, num_blocks: int
+) -> tuple[tuple[Any, ...] | None, ...] | None:
+    """Per-block extra keys (MM identity, LoRA, salt) as in GPU events.
+
+    None when no block has any, as upstream CPU events always reported."""
+    extra_keys: list[tuple[Any, ...] | None] = []
+    curr_mm_idx = 0
+    for block_idx in range(num_blocks):
+        start = start_token + block_idx * block_size
+        block_extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+            req, start, start + block_size, curr_mm_idx
+        )
+        extra_keys.append(block_extra_keys)
+    if all(keys is None for keys in extra_keys):
+        return None
+    return tuple(extra_keys)
 
 
 class OffloadingEventsTracker:
@@ -242,7 +261,9 @@ class OffloadingEventsTracker:
             block_size=tokens_per_hash,
             lora_id=lora_id,
             lora_name=lora_name,
-            extra_keys=None,
+            extra_keys=_block_extra_keys(
+                req, chunk_start, tokens_per_hash, len(block_hashes)
+            ),
             group_idx=group_config.group_idx,
             kv_cache_spec=group_config.kv_event_group_spec,
             active_residencies={_PRIMARY_RESIDENCY},
@@ -330,6 +351,10 @@ class OffloadingEventsTracker:
         assert tok_end <= len(req.all_token_ids)
         token_ids = tuple(req.all_token_ids[tok_start:tok_end])
 
+        extra_keys = _block_extra_keys(
+            req, tok_start, group_config.tokens_per_block, len(chunk_hashes)
+        )
+
         lora_id: int | None = None
         lora_name: str | None = None
         if req.lora_request is not None:
@@ -343,7 +368,7 @@ class OffloadingEventsTracker:
             block_size=group_config.tokens_per_block,
             lora_id=lora_id,
             lora_name=lora_name,
-            extra_keys=None,
+            extra_keys=extra_keys,
             group_idx=group_config.group_idx,
             kv_cache_spec=group_config.kv_event_group_spec,
             active_residencies={_PRIMARY_RESIDENCY},
