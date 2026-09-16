@@ -27,7 +27,11 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    generate_block_hash_extra_keys,
+    maybe_convert_block_hash,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     get_kv_cache_spec_kind,
@@ -84,7 +88,6 @@ class _OffloadEventMetadata:
     block_size: int
     lora_id: int | None
     lora_name: str | None
-    # Deferred: needs the same incremental curr_mm_idx handling as GPU events.
     extra_keys: tuple[tuple[Any, ...] | None, ...] | None
     group_idx: int
     kv_cache_spec: OffloadingEventGroupSpec
@@ -209,6 +212,16 @@ class OffloadingEventsTracker:
         assert tok_end <= len(req.all_token_ids)
         token_ids = tuple(req.all_token_ids[tok_start:tok_end])
 
+        extra_keys: list[tuple[Any, ...] | None] = []
+        curr_mm_idx = 0
+        for hash_idx in range(first_hash_idx, last_hash_idx):
+            hash_start = hash_idx * tokens_per_hash
+            hash_end = hash_start + tokens_per_hash
+            block_extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                req, hash_start, hash_end, curr_mm_idx
+            )
+            extra_keys.append(block_extra_keys)
+
         lora_id: int | None = None
         lora_name: str | None = None
         if req.lora_request is not None:
@@ -222,7 +235,7 @@ class OffloadingEventsTracker:
             block_size=tokens_per_hash,
             lora_id=lora_id,
             lora_name=lora_name,
-            extra_keys=None,
+            extra_keys=tuple(extra_keys),
             group_idx=group_config.group_idx,
             kv_cache_spec=group_config.kv_event_group_spec,
         )
