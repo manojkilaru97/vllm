@@ -1624,3 +1624,9 @@ class NemotronH_Nano_VL_V2(
     @classmethod
     def get_mamba_state_copy_func(cls):
         return NemotronHForCausalLM.get_mamba_state_copy_func()
+
+
+class NemotronH_Super_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
+    """Enable validated Super prefix caching without changing Nano's policy."""
+
+    supports_mamba_prefix_caching = True
