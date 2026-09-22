@@ -10,6 +10,7 @@ import time
 import uuid
 
 import pytest
+import torch
 
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.kv_offload.cpu.shared_offload_region import (
@@ -610,3 +611,103 @@ def test_wait_for_file_size_timeout(tmp_path):
             _wait_for_file_size(fd, PAGE_SIZE, timeout=0.1)
     finally:
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# num_openers — unlink-after-open so a dead worker cannot leave the region
+# resident in /dev/shm
+# ---------------------------------------------------------------------------
+
+
+def _mp_open_with_num_openers(
+    engine_id: str,
+    num_blocks: int,
+    rank: int,
+    num_workers: int,
+    fill_value: int,
+    done_queue,
+    exit_queue,
+) -> None:
+    """Join the region with num_openers set, write fill_value into this rank's
+    slot, report whether the path still exists, then exit without cleanup()
+    (simulating a worker that dies) once the parent says so."""
+    try:
+        region = SharedOffloadRegion(
+            engine_id=engine_id,
+            num_blocks=num_blocks,
+            rank=rank,
+            kv_bytes_per_block=num_workers * PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+            num_openers=num_workers,
+        )
+        t = region.create_next_view(PAGE_SIZE)
+        t[:, :] = fill_value
+        done_queue.put({"rank": rank, "error": None})
+        exit_queue.get()
+        os._exit(0)
+    except Exception as e:
+        done_queue.put({"rank": rank, "error": repr(e)})
+
+
+def test_num_openers_unlinks_path_once_all_workers_mapped(iid):
+    """With num_openers, the backing path disappears after the last worker maps
+    it, while the mapping itself stays shared and writable across processes; a
+    worker that exits without cleanup() leaves nothing behind in /dev/shm."""
+    num_workers = 2
+    num_blocks = 4
+    ctx = get_mp_context()
+    done_queue = ctx.Queue()
+    exit_queue = ctx.Queue()
+
+    region = SharedOffloadRegion(
+        engine_id=iid,
+        num_blocks=num_blocks,
+        rank=0,
+        kv_bytes_per_block=num_workers * PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        num_openers=num_workers,
+    )
+    marker_prefix = os.path.basename(region.mmap_path) + ".opened."
+    try:
+        # Only one of two expected openers so far: path and our marker remain.
+        assert os.path.exists(region.mmap_path)
+        assert any(n.startswith(marker_prefix) for n in os.listdir("/dev/shm"))
+
+        child = ctx.Process(
+            target=_mp_open_with_num_openers,
+            args=(iid, num_blocks, 1, num_workers, 22, done_queue, exit_queue),
+        )
+        child.start()
+        result = done_queue.get(timeout=30)
+        assert result["error"] is None, result
+
+        # Second opener observed both markers and unlinked file + markers.
+        assert not os.path.exists(region.mmap_path)
+        assert not any(n.startswith(marker_prefix) for n in os.listdir("/dev/shm"))
+
+        # The shared mapping is still live: the child's slot is visible here.
+        raw = torch.frombuffer(memoryview(region.mmap_obj), dtype=torch.int8)
+        assert raw[PAGE_SIZE : 2 * PAGE_SIZE].eq(22).all()
+        t0 = region.create_next_view(PAGE_SIZE)
+        t0[:, :] = 11
+        assert raw[:PAGE_SIZE].eq(11).all()
+
+        exit_queue.put(True)
+        child.join(timeout=30)
+        assert child.exitcode == 0
+        assert not any(n.startswith(marker_prefix) for n in os.listdir("/dev/shm"))
+        del raw, t0
+    finally:
+        region.cleanup()  # creator: must not warn or raise on the unlinked path
+        _cleanup_file(region.mmap_path)
+
+
+def test_num_openers_none_keeps_path_until_cleanup(iid):
+    """Without num_openers the legacy behavior is unchanged: the path exists for
+    the region's lifetime and the creator removes it in cleanup()."""
+    r = _make_region(iid, num_workers=1, rank=0)
+    try:
+        assert os.path.exists(r.mmap_path)
+    finally:
+        r.cleanup()
+    assert not os.path.exists(r.mmap_path)

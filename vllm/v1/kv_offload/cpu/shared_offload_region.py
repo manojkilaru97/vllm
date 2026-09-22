@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import mmap
 import os
 import time
@@ -34,6 +35,11 @@ class SharedOffloadRegion:
     size.  Each worker then mmap()s the full file.
 
     File path: /dev/shm/vllm_offload_{engine_id}.mmap
+
+    When ``num_openers`` is given, the path is unlinked as soon as that many
+    workers have mmap'd it. The mapping keeps the pages alive, so the region
+    is released by the kernel when the last worker exits, however it exits;
+    a leftover file cannot hold host memory across a worker restart.
     """
 
     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
@@ -45,6 +51,7 @@ class SharedOffloadRegion:
         rank: int | None,
         kv_bytes_per_block: int,
         cpu_page_size: int,
+        num_openers: int | None = None,
     ) -> None:
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_block % self.page_size == 0
@@ -55,6 +62,7 @@ class SharedOffloadRegion:
 
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
+        self._unlinked = False
         self.rank = rank
         if rank is not None:
             # byte offset to this worker's first slot within each block row
@@ -84,6 +92,8 @@ class SharedOffloadRegion:
             flags=mmap.MAP_SHARED,
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
+        if num_openers is not None:
+            self._unlink_once_all_opened(num_openers)
 
         # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
         _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
@@ -116,6 +126,39 @@ class SharedOffloadRegion:
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
         self.is_pinned: bool = False
+
+    def _unlink_once_all_opened(self, num_openers: int) -> None:
+        """Unlink the backing file after every expected worker has mmap'd it.
+
+        Each worker drops a per-process marker once its mapping exists; the
+        worker that observes all ``num_openers`` markers removes the data file
+        and the markers. No worker waits on another, so this cannot deadlock,
+        and a marker is only ever written by a process that already holds a
+        mapping, so the file is never removed before a worker has opened it.
+        """
+        marker_prefix = f"{self.mmap_path}.opened."
+        marker = f"{marker_prefix}{os.getpid()}"
+        with open(marker, "w"):
+            pass
+        directory = os.path.dirname(self.mmap_path)
+        prefix = os.path.basename(marker_prefix)
+        markers = [
+            os.path.join(directory, name)
+            for name in os.listdir(directory)
+            if name.startswith(prefix)
+        ]
+        if len(markers) < num_openers:
+            return
+        for path in (self.mmap_path, *markers):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+        self._unlinked = True
+        logger.info(
+            "Unlinked mmap file %s after %d workers mapped it; pages persist "
+            "until the last mapping is released",
+            self.mmap_path,
+            num_openers,
+        )
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
@@ -201,10 +244,12 @@ class SharedOffloadRegion:
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
             self.fd = None
-        if self._creator and getattr(self, "mmap_path", None):
+        if self._creator and not self._unlinked and getattr(self, "mmap_path", None):
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)
+            except FileNotFoundError:
+                pass
             except Exception:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True

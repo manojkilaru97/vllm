@@ -138,6 +138,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                num_kv_groups=len(self.config.groups),
             )
         return self._manager
 
@@ -153,10 +154,10 @@ class CPUOffloadingSpec(OffloadingSpec):
         if self._uses_shared_region() and self.num_blocks > 0:
             # Replicated layout puts all ranks on slot 0 (single MLA copy);
             # otherwise each rank takes its own slot by physical device index.
+            world_size = self.config.parallel.world_size
             if self.replicated_layout:
                 rank = 0
             else:
-                world_size = self.config.parallel.world_size
                 rank = torch.accelerator.current_device_index() % world_size
             mmap_region = SharedOffloadRegion(
                 engine_id=self.config.engine_id,
@@ -164,6 +165,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 rank=rank,
                 kv_bytes_per_block=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
+                num_openers=world_size,
             )
         return CPUOffloadingWorker(
             kv_caches=kv_caches,

@@ -971,3 +971,60 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
     assert len(received) == 1
     assert received[0][0] == keys
     assert received[0][1] is ctx
+
+
+@pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
+def test_eviction_takes_idle_chunk_siblings_across_groups(eviction_policy):
+    """Hybrid models keep one slot per (chunk, group) and can only load a chunk
+    when every group's slot is resident. Evicting one group's slot must take the
+    chunk's idle sibling slots with it, so residency implies loadability and the
+    router is not told about blocks the engine can no longer use."""
+    manager = CPUOffloadingManager(
+        num_blocks=4,
+        cache_policy=eviction_policy,
+        enable_events=True,
+        num_kv_groups=2,
+    )
+
+    def key(int_hash: int, group_idx: int) -> OffloadKey:
+        return make_offload_key(str(int_hash).encode(), group_idx)
+
+    chunk1 = [key(1, 0), key(1, 1)]
+    chunk2 = [key(2, 0), key(2, 1)]
+    manager.prepare_store(chunk1 + chunk2, _EMPTY_REQ_CTX)
+    manager.complete_store(chunk1 + chunk2, _EMPTY_REQ_CTX)
+    manager.touch(chunk2, _EMPTY_REQ_CTX)  # chunk1 slots are the LRU victims
+    list(manager.take_events())
+
+    # One new slot forces exactly one eviction; the LRU victim is a chunk1 slot
+    # and its sibling must go with it.
+    output = manager.prepare_store([key(3, 0)], _EMPTY_REQ_CTX)
+    assert output is not None
+    assert set(output.evicted_keys) == set(chunk1)
+    for k in chunk1:
+        assert manager.lookup(k, _EMPTY_REQ_CTX) == LookupResult.MISS
+    for k in chunk2:
+        assert manager.lookup(k, _EMPTY_REQ_CTX) == LookupResult.HIT
+    removed = [event for event in manager.take_events() if event.removed]
+    assert len(removed) == 1 and set(removed[0].keys) == set(chunk1)
+
+    # The freed sibling slot is reusable: two more slots fit without eviction.
+    manager.complete_store([key(3, 0)], _EMPTY_REQ_CTX)
+    output = manager.prepare_store([key(3, 1)], _EMPTY_REQ_CTX)
+    assert output is not None and output.evicted_keys == []
+
+
+def test_eviction_keeps_busy_chunk_siblings():
+    """A sibling slot with an in-flight load is not idle and must be left alone."""
+    manager = CPUOffloadingManager(
+        num_blocks=2, cache_policy="lru", enable_events=True, num_kv_groups=2
+    )
+    keys = [make_offload_key(b"1", 0), make_offload_key(b"1", 1)]
+    manager.prepare_store(keys, _EMPTY_REQ_CTX)
+    manager.complete_store(keys, _EMPTY_REQ_CTX)
+    manager.prepare_load([keys[1]], _EMPTY_REQ_CTX)  # ref_cnt 1: busy
+
+    output = manager.prepare_store([make_offload_key(b"2", 0)], _EMPTY_REQ_CTX)
+    assert output is not None
+    assert output.evicted_keys == [keys[0]]
+    assert manager.lookup(keys[1], _EMPTY_REQ_CTX) == LookupResult.HIT
