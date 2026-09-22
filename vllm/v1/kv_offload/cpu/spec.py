@@ -170,6 +170,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
                 info=self.cpu_info,
+                # Keys carry the KVCacheConfig group id, which may skip ids.
+                num_kv_groups=1
+                + max((g.group_id for g in self.config.groups), default=0),
             )
         return self._manager
 

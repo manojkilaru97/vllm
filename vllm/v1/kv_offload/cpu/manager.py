@@ -20,7 +20,9 @@ from vllm.v1.kv_offload.base import (
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
+    get_offload_block_hash,
     get_offload_group_idx,
+    make_offload_key,
 )
 from vllm.v1.kv_offload.cpu.common import (
     CPULoadStoreSpec,
@@ -66,12 +68,16 @@ class CPUOffloadingManager(OffloadingManager):
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
         info: CPUOffloadingInfo | None = None,
+        num_kv_groups: int = 1,
     ):
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
         self._config_info: ConfigInfoMapping = (
             info.as_config_info() if info is not None else {}
         )
+        # Hybrid models store one slot per (chunk, KV cache group); a chunk is
+        # only loadable while every group's slot is resident.
+        self._num_kv_groups: int = num_kv_groups
         self._num_allocated_chunks: int = 0
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -118,6 +124,34 @@ class CPUOffloadingManager(OffloadingManager):
 
     def _free_chunk(self, chunk: ChunkStatus) -> None:
         self._free_list.append(chunk.chunk_id)
+
+    def _evict_chunk_siblings(
+        self,
+        evicted: list[tuple[OffloadKey, ChunkStatus]],
+        protected: set[OffloadKey],
+    ) -> list[tuple[OffloadKey, ChunkStatus]]:
+        """Extend an eviction to the idle sibling slots of the same chunk.
+
+        Evicting a single group's slot (e.g. a Mamba state) leaves the chunk
+        unloadable while its other slots stay resident and advertised to the
+        router. Keeping chunks whole makes residency imply loadability and
+        frees the memory those orphaned slots would otherwise hold.
+        """
+        evicted = list(evicted)
+        seen = {key for key, _ in evicted}
+        for key, _ in list(evicted):
+            block_hash = get_offload_block_hash(key)
+            for group_idx in range(self._num_kv_groups):
+                sibling = make_offload_key(block_hash, group_idx)
+                if sibling in seen or sibling in protected:
+                    continue
+                chunk = self._policy.get(sibling)
+                if chunk is None or chunk.ref_cnt != 0:
+                    continue
+                self._policy.remove(sibling)
+                seen.add(sibling)
+                evicted.append((sibling, chunk))
+        return evicted
 
     def _get_load_store_spec(
         self,
@@ -334,6 +368,8 @@ class CPUOffloadingManager(OffloadingManager):
             evicted = self._policy.evict(num_chunks_to_evict, protected)
             if evicted is None:
                 return None
+            if self._num_kv_groups > 1:
+                evicted = self._evict_chunk_siblings(evicted, protected)
 
             # cache-policy removes only idle chunks.
             self._num_evictable_cache_chunks -= len(evicted)
