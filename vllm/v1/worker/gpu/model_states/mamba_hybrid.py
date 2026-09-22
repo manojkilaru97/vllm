@@ -32,6 +32,10 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    # All-mode spec decode only (Mamba2): per-row block index of the previous
+    # step's last scheduled token, or -1 to let the builder fall back to
+    # (num_computed_tokens - 1) // block_size.
+    prev_last_scheduled_idx: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -50,7 +54,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
         ):
             return {}
-        return {
+        kwargs: dict[str, Any] = {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
@@ -58,6 +62,12 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             if self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs],
         }
+        if (
+            isinstance(attn_metadata_builder, Mamba2AttentionMetadataBuilder)
+            and self.prev_last_scheduled_idx is not None
+        ):
+            kwargs["prev_last_scheduled_idx"] = self.prev_last_scheduled_idx[:num_reqs]
+        return kwargs
 
 
 class MambaHybridModelState(DefaultModelState):
@@ -72,9 +82,12 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        self._mamba_group_ids: list[int] = []
+        self._mamba_spec: MambaSpec | None = None
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
         # kernel reusing the postprocess copy machinery, so the per-step src
@@ -91,8 +104,25 @@ class MambaHybridModelState(DefaultModelState):
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
-            self._mamba_group_ids: list[int] = []
-            self._mamba_spec: MambaSpec | None = None
+        # "all" prefix-cache mode + spec decode: each decode step snapshots its
+        # states at the block of its last scheduled token, and the next step
+        # must read them back from there (V1 `postprocess_mamba_all` /
+        # `preprocess_mamba_all_specdec`). The index is derived from the GPU
+        # seq_lens because the CPU num_computed_tokens mirror is optimistic
+        # under async scheduling. -1 means "no prior full decode step" and
+        # makes the builder fall back to (num_computed_tokens - 1) // block_size.
+        self._all_specdec_mode = (
+            self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0
+        )
+        if self._all_specdec_mode:
+            self._mamba_prev_last_scheduled_idx_gpu = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
+            )
+            # Batch-ordered snapshot taken in preprocess_state for the batch
+            # about to run, consumed by prepare_attn (real batches only).
+            self._prev_last_scheduled_idx_batch: (
+                tuple[InputBatch, torch.Tensor] | None
+            ) = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -103,6 +133,10 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_state_idx_gpu[req_index].fill_(
                 (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
             )
+        if self._all_specdec_mode:
+            # New/resumed requests (and reused slots) have no previous decode
+            # step; the builder falls back to the last computed token's block.
+            self._mamba_prev_last_scheduled_idx_gpu[req_index].fill_(-1)
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -170,6 +204,8 @@ class MambaHybridModelState(DefaultModelState):
         ``prepare_attn`` gathers ``num_accepted_tokens``, so the boundary reset
         is visible to the forward kernels.
         """
+        if self._all_specdec_mode:
+            self._record_all_mode_last_scheduled_idx(input_batch, kv_cache_config)
         if not self._align_mode:
             return
         num_reqs = input_batch.num_reqs
@@ -206,6 +242,37 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.idx_mapping,
         )
 
+    def _record_all_mode_last_scheduled_idx(
+        self, input_batch: InputBatch, kv_cache_config: KVCacheConfig
+    ) -> None:
+        """Snapshot the batch's previous-step indices for ``prepare_attn``, then
+        record this step's for the next one.
+
+        Mirrors V1 ``postprocess_mamba_all``: a request that runs a full
+        ``1 + num_spec_tokens`` decode query records the block index of its
+        last scheduled token, ``(seq_len - 1) // block_size``; any other query
+        (prefill chunk, truncated draft) records -1. Uses the GPU ``seq_lens``
+        (exact under async scheduling) rather than the CPU mirror.
+        """
+        num_reqs = input_batch.num_reqs
+        if num_reqs == 0:
+            return
+        idx_mapping = input_batch.idx_mapping
+        self._prev_last_scheduled_idx_batch = (
+            input_batch,
+            self._mamba_prev_last_scheduled_idx_gpu[idx_mapping],
+        )
+        _, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        query_start_loc = input_batch.query_start_loc
+        query_lens = query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
+        is_full_decode = query_lens == 1 + self.num_spec_tokens
+        last_scheduled_idx = (input_batch.seq_lens[:num_reqs] - 1) // (
+            mamba_spec.block_size
+        )
+        self._mamba_prev_last_scheduled_idx_gpu[idx_mapping] = torch.where(
+            is_full_decode, last_scheduled_idx, -1
+        )
+
     def prepare_attn(
         self,
         input_batch: InputBatch,
@@ -240,11 +307,22 @@ class MambaHybridModelState(DefaultModelState):
         # compute them during actual (non-capture) forward execution.
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
-        if not for_capture and self.vllm_config.num_speculative_tokens > 0:
+        prev_last_scheduled_idx = None
+        if not for_capture and self.num_spec_tokens > 0:
             num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
                 input_batch.idx_mapping
             ]
+            if self._all_specdec_mode:
+                # Padded rows (and dummy runs, which skip preprocess_state) get
+                # -1 so the builder derives the index from num_computed_tokens.
+                prev_last_scheduled_idx = (
+                    self._mamba_prev_last_scheduled_idx_gpu.new_full((num_reqs,), -1)
+                )
+                snapshot = self._prev_last_scheduled_idx_batch
+                self._prev_last_scheduled_idx_batch = None
+                if snapshot is not None and snapshot[0] is input_batch:
+                    prev_last_scheduled_idx[: input_batch.num_reqs] = snapshot[1]
 
             # GDN uses >= 0 to select spec-decode rows, so non-decode rows
             # need the -1 sentinel rather than a raw zero draft count.
@@ -266,6 +344,7 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            prev_last_scheduled_idx=prev_last_scheduled_idx,
         )
         return build_attn_metadata(
             attn_groups=attn_groups,
