@@ -120,12 +120,22 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
         # Get the index of the init block
         conv_state_init_index = tl.load(initial_state_idx + idx_seq)
+
+        # When num_computed_tokens is not block aligned, the slot holding the
+        # initial state (read by the chunk_offset==0 program) is the same slot
+        # the chunk_offset==1 program fills with the first block-boundary
+        # snapshot. Programs of one launch are unordered, so the chunk_offset==0
+        # program takes over that write after its read.
+        reader_owns_first_fill = (
+            (n_block_to_fill > 0) & (current_first_index == conv_state_init_index)
+        ).to(tl.int32)
     else:
         n_block_to_fill = 0
         current_last_index = 0
         conv_state_init_index = 0
         current_first_index = 0
         last_full_block_token_index = 0
+        reader_owns_first_fill = 0
 
     token_offset = BLOCK_M * chunk_offset
     segment_len = min(BLOCK_M, seqlen - token_offset)
@@ -315,6 +325,40 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 ]
                 tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
+        if IS_APC_ENABLED:
+            if reader_owns_first_fill == 1:
+                # Same store the chunk_offset==1 program performs for
+                # current_first_index (see below), issued here after the
+                # initial state above has been read from that slot.
+                idx_tokens_last = (
+                    last_full_block_token_index
+                    - (n_block_to_fill - 1) * B_size
+                    - state_len
+                ) + tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+                x_ptrs = (
+                    x_ptr
+                    + (idx_tokens_last * stride_x_token)[:, None]
+                    + (idx_feats * stride_x_dim)[None, :]
+                )  # [BLOCK_M,BLOCK_N,]
+                mask_x = (idx_tokens_last >= 0)[:, None] & (idx_feats < dim)[None, :]
+                loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+                idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+                conv_states_output_coord = tl.load(
+                    conv_state_indices_ptr
+                    + idx_seq * stride_cache_indices
+                    + current_first_index
+                ).to(tl.int64)
+                conv_states_ptrs_target = (
+                    conv_states_ptr
+                    + (conv_states_output_coord * stride_conv_state_seq)
+                    + (idx_feats * stride_conv_state_dim)
+                )[None, :] + (idx_tokens_conv * stride_conv_state_tok)[:, None]
+                mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
+                    None, :
+                ]
+                tl.debug_barrier()
+                tl.store(conv_states_ptrs_target, loaded_x, mask)
+
     else:  # chunk_offset > 0
         # read prior-token data from `x`
         load_init_state = True
@@ -353,7 +397,15 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         # If n_block_to_fill > 0, then the states at the sequence end and at the n_block_to_fill-last
         # stride_block_m are cached.
         # For example chunk_offset = n_block_to_fill stores the state at last_full_block
-        if (chunk_offset - 1) < n_block_to_fill:
+        if IS_APC_ENABLED:
+            # chunk_offset==1 skips its fill when the chunk_offset==0 program
+            # owns it (initial-state slot == first fill slot).
+            do_fill = ((chunk_offset - 1) < n_block_to_fill) & (
+                (chunk_offset != 1) | (reader_owns_first_fill == 0)
+            )
+        else:
+            do_fill = (chunk_offset - 1) < n_block_to_fill
+        if do_fill:
             # Store the states at the chunk boundaries from the start of the sequence
             idx_tokens_last = (
                 last_full_block_token_index
