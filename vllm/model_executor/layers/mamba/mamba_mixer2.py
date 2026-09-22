@@ -980,9 +980,18 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # Process decode requests
         if has_decode:
             assert state_indices_tensor_d is not None
+            conv_initial_state_idx_d = block_idx_last_computed_token_d
             if is_mamba_cache_all:
                 if self.num_spec > 0:
                     assert block_idx_last_scheduled_token_prev_step_d is not None
+                    # The previous step rolled the conv window into the block of
+                    # its last *scheduled* token; when drafts straddled a block
+                    # boundary and acceptance stopped before it, that differs
+                    # from the last *computed* token's block. Read back from
+                    # where it was written, as the SSM path below does.
+                    conv_initial_state_idx_d = (
+                        block_idx_last_scheduled_token_prev_step_d
+                    )
                     input_indices = (
                         block_idx_last_scheduled_token_prev_step_d.unsqueeze(1)
                         + self._decode_state_offsets
@@ -1018,7 +1027,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 self.activation,
                 conv_state_indices=state_indices_tensor_d,
                 block_idx_last_scheduled_token=block_idx_last_scheduled_token_d,
-                initial_state_idx=block_idx_last_computed_token_d,
+                initial_state_idx=conv_initial_state_idx_d,
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
                 max_query_len=state_indices_tensor_d.size(-1),
