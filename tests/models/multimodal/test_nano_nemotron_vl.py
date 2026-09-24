@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 
-from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
+from vllm.model_executor.models.nano_nemotron_vl import (
+    NemotronH_Nano_VL_V2,
+    _hf_radio_names_to_legacy,
+)
 
 
 class _TextOnlyMultiModalConfig:
@@ -111,6 +115,74 @@ def test_nano_nemotron_vl_loads_vision_weights_without_sound_encoder():
     assert vision_model.loaded_weights == [
         ("radio_model.encoder.weight", vision_weight)
     ]
+
+
+def test_hf_v5_radio_names_map_to_fused_legacy_weights():
+    """Transformers v5 re-saved checkpoints must not silently drop vision."""
+    q, k, v = (torch.full((2, 4), float(i)) for i in range(3))
+    converted = dict(
+        _hf_radio_names_to_legacy(
+            [
+                ("language_model.lm_head.weight", torch.zeros(1)),
+                ("vision_model.encoder.layer.3.attention.attention.key.weight", k),
+                ("vision_model.encoder.layer.3.attention.attention.query.weight", q),
+                ("vision_model.encoder.layer.3.attention.attention.value.weight", v),
+                ("vision_model.encoder.layer.3.attention.output.dense.bias", q),
+                ("vision_model.encoder.layer.3.layer_scale1.lambda1", torch.ones(4)),
+                ("vision_model.encoder.layer.3.mlp.fc1.weight", q),
+                ("vision_model.embeddings.patch_projection.weight", q),
+                ("vision_model.embeddings.cls_register_token", q),
+                ("vision_projector.mlp1.linear2.weight", q),
+                ("vision_projector.vision_final_layernorm.bias", q),
+            ]
+        )
+    )
+
+    blocks = "vision_model.radio_model.model.blocks.3."
+    assert torch.equal(converted[blocks + "attn.qkv.weight"], torch.cat([q, k, v]))
+    assert set(converted) == {
+        "language_model.lm_head.weight",
+        blocks + "attn.qkv.weight",
+        blocks + "attn.proj.bias",
+        blocks + "mlp.fc1.weight",
+        "vision_model.radio_model.model.patch_generator.embedder.weight",
+        "vision_model.radio_model.model.patch_generator.cls_token.token",
+        "mlp1.3.weight",
+        "vision_projector.vision_final_layernorm.bias",
+    }
+
+
+def test_hf_v5_radio_rejects_unsupported_layer_scale_and_partial_qkv():
+    with pytest.raises(ValueError, match="layer scale"):
+        list(
+            _hf_radio_names_to_legacy(
+                [("vision_model.encoder.layer.0.layer_scale2.lambda1", torch.zeros(4))]
+            )
+        )
+    query_bias = "vision_model.encoder.layer.0.attention.attention.query.bias"
+    with pytest.raises(ValueError, match="query/key/value"):
+        list(_hf_radio_names_to_legacy([(query_bias, torch.zeros(4))]))
+
+
+class _RadioLikeVisionModel(_VisionModel):
+    def named_parameters(self):
+        return [("model.encoder.layers.0.attn.qkv.weight", None)]
+
+    def load_weights(self, weights):
+        super().load_weights(weights)
+        return set()
+
+
+def test_nano_nemotron_vl_fails_when_vision_parameters_are_not_loaded():
+    model = object.__new__(NemotronH_Nano_VL_V2)
+    object.__setattr__(model, "model_config", _ImageOnlyModelConfig())
+    object.__setattr__(model, "language_model", _LanguageModel())
+    object.__setattr__(model, "mlp1", _AdapterModule())
+    object.__setattr__(model, "vision_model", _RadioLikeVisionModel())
+    object.__setattr__(model, "sound_encoder", None)
+
+    with pytest.raises(ValueError, match="vision tower parameters were not loaded"):
+        model.load_weights([("vision_model.unknown.weight", _FakeTensor())])
 
 
 def test_nano_nemotron_vl_requires_sound_encoder_for_sound_weights():
