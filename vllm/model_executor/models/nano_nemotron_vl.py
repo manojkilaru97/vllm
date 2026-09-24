@@ -8,6 +8,7 @@
 # --------------------------------------------------------
 
 import math
+import re
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
@@ -105,6 +106,75 @@ from .utils import _merge_multimodal_embeddings
 logger = init_logger(__name__)
 
 MAX_AUDIO_LEN_S = 10 * 60  # 10 minutes
+
+_VISION_FINAL_NORM_PREFIX = "vision_projector.vision_final_layernorm."
+_LEGACY_RADIO = "vision_model.radio_model.model."
+_HF_RADIO_PREFIXES = (
+    ("vision_model.embeddings.patch_projection.", "patch_generator.embedder."),
+    (
+        "vision_model.embeddings.video_patch_projection.",
+        "patch_generator.video_embedder.",
+    ),
+    ("vision_model.embeddings.position_embedding", "patch_generator.pos_embed"),
+    ("vision_model.embeddings.cls_register_token", "patch_generator.cls_token.token"),
+)
+_HF_PROJECTOR_PREFIXES = (
+    ("vision_projector.mlp1.norm.", "mlp1.0."),
+    ("vision_projector.mlp1.linear1.", "mlp1.1."),
+    ("vision_projector.mlp1.linear2.", "mlp1.3."),
+)
+_HF_RADIO_LAYER = re.compile(r"vision_model\.encoder\.layer\.(\d+)\.(.+)")
+_HF_RADIO_QKV = re.compile(r"attention\.attention\.(query|key|value)\.(weight|bias)")
+_HF_RADIO_LAYER_RENAMES = (("attention.output.dense.", "attn.proj."),)
+
+
+def _hf_radio_names_to_legacy(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Map Transformers v5 native RADIO/projector names to the RADIO names.
+
+    Checkpoints re-saved with Transformers v5 split the fused ``attn.qkv`` into
+    ``query``/``key``/``value`` and rename embeddings, blocks and ``mlp1``.
+    Layer scales are unit-valued in those exports and are not used here.
+    """
+    pending_qkv: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
+    for name, w in weights:
+        for src, dst in _HF_PROJECTOR_PREFIXES:
+            if name.startswith(src):
+                name = dst + name[len(src) :]
+                break
+        else:
+            for src, dst in _HF_RADIO_PREFIXES:
+                if name.startswith(src):
+                    name = _LEGACY_RADIO + dst + name[len(src) :]
+                    break
+        if name == "vision_model.summary_idxs":
+            continue
+        if (layer_match := _HF_RADIO_LAYER.fullmatch(name)) is None:
+            yield name, w
+            continue
+        layer, rest = layer_match.groups()
+        if rest.startswith(("layer_scale1.", "layer_scale2.")):
+            if not torch.all(w == 1):
+                raise ValueError(f"Non-unit RADIO layer scale is unsupported: {name}")
+            continue
+        if qkv := _HF_RADIO_QKV.fullmatch(rest):
+            part, kind = qkv.groups()
+            parts = pending_qkv.setdefault((layer, kind), {})
+            parts[part] = w.detach().clone()
+            if len(parts) == 3:
+                del pending_qkv[(layer, kind)]
+                fused = torch.cat([parts[p] for p in ("query", "key", "value")])
+                yield f"{_LEGACY_RADIO}blocks.{layer}.attn.qkv.{kind}", fused
+            continue
+        for src, dst in _HF_RADIO_LAYER_RENAMES:
+            if rest.startswith(src):
+                rest = dst + rest[len(src) :]
+        yield f"{_LEGACY_RADIO}blocks.{layer}.{rest}", w
+    if pending_qkv:
+        raise ValueError(
+            f"Incomplete RADIO query/key/value weights: {sorted(pending_qkv)}"
+        )
 
 
 class NanoNemotronVLAudioFeatureInputs(TensorSchema):
@@ -1001,16 +1071,6 @@ class NemotronH_Nano_VL_V2(
             vision_projection_hidden_size = config.projector_hidden_size
             llm_hidden_size = config.text_config.hidden_size
 
-            # Match the HF vision projector for checkpoints trained with MTP.
-            self.vision_final_layernorm = (
-                nn.LayerNorm(
-                    vit_hidden_size,
-                    eps=getattr(vision_config, "layer_norm_eps", 1e-6),
-                ).to(llm_dtype)
-                if (getattr(config.text_config, "num_nextn_predict_layers", 0) or 0) > 0
-                else None
-            )
-
             mlp1 = nn.Sequential(
                 RMSNorm(
                     hidden_size=vit_hidden_size
@@ -1026,6 +1086,11 @@ class NemotronH_Nano_VL_V2(
                 nn.Linear(vision_projection_hidden_size, llm_hidden_size, bias=False),
             )
             self.mlp1 = mlp1.to(llm_dtype)
+            # Applied only if the checkpoint ships it (load_weights drops it otherwise).
+            self.vision_final_layernorm: nn.LayerNorm | None = nn.LayerNorm(
+                vit_hidden_size,
+                eps=getattr(vision_config, "layer_norm_eps", 1e-6),
+            ).to(llm_dtype)
             self.sound_encoder: ProjectedParakeet | None = None
             if getattr(config, "sound_config", None) is not None:
                 logger.info_once(
@@ -1607,11 +1672,8 @@ class NemotronH_Nano_VL_V2(
             for modality in ("image", "video", "audio")
         )
         adapter_dict = dict(self.mlp1.named_parameters())
-        vision_norm_params = (
-            dict(self.vision_final_layernorm.named_parameters())
-            if load_multimodal_weights and self.vision_final_layernorm is not None
-            else {}
-        )
+        weights = _hf_radio_names_to_legacy(weights)
+        final_norm_weights: list[tuple[str, torch.Tensor]] = []
 
         def is_llm(name: str) -> bool:
             return name.startswith("language_model")
@@ -1624,11 +1686,6 @@ class NemotronH_Nano_VL_V2(
 
         def is_sound_weights(name: str) -> bool:
             return name.startswith("sound")
-
-        vision_norm_prefix = "vision_projector.vision_final_layernorm."
-
-        def is_vision_norm_weights(name: str) -> bool:
-            return name.startswith(vision_norm_prefix)
 
         # LLM weights (the bulk of the model) are streamed lazily through a
         # generator so each tensor is copied into its parameter before the
@@ -1656,20 +1713,17 @@ class NemotronH_Nano_VL_V2(
                     # Convert: vision_model.radio_model.* → radio_model.*
                     hf_key = name[len("vision_model.") :]
                     vision_weights.append((hf_key, w.detach().clone()))
+                elif name.startswith(_VISION_FINAL_NORM_PREFIX):
+                    if not load_multimodal_weights:
+                        continue
+                    final_norm_weights.append(
+                        (name[len(_VISION_FINAL_NORM_PREFIX) :], w.detach().clone())
+                    )
                 elif is_sound_weights(name):
                     if not load_multimodal_weights:
                         continue
                     assert self.sound_encoder is not None
                     sound_weights.append((name, w.detach().clone()))
-                elif is_vision_norm_weights(name):
-                    if not load_multimodal_weights:
-                        continue
-                    param_name = name.removeprefix(vision_norm_prefix)
-                    assert param_name in vision_norm_params, (
-                        f"Unexpected vision LayerNorm weight: {name}"
-                    )
-                    with torch.no_grad():
-                        default_weight_loader(vision_norm_params[param_name], w)
 
         # Fully drain the generator so every mm tensor is buffered, even if
         # the LLM loader stops iterating early.
@@ -1684,9 +1738,45 @@ class NemotronH_Nano_VL_V2(
                 param = adapter_dict[trimmed_name]
                 with torch.no_grad():
                     default_weight_loader(param, w)
-            self.vision_model.load_weights(vision_weights)
+            missing_adapter = adapter_dict.keys() - {n for n, _ in adapter_weights}
+            if missing_adapter:
+                raise ValueError(
+                    f"Vision projector weights missing from checkpoint: "
+                    f"{sorted(missing_adapter)}"
+                )
+            loaded_vision = self.vision_model.load_weights(vision_weights)
+            if isinstance(loaded_vision, set):
+                missing_vision = sorted(
+                    n
+                    for n, _ in self.vision_model.named_parameters()
+                    if n not in loaded_vision and not n.endswith((".ls1", ".ls2"))
+                )
+                if missing_vision:
+                    raise ValueError(
+                        f"{len(missing_vision)} vision tower parameters were not "
+                        f"loaded from the checkpoint, e.g. {missing_vision[:5]}"
+                    )
+            self._load_vision_final_layernorm(final_norm_weights)
             if self.sound_encoder is not None and len(sound_weights) > 0:
                 self.sound_encoder.load_weights(sound_weights)
+
+    def _load_vision_final_layernorm(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        norm = getattr(self, "vision_final_layernorm", None)
+        if not weights:
+            self.vision_final_layernorm = None
+            return
+        if norm is None:
+            raise ValueError("Checkpoint has a vision final LayerNorm but none exists")
+        params = dict(norm.named_parameters())
+        if params.keys() != {n for n, _ in weights}:
+            raise ValueError(
+                f"Incomplete vision final LayerNorm weights: {[n for n, _ in weights]}"
+            )
+        with torch.no_grad():
+            for name, w in weights:
+                default_weight_loader(params[name], w)
 
     def get_vit_model_from_radio_config(self, hf_config):
         hf_config_vision = hf_config.vision_config
