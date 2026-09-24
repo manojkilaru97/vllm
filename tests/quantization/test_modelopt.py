@@ -226,6 +226,28 @@ def test_modelopt_mixed_precision_composes_gemma4_mappers():
     assert config._resolve_quant_algo(expected_prefix) == "NVFP4"
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "mtp.layers.1.mixer.experts",
+        "mtp.layers.1.mixer.shared_experts.up_proj",
+        "model.mtp.layers.1.mixer.shared_experts.up_proj",
+    ],
+)
+def test_modelopt_mixed_precision_resolves_omni_mtp_layers(prefix):
+    config = _mixed_precision_config(
+        {
+            "language_model.mtp.layers.1.mixer.experts": {"quant_algo": "NVFP4"},
+            "language_model.mtp.layers.1.mixer.shared_experts.up_proj": {
+                "quant_algo": "NVFP4"
+            },
+        }
+    )
+
+    assert config._resolve_quant_algo(prefix) == "NVFP4"
+    assert config._resolve_quant_algo("model.layers.1.mixer.experts") is None
+
+
 def test_modelopt_mixed_precision_infers_fused_gate_up_projection():
     from vllm.model_executor.layers.linear import LinearBase
 

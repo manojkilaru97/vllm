@@ -2395,6 +2395,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
 
+        if prefix.startswith("mtp.layers."):
+            candidates.append("language_model." + prefix)
+        elif prefix.startswith("model.mtp.layers."):
+            candidates.append("language_model." + prefix[len("model.") :])
+
         return tuple(dict.fromkeys(candidates))
 
     def get_quant_method(
