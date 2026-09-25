@@ -6,15 +6,23 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
+from tests.v1.kv_connector.unit.offloading_connector.test_config import (
+    _make_vllm_config,
+)
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
+    MockOffloadingSpec,
     generate_store_output,
     to_keys,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from vllm.config import KVEventsConfig
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    build_offloading_config,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
@@ -28,7 +36,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.kv_offload.base import (
@@ -2240,6 +2250,9 @@ class TestEagle:
         req.block_hashes = [BlockHash(str(i).encode()) for i in range(num_hash_blocks)]
         req.all_token_ids = list(range(num_tokens))
         req.lora_request = None
+        req.mm_features = []
+        req.cache_salt = None
+        req.prompt_embeds = None
 
         state = RequestOffloadState(
             config=scheduler.config,
@@ -2555,8 +2568,9 @@ class TestEagle:
 
         Groups: 0=non-eagle full-attn, 1=eagle full-attn.
         Group 0 has only 1 hit (out of 3 keys) → max_hit tightens to 4.
-        This clears eagle_verified. Group 1 runs with max_hit=4 → only 1
-        key queried, 1 hit, pop to 0 → returns 0.
+        This clears eagle_verified. Group 1 runs with max_hit=4 → widened
+        query of 2 keys, 2 hits, pop to 1 → the confirmed boundary holds
+        at 4 tokens.
         """
         block_size = 4
         groups = [
@@ -2601,9 +2615,12 @@ class TestEagle:
             offload_keys_per_group=[[10, 11, 12], [1, 2, 3]],
         )
         # Group 0 (non-eagle FA): prefix finds 1 hit → max_hit=4, num_hit=4
-        # Group 1 (eagle FA): max_hit=4 → num_blocks=1, keys=[1].
-        #   Finds 1 hit, pop to 0 → new_num_hit = 0 < block_size → return 0
-        assert sched._lookup(req_status) == 0
+        # Group 1 (eagle FA): max_hit=4, widened query → keys=[1, 2].
+        #   Finds 2 hits, pop to 1 → boundary stays at 4 tokens. Before the
+        #   #52735 fix the query was not widened for full-attention groups,
+        #   so the pop landed on the only queried chunk and zeroed the
+        #   whole request.
+        assert sched._lookup(req_status) == 4
 
     def test_eagle_verified_survives_eagle_tighten(self, request_runner):
         """Eagle group tightening does NOT clear eagle_verified.
@@ -2719,10 +2736,12 @@ class TestEagle:
         runner.manager.prepare_store.side_effect = lambda keys, req_context: (
             generate_store_output(keys)
         )
-        # 4 decoded tokens fill block 3 entirely with decode tokens (one
-        # extra token so the block is stored under async scheduling too).
+        # 4 decoded tokens fill block 3; the extra decode steps let its store
+        # job complete within this run under both scheduling modes. The
+        # eagle group holds back its volatile trailing block (1, 3) while the
+        # request is still decoding, while the normal group stores (0, 3).
         runner.run(
-            decoded_tokens=[1, 1, 1, 1, 1, EOS_TOKEN_ID],
+            decoded_tokens=[1, 1, 1, 1, 1, 1, 1],
             expected_stored=(
                 (0, 0),
                 (0, 1),
@@ -2732,6 +2751,13 @@ class TestEagle:
                 (1, 1),
                 (1, 2),
             ),
+        )
+        # Once the request finishes, no spec rejection can rewrite the tail,
+        # so the exclusion is lifted (issue #52735): the held-back (1, 3) and
+        # the just-completed block 4 are stored for both groups.
+        runner.run(
+            decoded_tokens=[EOS_TOKEN_ID],
+            expected_stored=((1, 3), (0, 4), (1, 4)),
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -2774,10 +2800,16 @@ class TestEagle:
         runner.manager.prepare_store.side_effect = lambda keys, req_context: (
             generate_store_output(keys)
         )
-        # 4 decoded tokens fill block 3 entirely with decode tokens.
+        # 4 decoded tokens fill block 3 entirely with decode tokens. The
+        # eagle group holds back its volatile trailing block while decoding.
         runner.run(
-            decoded_tokens=[1, 1, 1, 1, EOS_TOKEN_ID],
+            decoded_tokens=[1, 1, 1, 1],
             expected_stored=((0, 0), (0, 1), (0, 2)),
+        )
+        # Finish lifts the exclusion; the tail block is stored (issue #52735).
+        runner.run(
+            decoded_tokens=[EOS_TOKEN_ID],
+            expected_stored=((0, 3),),
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -3206,7 +3238,20 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
     assert len(runner.connector_scheduler._jobs) == 0
 
 
-# Ported from upstream #52771 (issue #52735).
+def _shared_kv_mtp_config():
+    """Speculative config for a shared-group MTP model: eagle-family method
+    whose drafter layer merges into a target KV-cache group, so no group
+    self-identifies as a drafter group (issue #52735)."""
+    spec = MagicMock(name="shared_kv_mtp_spec")
+    spec.use_eagle.return_value = True
+    spec.use_eagle_block_drop.return_value = True
+    spec.use_multi_module_mtp.return_value = False
+    spec.num_speculative_tokens_per_batch_size = None
+    spec.max_num_new_slots_for_drafting = 0
+    spec.num_speculative_tokens = 1
+    return spec
+
+
 class TestSharedGroupMTPOffload:
     """Regression tests for issue #52735: OffloadingConnector must keep
     serving when speculative decoding is enabled but no KV-cache group is
@@ -3257,7 +3302,7 @@ class TestSharedGroupMTPOffload:
             decoded_tokens=[0] * (block_size * 3 + 2),
             expected_stored=(0, 1, 2, 3, 4, 5),
         )
-        runner.run(decoded_tokens=[EOS_TOKEN_ID])
+        runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(6,))
 
         runner.scheduler.reset_prefix_cache()
 
@@ -3282,7 +3327,9 @@ class TestMambaHybridOffloadServing:
         vllm_config = _make_vllm_config(
             extra_config={"self_describing_kv_events": True}
         )
-        vllm_config.cache_config.block_size = self.BLOCK
+        # This fork treats a mamba group as "align" only when its block size
+        # equals cache_config.block_size.
+        vllm_config.cache_config.block_size = self.MAMBA_BLOCK
         vllm_config.cache_config.prefix_match_unit = self.BLOCK
         vllm_config.speculative_config = speculative_config
         vllm_config.kv_events_config = KVEventsConfig(
@@ -3352,6 +3399,9 @@ class TestMambaHybridOffloadServing:
             ]
             request.all_token_ids = list(range(self.PROMPT_TOKENS))
             request.lora_request = None
+            request.mm_features = []
+            request.cache_salt = None
+            request.prompt_embeds = None
             request.is_finished.return_value = False
             request.status = None
             scheduler.on_new_request(request)
@@ -3368,15 +3418,11 @@ class TestMambaHybridOffloadServing:
         req_status.group_states[0].block_ids[:] = list(range(1, n_full + 1))
         req_status.group_states[1].block_ids[:] = list(range(101, 101 + n_mamba + 1))
 
+        # This fork has no partial-tail/boundary-state store path.
         out = SimpleNamespace(
             num_scheduled_tokens={"A": self.PROMPT_TOKENS},
             finished_req_ids=set(),
-            kv_connector_block_state=KVConnectorBlockState(
-                block_ids={},
-                boundary_state_offloads={"A": [(1, 101, self.MAMBA_BLOCK)]},
-            ),
         )
-        scheduler._build_partial_tail_store_jobs(out)
         scheduler._build_store_jobs(out)
         complete_all_jobs()
 
