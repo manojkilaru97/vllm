@@ -10,6 +10,7 @@ source still has that digest and that the GPU destination equals it.
 import hashlib
 import os
 import threading
+import time
 
 import numpy as np
 import torch
@@ -25,6 +26,7 @@ _digests: dict[tuple[int, int], bytes] = {}
 _lock = threading.Lock()
 _last_bad = 0
 _next_log = 0
+_last_log_t = 0.0
 _counts = {
     "store_ops": 0,
     "store_copy_mismatch": 0,
@@ -57,7 +59,7 @@ def verify_transfer(
     stream: torch.cuda.Stream,
 ) -> None:
     """Synchronously check a finished transfer's bytes (debug only)."""
-    global _last_bad, _next_log
+    global _last_bad, _next_log, _last_log_t
     stream.synchronize()
     with _lock:
         for t_idx, src_ptr, dst_ptr, size in zip(
@@ -86,7 +88,9 @@ def verify_transfer(
             + _counts["load_cpu_changed"]
             + _counts["load_copy_mismatch"]
         )
-        if bad > _last_bad or total >= _next_log:
+        now = time.monotonic()
+        if bad > _last_bad or total >= _next_log or now - _last_log_t > 30:
             logger.warning("KV offload verify: %s", dict(_counts))
             _last_bad = bad
             _next_log = total + _LOG_EVERY
+            _last_log_t = now
