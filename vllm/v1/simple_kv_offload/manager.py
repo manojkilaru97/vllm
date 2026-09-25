@@ -952,9 +952,22 @@ class SimpleCPUOffloadScheduler:
 
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
         self.cpu_block_pool.free_blocks(cpu_blocks)
-        self._gpu_block_pool.free_blocks(
-            self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
-        )
+        gpu_blocks = [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
+        if self._lazy_mode:
+            self._free_offloaded_gpu_blocks(gpu_blocks)
+        else:
+            self._gpu_block_pool.free_blocks(gpu_blocks)
+
+    def _free_offloaded_gpu_blocks(self, gpu_blocks: list["KVCacheBlock"]) -> None:
+        """Lazy mode: return copied blocks to the evict-first end of the GPU queue.
+        They came from near the LRU head; free_blocks would make them MRU."""
+        assert self._gpu_block_pool is not None
+        released: list[KVCacheBlock] = []
+        for block in gpu_blocks:
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                released.append(block)
+        self._gpu_block_pool.free_block_queue.prepend_n(released)
 
     def _release_transfer_refs(self, transfer: TransferMeta) -> None:
         """Release transfer refs without making copied data cacheable."""

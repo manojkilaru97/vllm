@@ -942,6 +942,32 @@ def test_eager_in_flight_store_dedup_across_steps() -> None:
     assert sched._in_flight_store_gpu_blocks == set()
 
 
+def test_lazy_store_completion_keeps_offloaded_blocks_evict_first() -> None:
+    """Lazy-offloaded blocks were next to evict; completing the copy must not
+    move them behind newer, not-yet-offloaded blocks."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    sched._target_free = 2
+
+    old = _allocate_gpu_blocks(gpu_pool, make_request(num_blocks=2), 2)
+    new = _allocate_gpu_blocks(gpu_pool, make_request(num_blocks=2), 2)
+    _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=3)
+    gpu_pool.free_blocks(old)
+    gpu_pool.free_blocks(new)
+
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_gpu_blocks == [b.block_id for b in old]
+    simulate_store_completion(sched, meta.store_event)
+
+    for block in old:
+        assert block.block_hash is not None
+        cpu_map = sched.cpu_block_pool.cached_block_hash_to_block
+        assert cpu_map.get_one_block(block.block_hash) is not None
+    free_order = gpu_pool.free_block_queue.get_all_free_blocks()
+    assert free_order == old + new
+
+
 # ---------------------------------------------------------------------------
 # Test 2c: Lazy duplicate store is skipped
 # ---------------------------------------------------------------------------
