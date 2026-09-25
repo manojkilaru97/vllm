@@ -169,6 +169,9 @@ def test_swa_offload_window_covers_unaligned_hit(
         KVCacheConfig(num_blocks=256, kv_cache_tensors=[], kv_cache_groups=groups),
     )
     request = MagicMock()
+    request.mm_features = []
+    request.cache_salt = None
+    request.prompt_embeds = None
     request.request_id = "unaligned"
     request.kv_transfer_params = None
     request.num_tokens = request.num_prompt_tokens = 4353
@@ -253,6 +256,9 @@ def _make_partial_tail_request(
     request_id: str = "req",
 ) -> MagicMock:
     request = MagicMock()
+    request.mm_features = []
+    request.cache_salt = None
+    request.prompt_embeds = None
     request.request_id = request_id
     request.kv_transfer_params = kv_transfer_params
     request.kv_hints = None
@@ -634,6 +640,9 @@ def test_recurrent_group_unhashed_block_does_not_truncate_load_boundary():
     scheduler = _make_partial_tail_scheduler()
 
     request = MagicMock()
+    request.mm_features = []
+    request.cache_salt = None
+    request.prompt_embeds = None
     request.request_id = "req"
     request.kv_transfer_params = None
     request.num_prompt_tokens = 64
@@ -4311,6 +4320,9 @@ class TestEagle:
     ) -> RequestOffloadState:
         """Build RequestOffloadState with synthetic offload keys."""
         req = MagicMock()
+        req.mm_features = []
+        req.cache_salt = None
+        req.prompt_embeds = None
         req.request_id = "test-req"
         req.num_tokens = num_tokens
         req.kv_transfer_params = None
@@ -5106,6 +5118,9 @@ class TestEagle:
         )
 
         request = MagicMock()
+        request.mm_features = []
+        request.cache_salt = None
+        request.prompt_embeds = None
         request.request_id = "req"
         request.kv_transfer_params = None
         request.num_prompt_tokens = 1200
@@ -5863,6 +5878,9 @@ class TestMambaHybridOffloadServing:
 
         def make_request(req_id):
             request = MagicMock()
+            request.mm_features = []
+            request.cache_salt = None
+            request.prompt_embeds = None
             request.request_id = req_id
             request.kv_transfer_params = None
             request.num_prompt_tokens = self.PROMPT_TOKENS
