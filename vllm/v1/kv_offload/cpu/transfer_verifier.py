@@ -63,8 +63,10 @@ def verify_transfer(
     stream.synchronize()
     with _lock:
         for t_idx, src_ptr, dst_ptr, size in zip(
-            tensor_indices.tolist(), src_ptrs.tolist(), dst_ptrs.tolist(),
-            sizes.tolist()
+            tensor_indices.tolist(),
+            src_ptrs.tolist(),
+            dst_ptrs.tolist(),
+            sizes.tolist(),
         ):
             src = _view(src_tensors[t_idx], src_ptr, size)
             dst = _view(dst_tensors[t_idx], dst_ptr, size)
