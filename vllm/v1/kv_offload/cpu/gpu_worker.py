@@ -26,6 +26,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
+from vllm.v1.kv_offload.cpu import transfer_verifier
 from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
@@ -416,6 +417,7 @@ class SingleDirectionOffloadingHandler:
         all_dst: np.ndarray,
         all_sizes: np.ndarray,
         op_idx: int,
+        op_tensor_idx: np.ndarray | None = None,
     ) -> tuple[int, int]:
         """Fill one group's copy descriptors for the direct (worker-private)
         layout: one whole-page copy per (block, ref).
@@ -442,6 +444,8 @@ class SingleDirectionOffloadingHandler:
             )
 
             all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
+            if op_tensor_idx is not None:
+                op_tensor_idx[op_idx:end_idx] = t_idx
             num_bytes += group_size * data_ref.page_size_bytes
             op_idx = end_idx
         return op_idx, num_bytes
@@ -458,6 +462,7 @@ class SingleDirectionOffloadingHandler:
         all_dst: np.ndarray,
         all_sizes: np.ndarray,
         op_idx: int,
+        op_tensor_idx: np.ndarray | None = None,
     ) -> tuple[int, int]:
         """Fill one group's copy descriptors for the canonical layout:
         scatter each block through the ref's precomputed CopyPlan, keeping
@@ -535,6 +540,8 @@ class SingleDirectionOffloadingHandler:
             all_sizes[op_idx:end_idx].reshape(num_active_blocks, plan.num_frags)[:] = (
                 plan.frag_sizes
             )
+            if op_tensor_idx is not None:
+                op_tensor_idx[op_idx:end_idx] = t_idx
             num_bytes += num_active_blocks * plan.total_bytes
             op_idx = end_idx
         return op_idx, num_bytes
@@ -624,6 +631,11 @@ class SingleDirectionOffloadingHandler:
         src_offset = 0
         dst_offset = 0
         op_idx = 0
+        op_tensor_idx = (
+            np.empty(num_copy_ops, dtype=np.int64)
+            if transfer_verifier.ENABLED
+            else None
+        )
         # count total number of bytes copied
         num_transfer_bytes = 0
         for g_idx, (group_size, block_idx) in enumerate(
@@ -656,6 +668,7 @@ class SingleDirectionOffloadingHandler:
                 all_dst=all_dst,
                 all_sizes=all_sizes,
                 op_idx=op_idx,
+                op_tensor_idx=op_tensor_idx,
             )
             num_transfer_bytes += group_bytes
 
@@ -714,6 +727,18 @@ class SingleDirectionOffloadingHandler:
                     is_src_access_order_any=is_src_access_order_any,
                 )
             end_event.record(stream)
+
+        if op_tensor_idx is not None and op_idx > 0:
+            transfer_verifier.verify_transfer(
+                self.gpu_to_cpu,
+                self.src_tensors,
+                self.dst_tensors,
+                op_tensor_idx[:op_idx],
+                all_src[:op_idx],
+                all_dst[:op_idx],
+                all_sizes[:op_idx],
+                stream,
+            )
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
