@@ -23,6 +23,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
+from vllm.v1.kv_offload.cpu import transfer_verifier
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
@@ -305,6 +306,11 @@ class SingleDirectionOffloadingHandler:
         src_offset = 0
         dst_offset = 0
         op_idx = 0
+        op_tensor_idx = (
+            np.empty(num_copy_ops, dtype=np.int64)
+            if transfer_verifier.ENABLED
+            else None
+        )
         # count total number of bytes copied
         num_transfer_bytes = 0
         for group_size, block_idx, group_data_refs in zip(
@@ -349,6 +355,8 @@ class SingleDirectionOffloadingHandler:
                 )
 
                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
+                if op_tensor_idx is not None:
+                    op_tensor_idx[op_idx:end_idx] = t_idx
                 num_transfer_bytes += group_size * data_ref.page_size_bytes
                 op_idx = end_idx
 
@@ -398,6 +406,18 @@ class SingleDirectionOffloadingHandler:
                     is_src_access_order_any=is_src_access_order_any,
                 )
             end_event.record(stream)
+
+        if op_tensor_idx is not None and num_copy_ops > 0:
+            transfer_verifier.verify_transfer(
+                self.gpu_to_cpu,
+                self.src_tensors,
+                self.dst_tensors,
+                op_tensor_idx,
+                all_src,
+                all_dst,
+                all_sizes,
+                stream,
+            )
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
