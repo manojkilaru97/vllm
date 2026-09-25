@@ -84,9 +84,7 @@ def _make_mixed_kv_cache_config(
     tensors.append(
         KVCacheTensor(
             size=fa_bytes,
-            layers=fa_layers,
-            layer_stride=fa_bytes,
-            block_stride=_BYTES_PER_BLOCK,
+            shared_by=fa_layers,
         )
     )
 
@@ -104,9 +102,7 @@ def _make_mixed_kv_cache_config(
         tensors.append(
             KVCacheTensor(
                 size=sw_bytes,
-                layers=sw_layers,
-                layer_stride=sw_bytes,
-                block_stride=_BYTES_PER_BLOCK,
+                shared_by=sw_layers,
             )
         )
 
@@ -123,9 +119,7 @@ def _make_mixed_kv_cache_config(
         tensors.append(
             KVCacheTensor(
                 size=m_bytes,
-                layers=m_layers,
-                layer_stride=m_bytes,
-                block_stride=_BYTES_PER_BLOCK,
+                shared_by=m_layers,
             )
         )
 
