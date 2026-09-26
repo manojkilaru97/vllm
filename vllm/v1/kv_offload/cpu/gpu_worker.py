@@ -381,9 +381,9 @@ class SingleDirectionOffloadingHandler:
             else torch.Event(enable_timing=True)
         )
 
-        if self.gpu_to_cpu:
-            # wait for model computation to finish before offloading
-            stream.wait_stream(current_platform.current_stream())
+        # Stores wait for the KV they read; loads wait for queued writes (e.g. a
+        # freed request's drafter) to their reused destination blocks (upstream #50907).
+        stream.wait_stream(current_platform.current_stream())
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event

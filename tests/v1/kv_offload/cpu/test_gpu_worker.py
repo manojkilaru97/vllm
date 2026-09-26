@@ -441,3 +441,38 @@ def test_transfer_multi_group(
                 )
 
     worker.shutdown()
+
+
+@torch.inference_mode()
+def test_load_orders_after_queued_writes_to_its_blocks(default_vllm_config) -> None:
+    """A load into a block that queued compute work still writes (e.g. a freed
+    request's drafter) must land after that write, not before it."""
+    page_size, gpu_block, cpu_block = 512, 9, 5
+    gpu_tensor = torch.zeros((16, page_size), dtype=torch.int8, device=DEVICES[0])
+    kv_caches = CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(tensor=gpu_tensor, page_size_bytes=page_size)],
+        group_data_refs=[
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size)]
+        ],
+    )
+    worker = CPUOffloadingWorker(
+        kv_caches=kv_caches, blocks_per_chunk=1, num_cpu_blocks=16, mmap_region=None
+    )
+    cpu_tensor = worker._load_handler.src_tensors[0]
+    corrupt = 0
+    for job_id in range(1, 21):
+        cpu_tensor[cpu_block].fill_(job_id)
+        torch.cuda._sleep(50_000_000)
+        gpu_tensor[gpu_block].fill_(-1)  # stale write, queued before the load
+        assert worker.submit_load(
+            job_id,
+            CPULoadStoreSpec([cpu_block]),
+            GPULoadStoreSpec([gpu_block], group_sizes=(1,), block_indices=(0,)),
+        )
+        worker.wait({job_id})
+        torch.cuda.synchronize()
+        worker.get_finished()
+        if not torch.equal(gpu_tensor[gpu_block].cpu(), cpu_tensor[cpu_block]):
+            corrupt += 1
+    worker.shutdown()
+    assert corrupt == 0, f"{corrupt}/20 loads were overwritten by an earlier write"
