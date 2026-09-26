@@ -61,6 +61,9 @@ class SimpleCPUOffloadWorker:
         # Compute-done event recorded before each store; reused across steps
         # (get_finished runs once per step, copy queue is FIFO).
         self._store_compute_done: torch.Event | None = None
+        # Recorded at bind, before this step's forward: loads wait for earlier
+        # steps' writes (e.g. the drafter) into blocks since reallocated to them.
+        self._load_prior_work_done: torch.Event | None = None
 
         # Pending event index sets, populated in bind_connector_metadata
         self._pending_load_event_indices: set[int] = set()
@@ -190,6 +193,10 @@ class SimpleCPUOffloadWorker:
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
+        if metadata.load_cpu_blocks:
+            if self._load_prior_work_done is None:
+                self._load_prior_work_done = torch.Event()
+            self._load_prior_work_done.record(torch.cuda.current_stream())
         if metadata.load_event >= 0:
             self._pending_load_event_indices.add(metadata.load_event)
         if metadata.store_event >= 0:
@@ -216,7 +223,8 @@ class SimpleCPUOffloadWorker:
         Stores (GPU->CPU) read the live KV cache, which the compute stream may
         still be writing under v1 overlapped execution, so they are ordered
         after a compute-done event recorded on the current stream. Loads
-        (CPU->GPU) read stable pinned host memory and launch immediately. See
+        (CPU->GPU) wait for GPU work enqueued before this step (recorded at
+        bind), since their destination blocks may have just been freed. See
         #45704 for the bug and #39306 for the srcAccessOrder rationale.
 
         Returns:
@@ -234,6 +242,7 @@ class SimpleCPUOffloadWorker:
                     is_store=False,
                     event_idx=metadata.load_event,
                     events_list=self._load_events,
+                    wait_event=self._load_prior_work_done,
                 )
             if metadata.store_gpu_blocks:
                 if self._store_compute_done is None:

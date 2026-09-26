@@ -124,6 +124,54 @@ def test_store_orders_after_compute_write():
     assert fixed == 0, f"store raced compute even with the barrier: {fixed} corrupt"
 
 
+def _drive_load(
+    backend: DmaCopyBackend, gpu: torch.Tensor, cpu: torch.Tensor, *, fenced: bool
+) -> int:
+    """Run ITERS loads into a block an earlier kernel is still writing (as the
+    previous step's drafter can be after the block is freed and reallocated);
+    return how many ended with the stale write instead of the loaded bytes."""
+    worker = SimpleCPUOffloadWorker(
+        vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
+    )
+    worker._backend = backend
+    corrupt = 0
+    for it in range(ITERS):
+        cpu[5].fill_((it % 126) + 1)
+        torch.cuda._sleep(SLEEP_CYCLES)
+        gpu[9].fill_(-1)  # late stale write, enqueued before the load
+        meta = SimpleCPUOffloadMetadata(
+            load_event=it, load_gpu_blocks=[9], load_cpu_blocks=[5]
+        )
+        if fenced:
+            worker.bind_connector_metadata(meta)
+            worker.get_finished(set())
+        else:
+            backend.launch_copy(
+                [5], [9], is_store=False, event_idx=it, events_list=worker._load_events
+            )
+        deadline = time.time() + 10.0
+        while not worker._load_events and time.time() < deadline:
+            time.sleep(0.0005)
+        assert worker._load_events, "background copy was never enqueued"
+        torch.cuda.synchronize()
+        worker._load_events.clear()
+        if not torch.equal(gpu[9].cpu(), cpu[5]):
+            corrupt += 1
+    return corrupt
+
+
+def test_load_orders_after_prior_writes_to_its_blocks():
+    """Without the bind-time fence a load races earlier writes to its block."""
+    backend, gpu, cpu = _make_backend()
+    try:
+        control = _drive_load(backend, gpu, cpu, fenced=False)
+        fixed = _drive_load(backend, gpu, cpu, fenced=True)
+    finally:
+        backend.shutdown()
+    assert control > 0, "unfenced load did not race the earlier write"
+    assert fixed == 0, f"load raced an earlier write despite the fence: {fixed}"
+
+
 def _copy_and_wait(backend: DmaCopyBackend, src, dst, is_store: bool) -> None:
     events: list[tuple[int, torch.Event]] = []
     backend.launch_copy(src, dst, is_store=is_store, event_idx=0, events_list=events)
@@ -179,20 +227,22 @@ class _RecordingBackend:
         self.calls.append({"is_store": is_store, "wait_event": wait_event})
 
 
-def test_get_finished_passes_wait_event_for_store_only():
-    """get_finished gates stores on a compute-done event but not loads."""
+def test_get_finished_passes_wait_events():
+    """Stores wait for this step's compute; loads for work before this step."""
     worker = SimpleCPUOffloadWorker(
         vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
     )
     recording = _RecordingBackend()
     worker._backend = recording
-    worker._connector_metadata = SimpleCPUOffloadMetadata(
-        load_event=0,
-        load_gpu_blocks=[0],
-        load_cpu_blocks=[0],
-        store_event=1,
-        store_gpu_blocks=[1],
-        store_cpu_blocks=[1],
+    worker.bind_connector_metadata(
+        SimpleCPUOffloadMetadata(
+            load_event=0,
+            load_gpu_blocks=[0],
+            load_cpu_blocks=[0],
+            store_event=1,
+            store_gpu_blocks=[1],
+            store_cpu_blocks=[1],
+        )
     )
 
     worker.get_finished(set())
@@ -202,7 +252,8 @@ def test_get_finished_passes_wait_event_for_store_only():
     assert len(store_calls) == 1
     assert len(load_calls) == 1
     assert isinstance(store_calls[0]["wait_event"], torch.Event)
-    assert load_calls[0]["wait_event"] is None
+    assert isinstance(load_calls[0]["wait_event"], torch.Event)
+    assert load_calls[0]["wait_event"] is not store_calls[0]["wait_event"]
 
 
 def test_build_params_src_access_order():
