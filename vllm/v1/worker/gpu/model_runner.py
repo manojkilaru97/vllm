@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from collections.abc import Container
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -949,8 +950,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Dummy batches are uniform by construction.
             return None, get_uniform_token_count(num_reqs, num_toks, max_query_len)
 
+        # Prompt chunks without drafts; padded prompt tails are spec-decode rows.
+        req_id_to_index = self.req_states.req_id_to_index
+        num_computed_prefill = self.req_states.num_computed_prefill_tokens
+        prefill_len = self.req_states.prefill_len.np
+        draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+        prompt_chunk_req_ids = {
+            r
+            for r in num_tokens_per_req
+            if not draft_tokens.get(r)
+            and num_computed_prefill[i := req_id_to_index[r]] < prefill_len[i]
+        }
         # batch_idx -> req_id
-        req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
+        req_ids = sort_batch_req_ids(
+            num_tokens_per_req, self.decode_query_len, prompt_chunk_req_ids
+        )
         numtoks_iter = map(num_tokens_per_req.get, req_ids)
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
 
@@ -1771,9 +1785,15 @@ class BatchReqState(NamedTuple):
 
 
 def sort_batch_req_ids(
-    num_tokens_per_req: dict[str, int], decode_query_len: int
+    num_tokens_per_req: dict[str, int],
+    decode_query_len: int,
+    prompt_chunk_req_ids: Container[str] = (),
 ) -> list[str]:
     # Order decode -> short_extend -> prefill; split_decodes_and_prefills
-    # relies on uniform decodes (query_len == decode_query_len) leading.
-    key = lambda r: ((num := num_tokens_per_req[r]) != decode_query_len, num)
+    # relies on decodes leading, so a decode-length prompt chunk must trail them.
+    key = lambda r: (
+        r in prompt_chunk_req_ids,
+        (num := num_tokens_per_req[r]) != decode_query_len,
+        num,
+    )
     return sorted(num_tokens_per_req, key=key)

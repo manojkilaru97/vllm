@@ -73,6 +73,7 @@ def _uniform_token_count(
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={req_id: query_len for req_id in req_states},
         total_num_scheduled_tokens=query_len * len(req_states),
+        scheduled_spec_decode_tokens={},
     )
     runner = _make_runner(req_states, decode_query_len=query_len)
     _, uniform_tok_count = runner.gather_batch_req_state(scheduler_output, dummy_run)
@@ -146,6 +147,48 @@ def test_spec_decodes_lead_short_prefill_tail():
     assert (num_decode_tokens, num_prefill_tokens) == (16, 1)
 
 
+def test_decode_length_prompt_chunk_trails_spec_decodes():
+    """A prompt chunk of exactly decode_query_len tokens must not lead decodes.
+
+    E.g. a 4-token prompt tail (MTP k=3) of a running request ahead of verify
+    rows. Mamba splits on is_prefilling, so every decode behind the chunk would
+    run through the prefill kernels and corrupt its recurrent state.
+    """
+    runner = _make_runner(
+        {"tail": (2044, 2048), "d0": (64, 64), "d1": (64, 64)}, decode_query_len=4
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"tail": 4, "d0": 4, "d1": 4},
+        total_num_scheduled_tokens=12,
+        scheduled_spec_decode_tokens={"d0": [1] * 3, "d1": [1] * 3},
+    )
+    state, _ = runner.gather_batch_req_state(scheduler_output, False)
+    assert state.req_ids == ["d0", "d1", "tail"]
+
+    metadata = _make_common_attn_metadata([4] * 3)
+    metadata.is_prefilling = torch.from_numpy(state.is_prefilling_np)
+    num_decodes, num_prefills, _, _ = split_decodes_and_prefills(
+        metadata, decode_threshold=4, treat_short_extends_as_decodes=False
+    )
+    assert (num_decodes, num_prefills) == (2, 1)
+
+
+def test_padded_prompt_tail_sorts_with_spec_decodes():
+    # A one-token prompt tail padded with placeholder drafts is a spec-decode
+    # row: it must stay ahead of prompt chunks, not trail them.
+    runner = _make_runner(
+        {"chunk": (2044, 2048), "padded": (2047, 2048), "d0": (64, 64)},
+        decode_query_len=4,
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"chunk": 4, "padded": 4, "d0": 4},
+        total_num_scheduled_tokens=12,
+        scheduled_spec_decode_tokens={"padded": [-1] * 3, "d0": [1] * 3},
+    )
+    state, _ = runner.gather_batch_req_state(scheduler_output, False)
+    assert state.req_ids == ["padded", "d0", "chunk"]
+
+
 def test_uniform_decode_uses_state_index_not_batch_position():
     """The gather must read each request's own state, not its batch slot.
 
@@ -164,6 +207,7 @@ def test_uniform_decode_uses_state_index_not_batch_position():
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"decode_a": 8, "decode_b": 8},
         total_num_scheduled_tokens=16,
+        scheduled_spec_decode_tokens={},
     )
 
     state, uniform_tok_count = runner.gather_batch_req_state(scheduler_output, False)
