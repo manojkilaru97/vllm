@@ -75,6 +75,9 @@ class SimpleCPUOffloadWorker:
         # Compute-done event recorded before each store; reused across steps
         # (get_finished runs once per step, copy queue is FIFO).
         self._store_compute_done: torch.Event | None = None
+        # Recorded at bind, before this step's forward: loads wait for earlier
+        # steps' writes (e.g. the drafter) into blocks since reallocated to them.
+        self._load_prior_work_done: torch.Event | None = None
 
         # Pending event index sets, populated in bind_connector_metadata
         self._pending_load_event_indices: set[int] = set()
@@ -263,6 +266,10 @@ class SimpleCPUOffloadWorker:
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
+        if metadata.load_cpu_blocks:
+            if self._load_prior_work_done is None:
+                self._load_prior_work_done = torch.Event()
+            self._load_prior_work_done.record(torch.cuda.current_stream())
         if metadata.load_event >= 0:
             self._pending_load_event_indices.add(metadata.load_event)
         if metadata.store_event >= 0:
@@ -275,7 +282,8 @@ class SimpleCPUOffloadWorker:
         # Invoked after the forward launch on steps without sync loads
         # (SchedulerOutput.has_sync_kv_loads), so the CPU-side block copy
         # op overhead (~5ms) stays hidden behind GPU compute. Stores are
-        # issued in wait_for_save().
+        # issued in wait_for_save(). Loads wait on the bind-time event so they
+        # land after earlier steps' writes to their freshly reallocated blocks.
         metadata = self._connector_metadata
         if metadata is not None and metadata.load_cpu_blocks:
             backend = self._backend
@@ -286,6 +294,7 @@ class SimpleCPUOffloadWorker:
                 is_store=False,
                 event_idx=metadata.load_event,
                 events_list=self._load_events,
+                wait_event=self._load_prior_work_done,
             )
 
     def wait_for_save(self) -> None:
