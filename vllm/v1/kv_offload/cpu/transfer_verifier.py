@@ -70,10 +70,11 @@ def verify_transfer(
         ):
             src = _view(src_tensors[t_idx], src_ptr, size)
             dst = _view(dst_tensors[t_idx], dst_ptr, size)
+            bad_kinds = []
             if gpu_to_cpu:
                 _counts["store_ops"] += 1
                 if not torch.equal(src.cpu(), dst):
-                    _counts["store_copy_mismatch"] += 1
+                    bad_kinds.append("store_copy_mismatch")
                 _digests[(dst_ptr, size)] = _digest(dst)
             else:
                 _counts["load_ops"] += 1
@@ -81,9 +82,19 @@ def verify_transfer(
                 if expected is None:
                     _counts["load_unknown"] += 1
                 elif _digest(src) != expected:
-                    _counts["load_cpu_changed"] += 1
+                    bad_kinds.append("load_cpu_changed")
                 if not torch.equal(dst.cpu(), src):
-                    _counts["load_copy_mismatch"] += 1
+                    bad_kinds.append("load_copy_mismatch")
+            for kind in bad_kinds:
+                _counts[kind] += 1
+                logger.error(
+                    "KV offload verify BAD %s: tensor=%d src=%#x dst=%#x size=%d",
+                    kind,
+                    t_idx,
+                    src_ptr,
+                    dst_ptr,
+                    size,
+                )
         total = _counts["store_ops"] + _counts["load_ops"]
         bad = (
             _counts["store_copy_mismatch"]

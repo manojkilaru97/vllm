@@ -124,6 +124,43 @@ def test_store_orders_after_compute_write():
     assert fixed == 0, f"store raced compute even with the barrier: {fixed} corrupt"
 
 
+def _copy_and_wait(backend: DmaCopyBackend, src, dst, is_store: bool) -> None:
+    events: list[tuple[int, torch.Event]] = []
+    backend.launch_copy(src, dst, is_store=is_store, event_idx=0, events_list=events)
+    deadline = time.time() + 10.0
+    while not events and time.time() < deadline:
+        time.sleep(0.0005)
+    assert events, "background copy was never enqueued"
+    events[0][1].synchronize()
+
+
+def test_verifier_flags_cpu_block_changed_before_load(monkeypatch):
+    """Negative control for VLLM_KV_OFFLOAD_VERIFY on the DMA path: clean
+    round trips pass, a CPU block altered between store and load is flagged."""
+    from vllm.v1.kv_offload.cpu import transfer_verifier as tv
+
+    monkeypatch.setattr(tv, "ENABLED", True)
+    monkeypatch.setattr(tv, "_counts", dict.fromkeys(tv._counts, 0))
+    monkeypatch.setattr(tv, "_digests", {})
+    bad_keys = ("store_copy_mismatch", "load_cpu_changed", "load_copy_mismatch")
+    backend, gpu, cpu = _make_backend()
+    try:
+        gpu.copy_(torch.randint(-128, 127, gpu.shape, dtype=torch.int8, device="cuda"))
+        _copy_and_wait(backend, [1, 2], [3, 4], is_store=True)
+        _copy_and_wait(backend, [3], [10], is_store=False)
+        clean = dict(tv._counts)
+        cpu[4, 7] ^= 1
+        _copy_and_wait(backend, [4], [11], is_store=False)
+    finally:
+        backend.shutdown()
+
+    assert clean["store_ops"] == 2 and clean["load_ops"] == 1
+    assert all(clean[k] == 0 for k in bad_keys), clean
+    assert torch.equal(gpu[10].cpu(), gpu[1].cpu())
+    assert tv._counts["load_cpu_changed"] == 1, tv._counts
+    assert tv._counts["load_copy_mismatch"] == 0, tv._counts
+
+
 class _RecordingBackend:
     """Captures launch_copy calls without touching the GPU."""
 
