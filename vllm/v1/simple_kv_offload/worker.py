@@ -9,6 +9,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.kv_offload.cpu import transfer_verifier
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
@@ -238,6 +239,8 @@ class SimpleCPUOffloadWorker:
                 "Pinned memory not available. CPU offload performance may be degraded."
             )
 
+        if transfer_verifier.ENABLED:
+            logger.info("KV offload verify tensors: %s", list(unique_gpu_caches))
         self.cpu_kv_caches = {}
         for name, gpu_tensor in unique_gpu_caches.items():
             cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]

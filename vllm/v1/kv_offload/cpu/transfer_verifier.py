@@ -44,6 +44,10 @@ def _view(base: torch.Tensor, ptr: int, size: int) -> torch.Tensor:
     return base[row, col : col + size]
 
 
+def _row(base: torch.Tensor, ptr: int) -> int:
+    return (ptr - base.data_ptr()) // base.stride(0)
+
+
 def _digest(cpu_view: torch.Tensor) -> bytes:
     return hashlib.blake2b(cpu_view.numpy().tobytes(), digest_size=16).digest()
 
@@ -87,13 +91,19 @@ def verify_transfer(
                     bad_kinds.append("load_copy_mismatch")
             for kind in bad_kinds:
                 _counts[kind] += 1
+                diff = (src.cpu() != dst.cpu()).nonzero().flatten()
                 logger.error(
-                    "KV offload verify BAD %s: tensor=%d src=%#x dst=%#x size=%d",
+                    "KV offload verify BAD %s: tensor=%d src=%#x (row %d) "
+                    "dst=%#x (row %d) size=%d diff_bytes=%d first_diff=%d",
                     kind,
                     t_idx,
                     src_ptr,
+                    _row(src_tensors[t_idx], src_ptr),
                     dst_ptr,
+                    _row(dst_tensors[t_idx], dst_ptr),
                     size,
+                    diff.numel(),
+                    int(diff[0]) if diff.numel() else -1,
                 )
         total = _counts["store_ops"] + _counts["load_ops"]
         bad = (
