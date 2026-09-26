@@ -17,10 +17,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner, sort_batch_req_ids
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
@@ -147,18 +151,26 @@ def test_spec_decodes_lead_short_prefill_tail():
     assert (num_decode_tokens, num_prefill_tokens) == (16, 1)
 
 
-def test_decode_length_prompt_chunk_trails_spec_decodes():
+@pytest.mark.parametrize(
+    "order",
+    [
+        # Final prompt chunk of a running request, scheduled ahead of decodes.
+        ("tail", "d0", "d1"),
+        # Short cache-hit prefill between running decodes.
+        ("d0", "tail", "d1"),
+    ],
+)
+def test_decode_length_prompt_chunk_trails_spec_decodes(order):
     """A prompt chunk of exactly decode_query_len tokens must not lead decodes.
 
-    E.g. a 4-token prompt tail (MTP k=3) of a running request ahead of verify
-    rows. Mamba splits on is_prefilling, so every decode behind the chunk would
-    run through the prefill kernels and corrupt its recurrent state.
+    E.g. a 4-token prompt tail (MTP k=3) ahead of verify rows. Mamba splits on
+    is_prefilling, so every decode behind the chunk would run through the
+    prefill kernels and corrupt its recurrent state.
     """
-    runner = _make_runner(
-        {"tail": (2044, 2048), "d0": (64, 64), "d1": (64, 64)}, decode_query_len=4
-    )
+    states = {"tail": (2044, 2048), "d0": (64, 64), "d1": (64, 64)}
+    runner = _make_runner({r: states[r] for r in order}, decode_query_len=4)
     scheduler_output = SimpleNamespace(
-        num_scheduled_tokens={"tail": 4, "d0": 4, "d1": 4},
+        num_scheduled_tokens={r: 4 for r in order},
         total_num_scheduled_tokens=12,
         scheduled_spec_decode_tokens={"d0": [1] * 3, "d1": [1] * 3},
     )
@@ -187,6 +199,50 @@ def test_padded_prompt_tail_sorts_with_spec_decodes():
     )
     state, _ = runner.gather_batch_req_state(scheduler_output, False)
     assert state.req_ids == ["padded", "d0", "chunk"]
+
+
+def test_mamba_runs_padded_prompt_tail_as_spec_decode():
+    """A padded one-token prompt tail must take Mamba's spec-decode path.
+
+    Its placeholder drafts can only be rolled back by the decode kernels; the
+    prefill kernels would fold them into the running state. A real 4-token
+    prompt chunk behind it stays a prefill.
+    """
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+    )
+    builder: Any = Mamba2AttentionMetadataBuilder.__new__(
+        Mamba2AttentionMetadataBuilder
+    )
+    builder.kv_cache_spec = spec
+    builder.reorder_batch_threshold = 4
+    builder.num_spec_tokens = 3
+    builder.use_spec_decode = True
+    builder.use_replayssm = False
+    builder.decode_bc_pre_scratch = None
+    builder.chunk_size = 8
+    builder.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="align")
+    )
+    builder.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+
+    # Rows: verify decode, padded prompt tail (1 real token), 4-token chunk.
+    metadata = _make_common_attn_metadata([4, 4, 4])
+    metadata.seq_lens = torch.tensor([68, 36, 36], dtype=torch.int32)
+    metadata.seq_lens_cpu_upper_bound = metadata.seq_lens
+    metadata.block_table_tensor = torch.arange(24, dtype=torch.int32).view(3, 8)
+    metadata.is_prefilling = torch.tensor([False, True, True])
+    common = builder.build(
+        0,
+        metadata,
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([3, 3, -1], dtype=torch.int32),
+    )
+    assert (common.num_decodes, common.num_prefills) == (2, 1)
 
 
 def test_uniform_decode_uses_state_index_not_batch_position():
