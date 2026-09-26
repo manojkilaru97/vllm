@@ -967,6 +967,12 @@ def test_lazy_store_completion_keeps_offloaded_blocks_evict_first() -> None:
     free_order = gpu_pool.free_block_queue.get_all_free_blocks()
     assert free_order == old + new
 
+    # Reusing an offloaded block drops its GPU hash; the CPU copy still serves it.
+    old_hash = old[0].block_hash
+    assert gpu_pool.get_new_blocks(1) == [old[0]]
+    assert gpu_pool.cached_block_hash_to_block.get_one_block(old_hash) is None
+    assert cpu_map.get_one_block(old_hash) is not None
+
 
 # ---------------------------------------------------------------------------
 # Test 2c: Lazy duplicate store is skipped
