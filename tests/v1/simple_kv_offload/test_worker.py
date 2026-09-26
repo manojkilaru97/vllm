@@ -53,6 +53,13 @@ def _make_backend() -> tuple[DmaCopyBackend, torch.Tensor, torch.Tensor]:
     return backend, gpu["k"], cpu["k"]
 
 
+def _shutdown(backend: DmaCopyBackend, cpu: torch.Tensor) -> None:
+    # Unpin so a later test that reuses this host memory can register it again.
+    backend.shutdown()
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaHostUnregister(cpu.data_ptr())
+
+
 def _drive_store(
     backend: DmaCopyBackend,
     gpu: torch.Tensor,
@@ -115,7 +122,7 @@ def test_store_orders_after_compute_write():
         control = _drive_store(backend, gpu, cpu, with_barrier=False)
         fixed = _drive_store(backend, gpu, cpu, with_barrier=True)
     finally:
-        backend.shutdown()
+        _shutdown(backend, cpu)
 
     assert control > 0, (
         "no-barrier store did not race the compute write; the test no longer "
@@ -167,7 +174,7 @@ def test_load_orders_after_prior_writes_to_its_blocks():
         control = _drive_load(backend, gpu, cpu, fenced=False)
         fixed = _drive_load(backend, gpu, cpu, fenced=True)
     finally:
-        backend.shutdown()
+        _shutdown(backend, cpu)
     assert control > 0, "unfenced load did not race the earlier write"
     assert fixed == 0, f"load raced an earlier write despite the fence: {fixed}"
 
@@ -200,7 +207,7 @@ def test_verifier_flags_cpu_block_changed_before_load(monkeypatch):
         cpu[4, 7] ^= 1
         _copy_and_wait(backend, [4], [11], is_store=False)
     finally:
-        backend.shutdown()
+        _shutdown(backend, cpu)
 
     assert clean["store_ops"] == 2 and clean["load_ops"] == 1
     assert all(clean[k] == 0 for k in bad_keys), clean
