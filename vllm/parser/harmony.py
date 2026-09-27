@@ -442,9 +442,10 @@ class HarmonyParser(DelegatingParser):
 
 _JSON_CONSTRAINS = [" json", " <|constrain|>json"]
 # Harmomy's stop tokens are <|return|>, <|call|>, <|endoftext|>
-# They are represented as "" since xgrammar disallows stop tokens while
-# under constraints, leading to bad or infinite generations.
-_END_TAG = ["<|end|>", ""]
+# <|return|> is represented as "" since it's the default stop token, which xgrammar
+# disallows under constraints, leading to bad or infinite generation.
+# StreamableParser doesn't consider <|endoftext|> as a message end, so it's excluded
+_END_TAG = ["<|end|>", "<|call|>", ""]
 _FINAL_BEGIN = "<|channel|>final{constrain}<|message|>"
 _TOOL_CALL_CHANNELS = [
     "<|channel|>commentary",

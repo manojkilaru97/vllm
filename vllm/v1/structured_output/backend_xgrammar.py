@@ -118,10 +118,7 @@ class XgrammarBackend(StructuredOutputBackend):
             )
 
     def compile_grammar(
-        self,
-        request_type: StructuredOutputOptions,
-        grammar_spec: str,
-        stop_token_ids: set[int] | None = None,
+        self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
         # Note(arpera):
         # Our flag disable_any_whitespace does NOT map directly to
@@ -198,7 +195,6 @@ class XgrammarBackend(StructuredOutputBackend):
         return XgrammarGrammar(
             matcher=xgr.GrammarMatcher(
                 ctx,
-                override_stop_tokens=list(stop_token_ids) if stop_token_ids else None,
                 max_rollback_tokens=self.num_speculative_tokens,
             ),
             vocab_size=self.vocab_size,
