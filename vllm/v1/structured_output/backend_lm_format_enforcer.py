@@ -99,10 +99,7 @@ class LMFormatEnforcerBackend(StructuredOutputBackend):
         )
 
     def compile_grammar(
-        self,
-        request_type: StructuredOutputOptions,
-        grammar_spec: str,
-        stop_token_ids: set[int] | None = None,
+        self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
         character_level_parser: lmformatenforcer.CharacterLevelParser
         if request_type == StructuredOutputOptions.JSON:

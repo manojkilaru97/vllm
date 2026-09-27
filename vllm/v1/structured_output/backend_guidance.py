@@ -106,10 +106,7 @@ class GuidanceBackend(StructuredOutputBackend):
             )
 
     def compile_grammar(
-        self,
-        request_type: StructuredOutputOptions,
-        grammar_spec: str,
-        stop_token_ids: set[int] | None = None,
+        self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
         self.serialized_grammar = serialize_guidance_grammar(
             request_type,

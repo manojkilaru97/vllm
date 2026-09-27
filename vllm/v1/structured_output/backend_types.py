@@ -105,10 +105,7 @@ class StructuredOutputBackend(ABC):
 
     @abstractmethod
     def compile_grammar(
-        self,
-        request_type: StructuredOutputOptions,
-        grammar_spec: str,
-        stop_token_ids: set[int] | None = None,
+        self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
         """
         Compiles a grammar specification into a structured output grammar.
@@ -117,9 +114,6 @@ class StructuredOutputBackend(ABC):
             request_type (StructuredOutputOptions): The type of structured
                 output request.
             grammar_spec (str): The grammar specification to compile.
-            stop_token_ids (set[int] | None): The request's EOS and user
-                stop-token ids (``SamplingParams.all_stop_token_ids``), masked
-                until the grammar terminates.
 
         Returns:
             StructuredOutputGrammar: The compiled structured output grammar.

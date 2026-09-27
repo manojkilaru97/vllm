@@ -71,10 +71,7 @@ class OutlinesBackend(StructuredOutputBackend):
         return index
 
     def compile_grammar(
-        self,
-        request_type: StructuredOutputOptions,
-        grammar_spec: str,
-        stop_token_ids: set[int] | None = None,
+        self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
         if request_type == StructuredOutputOptions.JSON:
             regex = json_schema.build_regex_from_schema(grammar_spec)
