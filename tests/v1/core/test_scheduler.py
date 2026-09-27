@@ -1616,6 +1616,29 @@ def test_spec_decode_padding_first_decode_step():
     assert out.scheduled_spec_decode_tokens[r2.request_id] == [-1] * num_spec
 
 
+def test_spec_decode_padding_skipped_for_single_token_prompt():
+    """A new one-token prompt has no computed state, so padding it with
+    placeholder drafts would run it as a K+1-token prefill whose placeholders
+    become part of the recurrent state. It must be scheduled unpadded.
+    """
+    num_spec = 3
+    scheduler = create_scheduler(num_speculative_tokens=num_spec, block_size=16)
+    r1 = create_requests(num_requests=1, num_tokens=33, max_tokens=16)[0]
+    r2 = create_requests(num_requests=1, num_tokens=1, max_tokens=16, req_ids=["one"])[0]
+
+    scheduler.add_request(r1)
+    out = scheduler.schedule()
+    _model_output(scheduler, out, [[100]])
+    scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3]]))
+
+    scheduler.add_request(r2)
+    out = scheduler.schedule()
+
+    assert out.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3]
+    assert out.num_scheduled_tokens[r2.request_id] == 1
+    assert r2.request_id not in out.scheduled_spec_decode_tokens
+
+
 def test_spec_decode_padding_skipped_for_diffusion():
     """Diffusion spec tokens are the fixed-size denoising canvas, not
     rejectable drafts: a first-decode-step request must keep its 1-token span
