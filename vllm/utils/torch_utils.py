@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
-import functools
-import importlib
 import importlib.metadata
 import os
 import random
@@ -939,66 +937,3 @@ def direct_register_custom_op(
     my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
     if fake_impl is not None:
         my_lib._register_fake(op_name, fake_impl)
-
-
-def _torch_compile_failure_types() -> tuple[type[BaseException], ...]:
-    failure_types: list[type[BaseException]] = []
-    for module_name, attr in (
-        ("torch._dynamo.exc", "BackendCompilerFailed"),
-        ("torch._inductor.exc", "InductorError"),
-        ("torch._inductor.exc", "CppCompileError"),
-        ("torch._inductor.exc", "InvalidCxxCompiler"),
-    ):
-        try:
-            exc_type = getattr(importlib.import_module(module_name), attr)
-        except (ImportError, AttributeError):
-            continue
-        if isinstance(exc_type, type) and issubclass(exc_type, BaseException):
-            failure_types.append(exc_type)
-    return tuple(failure_types)
-
-
-def compile_with_eager_fallback(
-    fn: Callable[..., T] | None = None, **compile_kwargs: Any
-) -> Any:
-    """`torch.compile` a helper, running it eagerly if compilation fails.
-
-    Intended for small CPU-side preprocessing helpers (e.g. multimodal
-    processors) whose compiled form only saves time. Inductor's CPU backend
-    needs a host C++ toolchain that accepts the ISA flags it picks; when it
-    does not (e.g. torch>=2.13 emits ``-march=armv9-a`` on Grace, which
-    g++ < 12 rejects), the first call raises a compiler error. In that case
-    this wrapper logs one warning and calls the original function from then
-    on. Errors raised by the function itself are not swallowed.
-
-    Usable as ``@compile_with_eager_fallback(dynamic=True)`` on functions
-    and methods.
-    """
-    if fn is None:
-        return functools.partial(compile_with_eager_fallback, **compile_kwargs)
-
-    compiled = torch.compile(fn, **compile_kwargs)
-    failure_types = _torch_compile_failure_types()
-    use_eager = False
-
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> T:
-        nonlocal use_eager
-        if not use_eager:
-            try:
-                return compiled(*args, **kwargs)
-            except failure_types as e:
-                use_eager = True
-                detail = next((ln for ln in str(e).splitlines() if ln.strip()), "")
-                logger.warning(
-                    "torch.compile failed for %s (%s: %s); running it eagerly "
-                    "from now on. Install a host C++ compiler that supports "
-                    "the target CPU ISA to restore the compiled path.",
-                    getattr(fn, "__qualname__", repr(fn)),
-                    type(e).__name__,
-                    detail[:500],
-                )
-        return fn(*args, **kwargs)
-
-    wrapper._vllm_compiled = compiled  # type: ignore[attr-defined]
-    return wrapper

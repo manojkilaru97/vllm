@@ -27,7 +27,6 @@ from vllm.multimodal.inputs import AudioItem
 from vllm.multimodal.processing.processor import PromptUpdateDetails
 from vllm.multimodal.video_prune.evs import compute_retained_tokens_count
 from vllm.tokenizers.hf import HfTokenizer
-from vllm.utils.torch_utils import compile_with_eager_fallback
 
 from .internvl import calculate_internvl_targets, get_internvl_target_ratios
 
@@ -57,7 +56,7 @@ def calculate_timestamps(
     return timestamps
 
 
-@compile_with_eager_fallback(dynamic=True)
+@torch.compile(dynamic=True)
 def _bicubic_resize_and_normalize(
     tensor: torch.Tensor,
     size: tuple[int, int] | None = None,
