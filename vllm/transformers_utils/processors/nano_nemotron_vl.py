@@ -28,7 +28,6 @@ from vllm.multimodal.processing.processor import PromptUpdateDetails, cached_enc
 from vllm.multimodal.video_prune.evs import compute_retained_tokens_count
 from vllm.platforms import current_platform
 from vllm.tokenizers.hf import HfTokenizer
-from vllm.utils.torch_utils import compile_with_eager_fallback
 
 from .internvl import calculate_internvl_targets, get_internvl_target_ratios
 
@@ -58,9 +57,7 @@ def calculate_timestamps(
     return timestamps
 
 
-@compile_with_eager_fallback(
-    dynamic=True, backend=current_platform.simple_compile_backend
-)
+@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def _bicubic_resize_and_normalize(
     tensor: torch.Tensor,
     size: tuple[int, int] | None = None,
