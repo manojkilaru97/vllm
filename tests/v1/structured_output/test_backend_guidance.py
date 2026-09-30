@@ -5,6 +5,7 @@ import time
 from concurrent.futures import Future
 
 import pytest
+import torch
 from transformers import AutoTokenizer
 
 from vllm.config import StructuredOutputsConfig, VllmConfig
@@ -226,33 +227,69 @@ def test_disable_any_whitespace_ignores_schema_whitespace_options():
     assert grammar.accept_tokens("", tokenizer.encode('{"a":"x"}'))
 
 
-def test_manager_compiles_each_request_with_its_selected_backend():
-    """auto can select different backends per request; one engine must honour each."""
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
-    prompt = tokenizer.encode('{"a":"b"}')
-    vllm_config = VllmConfig(
-        model_config=ModelConfig(tokenizer=TOKENIZER),
-        structured_outputs_config=StructuredOutputsConfig(
-            backend="auto", disable_any_whitespace=True
-        ),
-        parallel_config=ParallelConfig(
-            distributed_executor_backend="external_launcher"
-        ),
+def _structured_request(
+    request_id: str, backend: str, params: StructuredOutputsParams, tokenizer
+) -> Request:
+    sampling_params = SamplingParams(structured_outputs=params)
+    sampling_params.structured_outputs._backend = backend
+    sampling_params.update_from_generation_config({}, tokenizer.eos_token_id)
+    return Request(
+        request_id,
+        prompt_token_ids=tokenizer.encode("x"),
+        sampling_params=sampling_params,
+        pooling_params=None,
     )
-    manager = StructuredOutputManager(vllm_config)
-    spaced = tokenizer.encode('{\n"a": "b"}')
+
+
+def _auto_manager(disable_any_whitespace: bool = True) -> StructuredOutputManager:
+    return StructuredOutputManager(
+        VllmConfig(
+            model_config=ModelConfig(tokenizer=TOKENIZER),
+            structured_outputs_config=StructuredOutputsConfig(
+                backend="auto", disable_any_whitespace=disable_any_whitespace
+            ),
+            parallel_config=ParallelConfig(
+                distributed_executor_backend="external_launcher"
+            ),
+        )
+    )
+
+
+# Compact separators differ: xgrammar emits ", " / ": ", guidance "," / ":".
+@pytest.mark.parametrize(
+    "params,spaced,compact",
+    [
+        pytest.param(
+            {"json": '{"type": "object"}'},
+            '{\n"a": "b"}',
+            {"xgrammar": '{"a": "b"}', "guidance": '{"a":"b"}'},
+            id="json",
+        ),
+        pytest.param(
+            {"json_object": True},
+            '{\n"a": "b"}',
+            {"xgrammar": '{"a": "b"}', "guidance": '{"a":"b"}'},
+            id="json_object",
+        ),
+        pytest.param(
+            {"json": '{"type": "object", "properties": {"m": {}}, "required": ["m"]}'},
+            '{"m":\n{"n": 1}}',
+            {"xgrammar": '{"m": {"n": 1}}', "guidance": '{"m":{"n":1}}'},
+            id="free_form",
+        ),
+    ],
+)
+def test_manager_compiles_each_request_with_its_selected_backend(
+    params, spaced, compact
+):
+    """auto can select different backends per request; one engine must honour each,
+    and disable_any_whitespace must hold on both."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    manager = _auto_manager()
     requests = {}
     for backend in ("xgrammar", "guidance"):
-        sampling_params = SamplingParams(
-            structured_outputs=StructuredOutputsParams(json='{"type": "object"}')
-        )
-        sampling_params.structured_outputs._backend = backend
-        sampling_params.update_from_generation_config({}, tokenizer.eos_token_id)
-        request = Request(
-            backend,
-            prompt_token_ids=prompt,
-            sampling_params=sampling_params,
-            pooling_params=None,
+        request = _structured_request(
+            backend, backend, StructuredOutputsParams(**params), tokenizer
         )
         manager.grammar_init(request)
         assert request.structured_output_request._check_grammar_completion()
@@ -262,14 +299,46 @@ def test_manager_compiles_each_request_with_its_selected_backend():
     assert type(grammars["xgrammar"]).__name__ == "XgrammarGrammar"
     assert type(grammars["guidance"]).__name__ == "GuidanceGrammar"
     assert manager.grammar_bitmask(requests, list(requests), {}) is not None
-    # Compact separators differ: xgrammar emits ", " / ": ", guidance "," / ":".
-    compact = {
-        "xgrammar": tokenizer.encode('{"a": "b"}'),
-        "guidance": tokenizer.encode('{"a":"b"}'),
-    }
+    spaced_tokens = tokenizer.encode(spaced)
     for request_id, grammar in grammars.items():
-        assert len(grammar.validate_tokens(spaced)) < len(spaced), request_id
-        assert grammar.accept_tokens(request_id, compact[request_id]), request_id
+        assert len(grammar.validate_tokens(spaced_tokens)) < len(spaced_tokens)
+        assert grammar.accept_tokens(
+            request_id, tokenizer.encode(compact[request_id])
+        ), request_id
+
+
+def test_manager_caches_only_incompatible_backends(monkeypatch):
+    """A bitmask-layout mismatch is permanent; a construction error is retried."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    manager = _auto_manager()
+    created = []
+
+    class FakeBackend:
+        def __init__(self, width):
+            self.width = width
+
+        def allocate_token_bitmask(self, n):
+            return torch.zeros((n, self.width), dtype=torch.int32)
+
+    def create(name):
+        created.append(name)
+        if name == "outlines":
+            raise RuntimeError("transient")
+        return FakeBackend(8 if name == "xgrammar" else 9)
+
+    monkeypatch.setattr(manager, "_create_backend", create)
+    params = StructuredOutputsParams(json='{"type": "object"}')
+    manager.grammar_init(_structured_request("a", "xgrammar", params, tokenizer))
+    for _ in range(2):
+        with pytest.raises(ValueError, match="incompatible"):
+            manager.grammar_init(
+                _structured_request("b", "guidance", params, tokenizer)
+            )
+        with pytest.raises(RuntimeError, match="transient"):
+            manager.grammar_init(
+                _structured_request("c", "outlines", params, tokenizer)
+            )
+    assert created == ["xgrammar", "guidance", "outlines", "outlines"]
 
 
 @pytest.mark.parametrize(
