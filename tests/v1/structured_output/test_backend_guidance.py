@@ -201,15 +201,18 @@ def test_grammar_init_async_and_sync(async_grammar):
 def test_manager_compiles_each_request_with_its_selected_backend():
     """auto can select different backends per request; one engine must honour each."""
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
-    prompt = tokenizer.encode('{"a": "b"}')
+    prompt = tokenizer.encode('{"a":"b"}')
     vllm_config = VllmConfig(
         model_config=ModelConfig(tokenizer=TOKENIZER),
-        structured_outputs_config=StructuredOutputsConfig(backend="auto"),
+        structured_outputs_config=StructuredOutputsConfig(
+            backend="auto", disable_any_whitespace=True
+        ),
         parallel_config=ParallelConfig(
             distributed_executor_backend="external_launcher"
         ),
     )
     manager = StructuredOutputManager(vllm_config)
+    spaced = tokenizer.encode('{\n"a": "b"}')
     requests = {}
     for backend in ("xgrammar", "guidance"):
         sampling_params = SamplingParams(
@@ -231,8 +234,14 @@ def test_manager_compiles_each_request_with_its_selected_backend():
     assert type(grammars["xgrammar"]).__name__ == "XgrammarGrammar"
     assert type(grammars["guidance"]).__name__ == "GuidanceGrammar"
     assert manager.grammar_bitmask(requests, list(requests), {}) is not None
+    # Compact separators differ: xgrammar emits ", " / ": ", guidance "," / ":".
+    compact = {
+        "xgrammar": tokenizer.encode('{"a": "b"}'),
+        "guidance": tokenizer.encode('{"a":"b"}'),
+    }
     for request_id, grammar in grammars.items():
-        assert grammar.accept_tokens(request_id, prompt)
+        assert len(grammar.validate_tokens(spaced)) < len(spaced), request_id
+        assert grammar.accept_tokens(request_id, compact[request_id]), request_id
 
 
 @pytest.mark.parametrize(

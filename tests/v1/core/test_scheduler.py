@@ -1624,7 +1624,9 @@ def test_spec_decode_padding_skipped_for_single_token_prompt():
     num_spec = 3
     scheduler = create_scheduler(num_speculative_tokens=num_spec, block_size=16)
     r1 = create_requests(num_requests=1, num_tokens=33, max_tokens=16)[0]
-    r2 = create_requests(num_requests=1, num_tokens=1, max_tokens=16, req_ids=["one"])[0]
+    r2 = create_requests(num_requests=1, num_tokens=1, max_tokens=16, req_ids=["one"])[
+        0
+    ]
 
     scheduler.add_request(r1)
     out = scheduler.schedule()
@@ -3327,16 +3329,16 @@ def test_schedule_skip_tokenizer_init_structured_output_request():
 def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     scheduler = create_scheduler()
     manager = scheduler.structured_output_manager
-    manager.backend = Mock()
-    manager.backend.compile_grammar.side_effect = RuntimeError(
-        "forced FSM compilation error"
-    )
+    backend = Mock()
+    backend.compile_grammar.side_effect = RuntimeError("forced FSM compilation error")
+    manager._backends["xgrammar"] = backend
     manager._use_async_grammar_compilation = async_grammar
 
     sampling_params = SamplingParams(
         max_tokens=16,
         structured_outputs=StructuredOutputsParams(json='{"type": "object"}'),
     )
+    sampling_params.structured_outputs._backend = "xgrammar"
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
     request = Request(
         request_id="grammar-error",

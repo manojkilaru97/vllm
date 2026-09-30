@@ -39,6 +39,7 @@ class StructuredOutputManager:
         # Backends are created on first use. With backend="auto", requests can be
         # validated for different backends, so each is compiled by its own.
         self._backends: dict[str, StructuredOutputBackend] = {}
+        self._backend_errors: dict[str, Exception] = {}
         # We only store the class of the reasoner in the manager.
         # The parser instance is request-scoped because some reasoning parsers
         # depend on per-request chat-template kwargs.
@@ -122,6 +123,17 @@ class StructuredOutputManager:
             raise ValueError("Structured output request has no backend selected")
         if (backend := self._backends.get(name)) is not None:
             return backend
+        if (error := self._backend_errors.get(name)) is not None:
+            raise error
+        try:
+            backend = self._create_backend(name)
+        except Exception as e:
+            self._backend_errors[name] = e
+            raise
+        self._backends[name] = backend
+        return backend
+
+    def _create_backend(self, name: str) -> StructuredOutputBackend:
         vocab_size = self.vllm_config.model_config.get_vocab_size()
         if name == "xgrammar":
             backend = XgrammarBackend(
@@ -157,7 +169,6 @@ class StructuredOutputManager:
                     f"shape {tuple(actual.shape)}, incompatible with "
                     f"{tuple(expected.shape)}"
                 )
-        self._backends[name] = backend
         return backend
 
     def grammar_init(self, request: "Request") -> None:
