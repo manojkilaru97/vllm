@@ -78,13 +78,20 @@ class XgrammarBackend(StructuredOutputBackend):
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
-        if request_type == StructuredOutputOptions.JSON:
-            ctx = self.compiler.compile_json_schema(
-                grammar_spec, any_whitespace=not self.disable_any_whitespace
+        if request_type in (
+            StructuredOutputOptions.JSON,
+            StructuredOutputOptions.JSON_OBJECT,
+        ):
+            schema = (
+                grammar_spec
+                if request_type == StructuredOutputOptions.JSON
+                else '{"type": "object"}'
             )
-        elif request_type == StructuredOutputOptions.JSON_OBJECT:
+            max_whitespace = vllm.envs.VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE
             ctx = self.compiler.compile_json_schema(
-                '{"type": "object"}', any_whitespace=not self.disable_any_whitespace
+                schema,
+                any_whitespace=not self.disable_any_whitespace,
+                max_whitespace_cnt=max_whitespace if max_whitespace > 0 else None,
             )
         elif request_type == StructuredOutputOptions.GRAMMAR:
             ctx = self.compiler.compile_grammar(grammar_spec)
