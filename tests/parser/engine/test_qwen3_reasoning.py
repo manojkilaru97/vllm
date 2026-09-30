@@ -581,3 +581,54 @@ class TestThinkingDisabled:
         reasoning, content = p.extract_reasoning("The answer is 42.", None)
         assert reasoning is None
         assert content == "The answer is 42."
+
+    def test_thinking_disabled_usage_ignores_think_start(self, mock_tokenizer):
+        """The usage counter must follow the same configured transitions as
+        the parser instead of reopening reasoning on a content-only marker.
+        """
+        p = Qwen3Parser(
+            mock_tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        counter = p.create_reasoning_token_counter(None)
+        assert counter is not None
+
+        assert counter.update([_THINK_START_ID, _TEXT_ID], finished=True) == 0
+
+    def test_usage_does_not_reopen_after_reasoning_end(self, mock_tokenizer):
+        p = Qwen3Parser(
+            mock_tokenizer,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        counter = p.create_reasoning_token_counter(None)
+        assert counter is not None
+
+        assert (
+            counter.update(
+                [_TEXT_ID, _THINK_END_ID, _THINK_START_ID, _TEXT_ID],
+                finished=True,
+            )
+            == 1
+        )
+
+    def test_usage_excludes_reasoning_start_self_loop(self, mock_tokenizer):
+        p = Qwen3Parser(
+            mock_tokenizer,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        counter = p.create_reasoning_token_counter(None)
+        assert counter is not None
+
+        assert (
+            counter.update(
+                [
+                    _THINK_START_ID,
+                    _TEXT_ID,
+                    _TEXT_ID,
+                    _THINK_END_ID,
+                    _TEXT_ID,
+                ],
+                finished=True,
+            )
+            == 2
+        )

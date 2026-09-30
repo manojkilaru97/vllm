@@ -146,6 +146,23 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
 
 
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_payload_logging_truthy_values(value: str) -> None:
+    with patch.dict(os.environ, {"VLLM_LOG_PAYLOADS": value}, clear=True):
+        assert environment_variables["VLLM_LOG_PAYLOADS"]() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
+def test_payload_logging_falsey_values(value: str) -> None:
+    with patch.dict(os.environ, {"VLLM_LOG_PAYLOADS": value}, clear=True):
+        assert environment_variables["VLLM_LOG_PAYLOADS"]() is False
+
+
+@pytest.mark.skip_global_cleanup
+def test_payload_logging_does_not_change_compile_factors() -> None:
+    assert "VLLM_LOG_PAYLOADS" not in envs.compile_factors()
+
+
 def test_rust_bench_auto_path_missing_fails_fast() -> None:
     with (
         patch.dict(os.environ, {"VLLM_USE_RUST_BENCH": "1"}, clear=True),

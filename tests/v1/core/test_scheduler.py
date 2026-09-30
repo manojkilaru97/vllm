@@ -40,7 +40,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
+from vllm.v1.structured_output import (
+    STRUCTURED_OUTPUT_COMPILE_ERROR,
+    StructuredOutputGrammar,
+    StructuredOutputManager,
+)
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
@@ -3164,16 +3168,16 @@ def test_schedule_skip_tokenizer_init_structured_output_request():
 def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     scheduler = create_scheduler()
     manager = scheduler.structured_output_manager
-    manager.backend = Mock()
-    manager.backend.compile_grammar.side_effect = RuntimeError(
-        "forced FSM compilation error"
-    )
+    backend = Mock()
+    backend.compile_grammar.side_effect = RuntimeError("forced FSM compilation error")
+    manager._backends["xgrammar"] = backend
     manager._use_async_grammar_compilation = async_grammar
 
     sampling_params = SamplingParams(
         max_tokens=16,
         structured_outputs=StructuredOutputsParams(json='{"type": "object"}'),
     )
+    sampling_params.structured_outputs._backend = "xgrammar"
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
     request = Request(
         request_id="grammar-error",
@@ -3202,7 +3206,7 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     output = engine_core_outputs[0].outputs[0]
     assert output.request_id == request.request_id
     assert output.finish_reason == FinishReason.ERROR
-    assert output.stop_reason is None
+    assert output.stop_reason == STRUCTURED_OUTPUT_COMPILE_ERROR
 
     healthy_request = create_requests(num_requests=1, req_ids=["healthy-request"])[0]
     scheduler.add_request(healthy_request)

@@ -123,6 +123,14 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     routed_experts: str | None = None
 
 
+class CompletionTokenUsageInfo(OpenAIBaseModel):
+    reasoning_tokens: int = 0
+
+
+class ChatCompletionUsageInfo(UsageInfo):
+    completion_tokens_details: CompletionTokenUsageInfo | None = None
+
+
 class ChatCompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: Literal["chat.completion"] = "chat.completion"
@@ -131,7 +139,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     choices: list[ChatCompletionResponseChoice]
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     system_fingerprint: str | None = None
-    usage: UsageInfo
+    usage: SerializeAsAny[UsageInfo]
 
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
@@ -168,7 +176,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: list[ChatCompletionResponseStreamChoice]
-    usage: UsageInfo | None = Field(default=None)
+    usage: SerializeAsAny[UsageInfo] | None = Field(default=None)
     # Set only on the final chunk of a stream to mirror non-streaming responses
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
@@ -590,16 +598,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
-        if self.max_completion_tokens is not None:
-            max_output_tokens: int | None = self.max_completion_tokens
-            max_output_tokens_param = "max_completion_tokens"
-        else:
-            max_output_tokens = self.max_tokens
-            max_output_tokens_param = "max_tokens"
+        max_output_tokens_param = (
+            "max_completion_tokens"
+            if self.max_completion_tokens is not None
+            else "max_tokens"
+        )
 
         return TokenizeParams(
             max_total_tokens=model_config.max_model_len,
-            max_output_tokens=max_output_tokens or 0,
+            # Validate that the prompt leaves room for a completion. The actual
+            # output limit is clamped to the remaining context after rendering,
+            # when the exact prompt token count is known.
+            max_output_tokens=1,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             truncation_side=self.truncation_side,
             add_special_tokens=self.add_special_tokens,

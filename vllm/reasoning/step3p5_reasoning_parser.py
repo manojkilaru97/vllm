@@ -45,6 +45,15 @@ class Step3p5ReasoningParser(BaseThinkingReasoningParser):
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         return self._is_reasoning_end_from_ids(input_ids)
 
+    def is_reasoning_end_for_usage(self, input_ids: Sequence[int]) -> bool:
+        """Inspect prompt markers without changing the streaming latch."""
+        for token_id in reversed(input_ids):
+            if token_id == self.start_token_id:
+                return False
+            if token_id == self.end_token_id:
+                return True
+        return False
+
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:

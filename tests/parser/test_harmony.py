@@ -498,6 +498,17 @@ class TestParse:
 
 
 class TestParseDelta:
+    @pytest.mark.skip_global_cleanup
+    def test_reasoning_token_counter_uses_live_harmony_count(self, harmony_parser):
+        token_ids = encode_output("<|channel|>analysis<|message|>Thinking")
+
+        result = harmony_parser.process_chunk(token_ids)
+        counter = harmony_parser.create_reasoning_token_counter(None)
+
+        assert counter is not None
+        assert result.reasoning_token_count > 0
+        assert counter.update(token_ids) == result.reasoning_token_count
+
     def test_basic(self, gpt_oss_tokenizer, chat_request):
         parser = HarmonyParser(gpt_oss_tokenizer)
 

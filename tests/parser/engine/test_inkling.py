@@ -277,6 +277,19 @@ class TestNonStreaming:
 
 
 class TestStreaming:
+    def test_counter_uses_prompt_tail_state(self, parser):
+        reasoning_counter = parser.create_reasoning_token_counter(
+            [_TML_VOCAB[THINK_START]]
+        )
+        content_counter = parser.create_reasoning_token_counter(
+            [_TML_VOCAB[TEXT_START]]
+        )
+
+        assert reasoning_counter is not None
+        assert content_counter is not None
+        assert reasoning_counter.update([ord("x")], finished=True) == 1
+        assert content_counter.update([ord("x")], finished=True) == 0
+
     @pytest.mark.parametrize("chunk_size", [1, 3, 7, 64, 4096])
     def test_chunk_invariance_tool_call(self, mock_tokenizer, mock_request, chunk_size):
         parser = InklingParser(mock_tokenizer)

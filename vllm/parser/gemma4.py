@@ -414,12 +414,14 @@ class Gemma4Parser(ParserEngine):
         self._reasoning_text: str = ""
         self._prefix_stripped: bool = False
         self._is_first_feed: bool = True
+        self._reasoning_start_injected: bool = False
 
     def _reset(self, initial_state=None) -> None:
         super()._reset(initial_state=initial_state)
         self._reasoning_text = ""
         self._prefix_stripped = False
         self._is_first_feed = True
+        self._reasoning_start_injected = False
 
     def _preprocess_feed(
         self,
@@ -449,6 +451,7 @@ class Gemma4Parser(ParserEngine):
         if not needs_injection:
             return delta_text, delta_token_ids
 
+        self._reasoning_start_injected = True
         delta_text = CHANNEL_START + delta_text
         if delta_token_ids:
             delta_token_ids = [self._reasoning_start_token_id, *delta_token_ids]
@@ -504,6 +507,13 @@ class Gemma4Parser(ParserEngine):
             if tid in boundary_ids:
                 return False
         return False
+
+    def _reasoning_counter_starts_in_reasoning(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> bool:
+        return self._reasoning_start_injected or bool(
+            prompt_token_ids and self._prompt_ends_in_open_reasoning(prompt_token_ids)
+        )
 
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         """Pre-initialise the engine to ``REASONING`` when the prompt ends

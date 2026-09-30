@@ -29,7 +29,10 @@ from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.parser.metrics import record_tool_parser_invocation
 from vllm.parser.utils import count_history_tool_calls
-from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
+from vllm.reasoning.abs_reasoning_parsers import (
+    ReasoningParser,
+    ReasoningTokenCounter,
+)
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser
@@ -162,6 +165,36 @@ class Parser:
     @tool_parser.setter
     def tool_parser(self, parser: ToolParser | None) -> None:
         self._tool_parser = parser
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        reasoning_parser = self._reasoning_parser
+        if reasoning_parser is None:
+            return None
+        if (
+            type(reasoning_parser).create_reasoning_token_counter
+            is ReasoningParser.create_reasoning_token_counter
+        ):
+            # Avoid scanning/copying the prompt for parsers that inherit the
+            # opt-out implementation and cannot produce a counter.
+            return None
+        if (
+            prompt_token_ids is not None
+            and reasoning_parser.is_reasoning_end_for_usage(prompt_token_ids)
+            # Engine tool adapters parse the post-reasoning phase with the
+            # full state machine and may legitimately transition back into
+            # reasoning. Legacy/no-tool paths permanently latch content mode.
+            and not (
+                self._tool_parser is not None
+                and self._tool_parser.can_reenter_reasoning
+            )
+        ):
+            # Do not mutate a plugin-provided counter: external reasoning
+            # plugins only promise the existing ``update`` interface. A
+            # standard closed counter is both compatible and authoritative.
+            return ReasoningTokenCounter()
+        return reasoning_parser.create_reasoning_token_counter(prompt_token_ids)
 
     def _initialize_history_tool_call_cnt(
         self,

@@ -108,7 +108,7 @@ class GuidanceBackend(StructuredOutputBackend):
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
-        self.serialized_grammar = serialize_guidance_grammar(
+        serialized_grammar = serialize_guidance_grammar(
             request_type,
             grammar_spec,
             self.disable_any_whitespace,
@@ -117,7 +117,7 @@ class GuidanceBackend(StructuredOutputBackend):
 
         ll_matcher = llguidance.LLMatcher(
             self.ll_tokenizer,
-            self.serialized_grammar,
+            serialized_grammar,
             log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
         )
 
@@ -147,6 +147,7 @@ class GuidanceGrammar(StructuredOutputGrammar):
     printed_error: bool = False
     terminated: bool = False
     rollback_lag: int = 0
+    _scratch: torch.Tensor | None = None
 
     def check_error(self):
         if not self.printed_error:
@@ -210,7 +211,21 @@ class GuidanceGrammar(StructuredOutputGrammar):
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         # this will automatically return [EOS] mask if the matcher is stopped
         # or otherwise in an error state
-        llguidance_torch.fill_next_token_bitmask(self.ll_matcher, bitmask, idx)
+        width = (self.ll_tokenizer.vocab_size + 31) // 32
+        if bitmask.shape[1] == width:
+            llguidance_torch.fill_next_token_bitmask(self.ll_matcher, bitmask, idx)
+        else:
+            # The engine's bitmask is sized for another backend's vocabulary (the
+            # model's). Fill a guidance-sized row and keep the words that fit;
+            # tokens past the model vocabulary cannot be sampled.
+            if self._scratch is None:
+                self._scratch = llguidance_torch.allocate_token_bitmask(
+                    1, self.ll_tokenizer.vocab_size
+                )
+            llguidance_torch.fill_next_token_bitmask(self.ll_matcher, self._scratch, 0)
+            shared = min(width, bitmask.shape[1])
+            bitmask[idx, :shared] = self._scratch[0, :shared]
+            bitmask[idx, shared:] = 0
         self.check_error()
 
     def is_terminated(self) -> bool:
@@ -227,6 +242,18 @@ def serialize_guidance_grammar(
     disable_any_whitespace: bool = False,
     disable_additional_properties: bool = False,
 ) -> str:
+    # A schema's own x-guidance options must not re-enable flexible whitespace.
+    overrides = (
+        {
+            "whitespace_flexible": False,
+            "whitespace_pattern": None,
+            "item_separator": ",",
+            "key_separator": ":",
+        }
+        if disable_any_whitespace
+        else None
+    )
+
     def _process_schema(
         grammar_spec: str | dict[str, Any],
     ) -> str:
@@ -237,6 +264,7 @@ def serialize_guidance_grammar(
             defaults={
                 "whitespace_flexible": not disable_any_whitespace,
             },
+            overrides=overrides,
         )
 
     if request_type == StructuredOutputOptions.JSON:

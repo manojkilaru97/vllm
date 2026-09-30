@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import time
 from concurrent.futures import Future
 
 import pytest
+import torch
 from transformers import AutoTokenizer
 
 from vllm.config import StructuredOutputsConfig, VllmConfig
@@ -196,6 +198,212 @@ def test_grammar_init_async_and_sync(async_grammar):
 
     # Verify the grammar can accept valid tokens
     assert grammar.accept_tokens(request.request_id, prompt)
+
+
+def test_disable_any_whitespace_ignores_schema_whitespace_options():
+    """A request schema's x-guidance must not re-enable flexible whitespace."""
+    vllm_config = VllmConfig(
+        structured_outputs_config=StructuredOutputsConfig(
+            backend="guidance", disable_any_whitespace=True
+        )
+    )
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    backend = GuidanceBackend(vllm_config, tokenizer=tokenizer, vocab_size=50257)
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["a"],
+            "x-guidance": {
+                "whitespace_flexible": True,
+                "whitespace_pattern": "[\\n ]*",
+                "item_separator": ",\n   ",
+                "key_separator": " :  ",
+            },
+        }
+    )
+    spaced = tokenizer.encode("{" + " " * 200 + '"a":"x"}')
+    grammar = backend.compile_grammar(StructuredOutputOptions.JSON, schema)
+    assert len(grammar.validate_tokens(spaced)) < len(spaced)
+    grammar = backend.compile_grammar(StructuredOutputOptions.JSON, schema)
+    assert grammar.accept_tokens("", tokenizer.encode('{"a":"x"}'))
+
+
+def _structured_request(
+    request_id: str, backend: str, params: StructuredOutputsParams, tokenizer
+) -> Request:
+    sampling_params = SamplingParams(structured_outputs=params)
+    sampling_params.structured_outputs._backend = backend
+    sampling_params.update_from_generation_config({}, tokenizer.eos_token_id)
+    return Request(
+        request_id,
+        prompt_token_ids=tokenizer.encode("x"),
+        sampling_params=sampling_params,
+        pooling_params=None,
+    )
+
+
+def _auto_manager(disable_any_whitespace: bool = True) -> StructuredOutputManager:
+    return StructuredOutputManager(
+        VllmConfig(
+            model_config=ModelConfig(tokenizer=TOKENIZER),
+            structured_outputs_config=StructuredOutputsConfig(
+                backend="auto", disable_any_whitespace=disable_any_whitespace
+            ),
+            parallel_config=ParallelConfig(
+                distributed_executor_backend="external_launcher"
+            ),
+        )
+    )
+
+
+# Compact separators differ: xgrammar emits ", " / ": ", guidance "," / ":".
+@pytest.mark.parametrize(
+    "params,spaced,compact",
+    [
+        pytest.param(
+            {"json": '{"type": "object"}'},
+            '{\n"a": "b"}',
+            {"xgrammar": '{"a": "b"}', "guidance": '{"a":"b"}'},
+            id="json",
+        ),
+        pytest.param(
+            {"json_object": True},
+            '{\n"a": "b"}',
+            {"xgrammar": '{"a": "b"}', "guidance": '{"a":"b"}'},
+            id="json_object",
+        ),
+        pytest.param(
+            {"json": '{"type": "object", "properties": {"m": {}}, "required": ["m"]}'},
+            '{"m":\n{"n": 1}}',
+            {"xgrammar": '{"m": {"n": 1}}', "guidance": '{"m":{"n":1}}'},
+            id="free_form",
+        ),
+    ],
+)
+def test_manager_compiles_each_request_with_its_selected_backend(
+    params, spaced, compact
+):
+    """auto can select different backends per request; one engine must honour each,
+    and disable_any_whitespace must hold on both."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    manager = _auto_manager()
+    requests = {}
+    for backend in ("xgrammar", "guidance"):
+        request = _structured_request(
+            backend, backend, StructuredOutputsParams(**params), tokenizer
+        )
+        manager.grammar_init(request)
+        assert request.structured_output_request._check_grammar_completion()
+        requests[backend] = request
+
+    grammars = {k: r.structured_output_request.grammar for k, r in requests.items()}
+    assert type(grammars["xgrammar"]).__name__ == "XgrammarGrammar"
+    assert type(grammars["guidance"]).__name__ == "GuidanceGrammar"
+    assert manager.grammar_bitmask(requests, list(requests), {}) is not None
+    spaced_tokens = tokenizer.encode(spaced)
+    for request_id, grammar in grammars.items():
+        assert len(grammar.validate_tokens(spaced_tokens)) < len(spaced_tokens)
+        assert grammar.accept_tokens(
+            request_id, tokenizer.encode(compact[request_id])
+        ), request_id
+
+
+def test_guidance_fills_a_narrower_shared_bitmask():
+    """guidance's bitmask can be wider than the engine's (tokenizer larger than
+    the model vocabulary); it must fill the shared words exactly."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        structured_outputs_config=StructuredOutputsConfig(backend="guidance")
+    )
+    backend = GuidanceBackend(vllm_config, tokenizer=tokenizer, vocab_size=50257 + 64)
+    schema = (
+        '{"type": "object", "properties": {"a": {"type": "integer", "multipleOf": 2}}}'
+    )
+    native = backend.allocate_token_bitmask(1)
+    assert native.shape[1] == 1573
+    grammar = backend.compile_grammar(StructuredOutputOptions.JSON, schema)
+    prefix = tokenizer.encode('{"a":')
+    assert grammar.accept_tokens("", prefix)
+    grammar.fill_bitmask(native, 0)
+    shared = torch.full((2, 1571), -1, dtype=torch.int32)
+    grammar.fill_bitmask(shared, 1)
+    assert torch.equal(shared[1], native[0, :1571])
+    assert torch.equal(shared[0], torch.full((1571,), -1, dtype=torch.int32))
+
+
+def test_manager_keeps_guidance_with_a_wider_bitmask(monkeypatch):
+    """guidance joins an engine whose bitmask xgrammar owns even when its own
+    bitmask is wider (tokenizer larger than the model vocabulary)."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    manager = _auto_manager()
+    create = manager._create_backend
+
+    def create_with_wider_guidance(name):
+        if name != "guidance":
+            return create(name)
+        vocab_size = manager.vllm_config.model_config.get_vocab_size() + 64
+        return GuidanceBackend(
+            manager.vllm_config, tokenizer=manager.tokenizer, vocab_size=vocab_size
+        )
+
+    monkeypatch.setattr(manager, "_create_backend", create_with_wider_guidance)
+    schema = (
+        '{"type": "object", "properties": {"a": {"type": "integer", "multipleOf": 2}}}'
+    )
+    requests = {}
+    for backend in ("xgrammar", "guidance"):
+        request = _structured_request(
+            backend, backend, StructuredOutputsParams(json=schema), tokenizer
+        )
+        manager.grammar_init(request)
+        assert request.structured_output_request._check_grammar_completion()
+        requests[backend] = request
+    guidance = requests["guidance"].structured_output_request.grammar
+    assert type(guidance).__name__ == "GuidanceGrammar"
+    shared_width = manager.backend.allocate_token_bitmask(1).shape[1]
+    guidance_width = manager._backends["guidance"].allocate_token_bitmask(1).shape[1]
+    assert guidance_width > shared_width
+    bitmask = manager.grammar_bitmask(requests, list(requests), {})
+    assert bitmask is not None and bitmask.shape[1] == shared_width
+
+
+def test_manager_falls_back_for_incompatible_backends(monkeypatch):
+    """xgrammar anchors the bitmask under auto; a backend with a different bitmask
+    layout is served by it, and a construction error is retried."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    manager = _auto_manager()
+    created = []
+
+    class FakeBackend:
+        def __init__(self, name, width):
+            self.name = name
+            self.width = width
+
+        def allocate_token_bitmask(self, n):
+            return torch.zeros((n, self.width), dtype=torch.int32)
+
+        def compile_grammar(self, request_type, grammar_spec):
+            raise RuntimeError(f"compiled by {self.name}")
+
+    def create(name):
+        created.append(name)
+        if name == "outlines":
+            raise RuntimeError("transient")
+        return FakeBackend(name, 8 if name == "xgrammar" else 9)
+
+    monkeypatch.setattr(manager, "_create_backend", create)
+    params = StructuredOutputsParams(json='{"type": "object"}')
+    for _ in range(2):
+        request = _structured_request("b", "guidance", params, tokenizer)
+        manager.grammar_init(request)
+        error = request.structured_output_request.grammar
+        assert isinstance(error, RuntimeError) and "by xgrammar" in str(error)
+        with pytest.raises(RuntimeError, match="transient"):
+            manager.grammar_init(
+                _structured_request("c", "outlines", params, tokenizer)
+            )
+    assert created == ["xgrammar", "guidance", "outlines", "outlines"]
 
 
 @pytest.mark.parametrize(

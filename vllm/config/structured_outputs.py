@@ -24,10 +24,12 @@ class StructuredOutputsConfig:
     based on request contents and what the backend libraries currently support,
     so the behavior is subject to change in each release."""
     disable_any_whitespace: bool = False
-    """If `True`, json output will always be compact without any whitespace.
-    If `False`, the model may generate whitespace between JSON fields,
-    which is still valid JSON. This is only supported for xgrammar
-    and guidance backends."""
+    """If `True`, JSON output has no free-form whitespace between tokens: the
+    guidance backend emits none, and xgrammar emits a single space after `,`
+    and `:`. If `False`, the model may generate whitespace between JSON fields,
+    which is still valid JSON. This is only supported for the xgrammar and
+    guidance backends, and for "auto", which falls back to one of them except
+    for requests routed to outlines."""
     disable_additional_properties: bool = False
     """If `True`, the `guidance` backend will not use `additionalProperties`
     in the JSON schema. This is only supported for the `guidance` backend and
@@ -61,10 +63,14 @@ class StructuredOutputsConfig:
 
     @model_validator(mode="after")
     def _validate_structured_output_config(self) -> Self:
-        if self.disable_any_whitespace and self.backend not in ("xgrammar", "guidance"):
+        if self.disable_any_whitespace and self.backend not in (
+            "auto",
+            "xgrammar",
+            "guidance",
+        ):
             raise ValueError(
-                "disable_any_whitespace is only supported for "
-                "xgrammar and guidance backends."
+                "disable_any_whitespace is only supported for the "
+                "auto, xgrammar, and guidance backends."
             )
         if self.disable_additional_properties and self.backend != "guidance":
             raise ValueError(
