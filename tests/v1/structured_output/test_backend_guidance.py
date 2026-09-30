@@ -217,6 +217,8 @@ def test_disable_any_whitespace_ignores_schema_whitespace_options():
             "x-guidance": {
                 "whitespace_flexible": True,
                 "whitespace_pattern": "[\\n ]*",
+                "item_separator": ",\n   ",
+                "key_separator": " :  ",
             },
         }
     )
