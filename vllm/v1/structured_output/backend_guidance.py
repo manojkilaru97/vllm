@@ -147,6 +147,7 @@ class GuidanceGrammar(StructuredOutputGrammar):
     printed_error: bool = False
     terminated: bool = False
     rollback_lag: int = 0
+    _scratch: torch.Tensor | None = None
 
     def check_error(self):
         if not self.printed_error:
@@ -210,7 +211,21 @@ class GuidanceGrammar(StructuredOutputGrammar):
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         # this will automatically return [EOS] mask if the matcher is stopped
         # or otherwise in an error state
-        llguidance_torch.fill_next_token_bitmask(self.ll_matcher, bitmask, idx)
+        width = (self.ll_tokenizer.vocab_size + 31) // 32
+        if bitmask.shape[1] == width:
+            llguidance_torch.fill_next_token_bitmask(self.ll_matcher, bitmask, idx)
+        else:
+            # The engine's bitmask is sized for another backend's vocabulary (the
+            # model's). Fill a guidance-sized row and keep the words that fit;
+            # tokens past the model vocabulary cannot be sampled.
+            if self._scratch is None:
+                self._scratch = llguidance_torch.allocate_token_bitmask(
+                    1, self.ll_tokenizer.vocab_size
+                )
+            llguidance_torch.fill_next_token_bitmask(self.ll_matcher, self._scratch, 0)
+            shared = min(width, bitmask.shape[1])
+            bitmask[idx, :shared] = self._scratch[0, :shared]
+            bitmask[idx, shared:] = 0
         self.check_error()
 
     def is_terminated(self) -> bool:
