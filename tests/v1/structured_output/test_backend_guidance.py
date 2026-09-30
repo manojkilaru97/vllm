@@ -18,6 +18,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.structured_output.backend_guidance import (
     GuidanceBackend,
     process_for_additional_properties,
+    serialize_guidance_grammar,
 )
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 
@@ -338,3 +339,28 @@ def test_disable_additional_properties_accepts_literal_with_properties_key(
 
     assert grammar.validate_tokens(valid_tokens) == valid_tokens
     assert grammar.validate_tokens(rewritten_tokens) != rewritten_tokens
+
+
+@pytest.mark.parametrize(
+    ("max_whitespace", "disable_any_whitespace", "expected_pattern"),
+    [
+        ("64", False, r"[\x20\x0A\x0D\x09]{0,64}"),
+        ("0", False, None),
+        ("64", True, None),
+    ],
+)
+def test_json_grammar_bounds_consecutive_whitespace(
+    monkeypatch, max_whitespace, disable_any_whitespace, expected_pattern
+):
+    """Unbounded JSON whitespace lets models loop on newlines until max_tokens."""
+    monkeypatch.setenv("VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE", max_whitespace)
+    for request_type, spec in (
+        (StructuredOutputOptions.JSON, '{"type": "object"}'),
+        (StructuredOutputOptions.JSON_OBJECT, ""),
+    ):
+        grammar = json.loads(
+            serialize_guidance_grammar(request_type, spec, disable_any_whitespace)
+        )
+        options = grammar["grammars"][0]["json_schema"]["x-guidance"]
+        assert options["whitespace_flexible"] is not disable_any_whitespace
+        assert options.get("whitespace_pattern") == expected_pattern
