@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 from transformers import MistralCommonBackend
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.utils.import_utils import LazyLoader
@@ -228,27 +227,26 @@ def serialize_guidance_grammar(
     disable_any_whitespace: bool = False,
     disable_additional_properties: bool = False,
 ) -> str:
-    json_defaults: dict[str, Any] = {"whitespace_flexible": not disable_any_whitespace}
-    max_whitespace = envs.VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE
-    if not disable_any_whitespace and max_whitespace > 0:
-        json_defaults["whitespace_pattern"] = (
-            rf"[\x20\x0A\x0D\x09]{{0,{max_whitespace}}}"
-        )
-
     def _process_schema(
         grammar_spec: str | dict[str, Any],
     ) -> str:
         if disable_additional_properties:
             grammar_spec = process_for_additional_properties(grammar_spec)
         return llguidance.LLMatcher.grammar_from_json_schema(
-            grammar_spec, defaults=json_defaults
+            grammar_spec,
+            defaults={
+                "whitespace_flexible": not disable_any_whitespace,
+            },
         )
 
     if request_type == StructuredOutputOptions.JSON:
         return _process_schema(grammar_spec)
     elif request_type == StructuredOutputOptions.JSON_OBJECT:
         return llguidance.LLMatcher.grammar_from_json_schema(
-            '{"type": "object"}', defaults=json_defaults
+            '{"type": "object"}',
+            defaults={
+                "whitespace_flexible": not disable_any_whitespace,
+            },
         )
     else:
         if request_type == StructuredOutputOptions.REGEX:
