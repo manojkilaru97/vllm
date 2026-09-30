@@ -307,33 +307,37 @@ def test_manager_compiles_each_request_with_its_selected_backend(
         ), request_id
 
 
-def test_manager_caches_only_incompatible_backends(monkeypatch):
-    """A bitmask-layout mismatch is permanent; a construction error is retried."""
+def test_manager_falls_back_for_incompatible_backends(monkeypatch):
+    """xgrammar anchors the bitmask under auto; a backend with a different bitmask
+    layout is served by it, and a construction error is retried."""
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
     manager = _auto_manager()
     created = []
 
     class FakeBackend:
-        def __init__(self, width):
+        def __init__(self, name, width):
+            self.name = name
             self.width = width
 
         def allocate_token_bitmask(self, n):
             return torch.zeros((n, self.width), dtype=torch.int32)
 
+        def compile_grammar(self, request_type, grammar_spec):
+            raise RuntimeError(f"compiled by {self.name}")
+
     def create(name):
         created.append(name)
         if name == "outlines":
             raise RuntimeError("transient")
-        return FakeBackend(8 if name == "xgrammar" else 9)
+        return FakeBackend(name, 8 if name == "xgrammar" else 9)
 
     monkeypatch.setattr(manager, "_create_backend", create)
     params = StructuredOutputsParams(json='{"type": "object"}')
-    manager.grammar_init(_structured_request("a", "xgrammar", params, tokenizer))
     for _ in range(2):
-        with pytest.raises(ValueError, match="incompatible"):
-            manager.grammar_init(
-                _structured_request("b", "guidance", params, tokenizer)
-            )
+        request = _structured_request("b", "guidance", params, tokenizer)
+        manager.grammar_init(request)
+        error = request.structured_output_request.grammar
+        assert isinstance(error, RuntimeError) and "by xgrammar" in str(error)
         with pytest.raises(RuntimeError, match="transient"):
             manager.grammar_init(
                 _structured_request("c", "outlines", params, tokenizer)
