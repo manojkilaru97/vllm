@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Request-time validation of structured output requests."""
 
+import json
+
 import pytest
 
 from vllm.config import StructuredOutputsConfig
@@ -84,23 +86,29 @@ def test_disable_any_whitespace_rejected_for_other_backends(backend):
         StructuredOutputsConfig(backend=backend, disable_any_whitespace=True)
 
 
-def test_disable_any_whitespace_rejects_outlines_fallback():
-    """Outlines ignores disable_any_whitespace, so auto must not silently use it."""
-    params = SamplingParams(
-        structured_outputs=StructuredOutputsParams(
-            json={"type": "object", "patternProperties": {"^a": {"type": "string"}}}
-        )
+def test_disable_any_whitespace_keeps_outlines_fallback():
+    """outlines-core JSON regexes allow at most one space between tokens, so the
+    outlines fallback stays bounded under disable_any_whitespace."""
+    import re
+
+    from outlines_core import json_schema
+
+    schema = {"type": "object", "patternProperties": {"^a": {"type": "string"}}}
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+    params._validate_structured_outputs(
+        _StubModelConfig(is_diffusion=False),
+        StructuredOutputsConfig(backend="auto", disable_any_whitespace=True),
+        tokenizer=object(),
     )
-    with pytest.raises(VLLMValidationError, match="outlines"):
-        params._validate_structured_outputs(
-            _StubModelConfig(is_diffusion=False),
-            StructuredOutputsConfig(backend="auto", disable_any_whitespace=True),
-            tokenizer=object(),
-        )
+    assert params.structured_outputs._backend == "outlines"
+    regex = json_schema.build_regex_from_schema(json.dumps(schema))
+    assert re.fullmatch(regex, '{"ab": "x"}')
+    assert not re.fullmatch(regex, '{\n"ab": "x"}')
+    assert not re.fullmatch(regex, '{"ab":  "x"}')
 
 
 def test_disable_any_whitespace_keeps_non_json_outlines_fallback(monkeypatch):
-    """Only JSON output is affected by disable_any_whitespace."""
+    """Non-JSON requests keep the outlines fallback under disable_any_whitespace."""
     import vllm.sampling_params as sampling_params_module
     import vllm.v1.structured_output.backend_outlines as backend_outlines
 
