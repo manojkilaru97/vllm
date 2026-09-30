@@ -80,7 +80,11 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
+from vllm.v1.structured_output import (
+    STRUCTURED_OUTPUT_COMPILE_ERROR,
+    StructuredOutputGrammar,
+    StructuredOutputManager,
+)
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
@@ -5100,7 +5104,7 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     output = engine_core_outputs[0].outputs[0]
     assert output.request_id == request.request_id
     assert output.finish_reason == FinishReason.ERROR
-    assert output.stop_reason is None
+    assert output.stop_reason == STRUCTURED_OUTPUT_COMPILE_ERROR
     assert output.error == RequestError(
         code="validation_error",
         message="Invalid structured outputs: forced FSM compilation error",

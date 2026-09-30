@@ -33,6 +33,10 @@ else:
 
 logger = init_logger(__name__)
 
+# stop_reason of a request finished with an error because its grammar failed
+# to compile, so frontends can report it as a client error.
+STRUCTURED_OUTPUT_COMPILE_ERROR = "structured_output_compile_error"
+
 
 class ConstraintBounds(NamedTuple):
     """Where tokens start being fed to the grammar and being masked."""

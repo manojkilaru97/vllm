@@ -77,7 +77,10 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
-from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output import (
+    STRUCTURED_OUTPUT_COMPILE_ERROR,
+    StructuredOutputManager,
+)
 from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -2587,6 +2590,11 @@ class Scheduler(SchedulerInterface):
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
+                        stop_reason=(
+                            STRUCTURED_OUTPUT_COMPILE_ERROR
+                            if request.request_id in request_errors
+                            else None
+                        ),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
                         error=request_errors.get(request.request_id),
