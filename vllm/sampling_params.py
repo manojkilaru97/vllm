@@ -1419,6 +1419,12 @@ class SamplingParams(
                     skip_guidance = has_guidance_unsupported_json_features(schema)
 
                 if skip_guidance:
+                    if structured_outputs_config.disable_any_whitespace:
+                        raise VLLMValidationError(
+                            "This request needs the outlines structured output "
+                            "backend, which does not support "
+                            "disable_any_whitespace."
+                        ) from None
                     # Fall back to outlines for non-Tekken Mistral tokenizers or
                     # schemas containing features unsupported by guidance.
                     validate_structured_output_request_outlines(self)

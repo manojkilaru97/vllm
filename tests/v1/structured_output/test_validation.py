@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 from transformers import MistralCommonBackend, TokenizersBackend
 
 import vllm.v1.structured_output as structured_output
@@ -451,17 +452,24 @@ class TestValidateStructuredOutputs:
             assert params.structured_outputs._backend == "guidance"
 
     class TestPR49625Regression:
-        def test_manager_rejects_mixed_structured_output_backends(self, monkeypatch):
-            xgrammar_backend = Mock()
-            xgrammar_backend.compile_grammar.return_value = object()
-            xgrammar_factory = Mock(return_value=xgrammar_backend)
-            guidance_factory = Mock()
+        def test_manager_serves_mixed_structured_output_backends(self, monkeypatch):
+            # Fork: each request compiles with the backend selected for it,
+            # instead of #49625's one-backend-per-engine rejection.
+            def make_factory():
+                backend = Mock()
+                backend.compile_grammar.return_value = object()
+                backend.allocate_token_bitmask.side_effect = lambda n: torch.zeros(
+                    n, 4, dtype=torch.int32
+                )
+                return Mock(return_value=backend), backend
+
+            xgrammar_factory, xgrammar_backend = make_factory()
+            guidance_factory, guidance_backend = make_factory()
             monkeypatch.setattr(structured_output, "XgrammarBackend", xgrammar_factory)
             monkeypatch.setattr(structured_output, "GuidanceBackend", guidance_factory)
 
             manager = object.__new__(StructuredOutputManager)
-            manager.backend = None
-            manager.backend_name = None
+            manager._backends = {}
             manager.vllm_config = SimpleNamespace(
                 model_config=SimpleNamespace(get_vocab_size=lambda: 128)
             )
@@ -473,7 +481,6 @@ class TestValidateStructuredOutputs:
                     request_id=f"req-{backend}",
                     sampling_params=SimpleNamespace(
                         structured_outputs=SimpleNamespace(_backend=backend),
-                        all_stop_token_ids=None,
                     ),
                     structured_output_request=SimpleNamespace(
                         structured_output_key=(StructuredOutputOptions.JSON, "{}"),
@@ -482,13 +489,13 @@ class TestValidateStructuredOutputs:
                 )
 
             manager.grammar_init(make_request("xgrammar"))
-
-            with pytest.raises(VLLMValidationError, match="already using 'xgrammar'"):
-                manager.grammar_init(make_request("guidance"))
+            manager.grammar_init(make_request("guidance"))
+            manager.grammar_init(make_request("xgrammar"))
 
             xgrammar_factory.assert_called_once()
-            xgrammar_backend.compile_grammar.assert_called_once()
-            guidance_factory.assert_not_called()
+            guidance_factory.assert_called_once()
+            assert xgrammar_backend.compile_grammar.call_count == 2
+            guidance_backend.compile_grammar.assert_called_once()
 
 
 @pytest.mark.parametrize("backend", ["auto", "xgrammar", "guidance"])
@@ -500,3 +507,22 @@ def test_disable_any_whitespace_allowed_for_whitespace_aware_backends(backend):
 def test_disable_any_whitespace_rejected_for_outlines():
     with pytest.raises(ValueError, match="disable_any_whitespace"):
         StructuredOutputsConfig(backend="outlines", disable_any_whitespace=True)
+
+
+def test_disable_any_whitespace_rejects_outlines_fallback():
+    """Outlines ignores disable_any_whitespace, so auto must not silently use it."""
+    params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(
+            # multipleOf: xgrammar rejects; patternProperties: guidance rejects.
+            json={
+                "type": "object",
+                "patternProperties": {"^a": {"type": "integer", "multipleOf": 2}},
+            }
+        )
+    )
+    with pytest.raises(VLLMValidationError, match="outlines"):
+        params._validate_structured_outputs(
+            _StubModelConfig(is_diffusion=False),
+            StructuredOutputsConfig(backend="auto", disable_any_whitespace=True),
+            tokenizer=object(),
+        )
