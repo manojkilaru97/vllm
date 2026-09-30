@@ -307,6 +307,29 @@ def test_manager_compiles_each_request_with_its_selected_backend(
         ), request_id
 
 
+def test_guidance_fills_a_narrower_shared_bitmask():
+    """guidance's bitmask can be wider than the engine's (tokenizer larger than
+    the model vocabulary); it must fill the shared words exactly."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    vllm_config = VllmConfig(
+        structured_outputs_config=StructuredOutputsConfig(backend="guidance")
+    )
+    backend = GuidanceBackend(vllm_config, tokenizer=tokenizer, vocab_size=50257 + 64)
+    schema = (
+        '{"type": "object", "properties": {"a": {"type": "integer", "multipleOf": 2}}}'
+    )
+    native = backend.allocate_token_bitmask(1)
+    assert native.shape[1] == 1573
+    grammar = backend.compile_grammar(StructuredOutputOptions.JSON, schema)
+    prefix = tokenizer.encode('{"a":')
+    assert grammar.accept_tokens("", prefix)
+    grammar.fill_bitmask(native, 0)
+    shared = torch.full((2, 1571), -1, dtype=torch.int32)
+    grammar.fill_bitmask(shared, 1)
+    assert torch.equal(shared[1], native[0, :1571])
+    assert torch.equal(shared[0], torch.full((1571,), -1, dtype=torch.int32))
+
+
 def test_manager_falls_back_for_incompatible_backends(monkeypatch):
     """xgrammar anchors the bitmask under auto; a backend with a different bitmask
     layout is served by it, and a construction error is retried."""

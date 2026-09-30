@@ -134,14 +134,18 @@ class StructuredOutputManager:
             # Under auto, xgrammar serves most requests; let it own the bitmask.
             self._get_backend("xgrammar")
         backend = self._create_backend(name)
-        # All backends share one bitmask tensor, so their layouts must match. A
-        # backend whose layout differs (for example guidance when the tokenizer is
-        # larger than the model vocabulary) is replaced by the first backend, as
-        # when only one backend per engine was supported.
+        # All backends share one bitmask tensor, so their layouts must match.
+        # guidance adapts to a different width (its tokenizer can be larger than
+        # the model vocabulary); any other backend whose layout differs is
+        # replaced by the first backend, as when only one backend per engine was
+        # supported.
         if (first := self.backend) is not None:
             expected = first.allocate_token_bitmask(1)
             actual = backend.allocate_token_bitmask(1)
-            if actual.shape != expected.shape or actual.dtype != expected.dtype:
+            if actual.dtype != expected.dtype or (
+                actual.shape != expected.shape
+                and not isinstance(backend, GuidanceBackend)
+            ):
                 logger.warning(
                     "Structured output backend %r uses a token bitmask of shape %s, "
                     "incompatible with %s; compiling its requests with %s instead.",
