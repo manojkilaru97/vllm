@@ -1397,7 +1397,7 @@ class SamplingParams(
             try:
                 validate_xgrammar_grammar(self)
                 self.structured_outputs._backend = "xgrammar"
-            except VLLMValidationError:
+            except VLLMValidationError as xgrammar_error:
                 # The request either failed validation
                 # or includes some jsonschema feature(s) that
                 # are not supported in xgrammar.
@@ -1419,12 +1419,14 @@ class SamplingParams(
                     skip_guidance = has_guidance_unsupported_json_features(schema)
 
                 if skip_guidance:
-                    if structured_outputs_config.disable_any_whitespace:
+                    if structured_outputs_config.disable_any_whitespace and (
+                        so_params.json is not None or so_params.json_object
+                    ):
                         raise VLLMValidationError(
-                            "This request needs the outlines structured output "
-                            "backend, which does not support "
-                            "disable_any_whitespace."
-                        ) from None
+                            "This JSON request needs the outlines structured "
+                            "output backend, which does not support "
+                            f"disable_any_whitespace ({xgrammar_error})"
+                        ) from xgrammar_error
                     # Fall back to outlines for non-Tekken Mistral tokenizers or
                     # schemas containing features unsupported by guidance.
                     validate_structured_output_request_outlines(self)
