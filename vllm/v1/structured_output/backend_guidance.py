@@ -244,7 +244,12 @@ def serialize_guidance_grammar(
 ) -> str:
     # A schema's own x-guidance options must not re-enable flexible whitespace.
     overrides = (
-        {"whitespace_flexible": False, "whitespace_pattern": None}
+        {
+            "whitespace_flexible": False,
+            "whitespace_pattern": None,
+            "item_separator": ",",
+            "key_separator": ":",
+        }
         if disable_any_whitespace
         else None
     )
