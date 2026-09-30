@@ -42,7 +42,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
+from vllm.v1.structured_output import (
+    STRUCTURED_OUTPUT_COMPILE_ERROR,
+    StructuredOutputGrammar,
+    StructuredOutputManager,
+)
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
@@ -3367,7 +3371,7 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     output = engine_core_outputs[0].outputs[0]
     assert output.request_id == request.request_id
     assert output.finish_reason == FinishReason.ERROR
-    assert output.stop_reason is None
+    assert output.stop_reason == STRUCTURED_OUTPUT_COMPILE_ERROR
 
     healthy_request = create_requests(num_requests=1, req_ids=["healthy-request"])[0]
     scheduler.add_request(healthy_request)
