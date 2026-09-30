@@ -3164,16 +3164,16 @@ def test_schedule_skip_tokenizer_init_structured_output_request():
 def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     scheduler = create_scheduler()
     manager = scheduler.structured_output_manager
-    manager.backend = Mock()
-    manager.backend.compile_grammar.side_effect = RuntimeError(
-        "forced FSM compilation error"
-    )
+    backend = Mock()
+    backend.compile_grammar.side_effect = RuntimeError("forced FSM compilation error")
+    manager._backends["xgrammar"] = backend
     manager._use_async_grammar_compilation = async_grammar
 
     sampling_params = SamplingParams(
         max_tokens=16,
         structured_outputs=StructuredOutputsParams(json='{"type": "object"}'),
     )
+    sampling_params.structured_outputs._backend = "xgrammar"
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
     request = Request(
         request_id="grammar-error",
