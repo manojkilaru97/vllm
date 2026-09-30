@@ -470,7 +470,7 @@ class TestValidateStructuredOutputs:
 
             manager = object.__new__(StructuredOutputManager)
             manager._backends = {}
-            manager._backend_errors = {}
+            manager._incompatible_backends = set()
             manager.vllm_config = SimpleNamespace(
                 model_config=SimpleNamespace(get_vocab_size=lambda: 128)
             )
