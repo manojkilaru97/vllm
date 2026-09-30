@@ -28,7 +28,8 @@ class StructuredOutputsConfig:
     The "lm-format-enforcer" backend is deprecated and will be removed in
     v0.35.0. Use "auto", "xgrammar", or "guidance" instead."""
     disable_any_whitespace: bool = False
-    """If `True`, json output will always be compact without any whitespace.
+    """If `True`, JSON output has no free-form whitespace between tokens: both
+    the guidance and xgrammar backends emit `,` and `:` without spaces.
     If `False`, the model may generate whitespace between JSON fields,
     which is still valid JSON. This is only supported for the xgrammar and
     guidance backends, and for "auto", which falls back to one of them except
