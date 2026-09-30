@@ -139,21 +139,17 @@ class XgrammarBackend(StructuredOutputBackend):
         # and will be available in next release.
         # So, remove this comment once xgrammar updates to v0.2.9
         separators = (",", ":") if self.disable_any_whitespace else None
-        if request_type in (
-            StructuredOutputOptions.JSON,
-            StructuredOutputOptions.JSON_OBJECT,
-        ):
-            schema = (
-                grammar_spec
-                if request_type == StructuredOutputOptions.JSON
-                else '{"type": "object"}'
-            )
-            max_whitespace = vllm.envs.VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE
+        if request_type == StructuredOutputOptions.JSON:
             ctx = self.compiler.compile_json_schema(
-                schema,
+                grammar_spec,
                 any_whitespace=not self.disable_any_whitespace,
                 separators=separators,
-                max_whitespace_cnt=max_whitespace if max_whitespace > 0 else None,
+            )
+        elif request_type == StructuredOutputOptions.JSON_OBJECT:
+            ctx = self.compiler.compile_json_schema(
+                '{"type": "object"}',
+                any_whitespace=not self.disable_any_whitespace,
+                separators=separators,
             )
         elif request_type == StructuredOutputOptions.GRAMMAR:
             if grammar_is_likely_lark(grammar_spec):
