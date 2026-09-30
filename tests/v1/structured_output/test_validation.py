@@ -119,3 +119,18 @@ def test_disable_any_whitespace_keeps_non_json_outlines_fallback(monkeypatch):
         tokenizer=object(),
     )
     assert params.structured_outputs._backend == "outlines"
+
+
+def test_disable_any_whitespace_keeps_guidance_fallback():
+    """xgrammar-unsupported schemas that guidance supports stay compilable."""
+    params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(
+            json={"type": "integer", "multipleOf": 2}
+        )
+    )
+    params._validate_structured_outputs(
+        _StubModelConfig(is_diffusion=False),
+        StructuredOutputsConfig(backend="auto", disable_any_whitespace=True),
+        tokenizer=object(),
+    )
+    assert params.structured_outputs._backend == "guidance"

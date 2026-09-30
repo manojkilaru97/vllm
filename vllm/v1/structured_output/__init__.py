@@ -39,7 +39,7 @@ class StructuredOutputManager:
         # Backends are created on first use. With backend="auto", requests can be
         # validated for different backends, so each is compiled by its own.
         self._backends: dict[str, StructuredOutputBackend] = {}
-        self._backend_errors: dict[str, Exception] = {}
+        self._backend_errors: dict[str, str] = {}
         # We only store the class of the reasoner in the manager.
         # The parser instance is request-scoped because some reasoning parsers
         # depend on per-request chat-template kwargs.
@@ -124,12 +124,19 @@ class StructuredOutputManager:
         if (backend := self._backends.get(name)) is not None:
             return backend
         if (error := self._backend_errors.get(name)) is not None:
-            raise error
-        try:
-            backend = self._create_backend(name)
-        except Exception as e:
-            self._backend_errors[name] = e
-            raise
+            raise ValueError(error)
+        backend = self._create_backend(name)
+        # All backends share one bitmask tensor, so their layouts must match.
+        if (first := self.backend) is not None:
+            expected = first.allocate_token_bitmask(1)
+            actual = backend.allocate_token_bitmask(1)
+            if actual.shape != expected.shape or actual.dtype != expected.dtype:
+                self._backend_errors[name] = (
+                    f"Structured output backend {name!r} uses a token bitmask of "
+                    f"shape {tuple(actual.shape)}, incompatible with "
+                    f"{tuple(expected.shape)}"
+                )
+                raise ValueError(self._backend_errors[name])
         self._backends[name] = backend
         return backend
 
@@ -159,16 +166,6 @@ class StructuredOutputManager:
             )
         else:
             raise ValueError(f"Unsupported structured output backend: {name}")
-        # All backends share one bitmask tensor, so their layouts must match.
-        if (first := self.backend) is not None:
-            expected = first.allocate_token_bitmask(1)
-            actual = backend.allocate_token_bitmask(1)
-            if actual.shape != expected.shape or actual.dtype != expected.dtype:
-                raise ValueError(
-                    f"Structured output backend {name!r} uses a token bitmask of "
-                    f"shape {tuple(actual.shape)}, incompatible with "
-                    f"{tuple(expected.shape)}"
-                )
         return backend
 
     def grammar_init(self, request: "Request") -> None:
