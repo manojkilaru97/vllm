@@ -332,6 +332,42 @@ def test_guidance_fills_a_narrower_shared_bitmask():
     assert torch.equal(shared[0], torch.full((1571,), -1, dtype=torch.int32))
 
 
+def test_manager_keeps_guidance_with_a_wider_bitmask(monkeypatch):
+    """guidance joins an engine whose bitmask xgrammar owns even when its own
+    bitmask is wider (tokenizer larger than the model vocabulary)."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    manager = _auto_manager()
+    create = manager._create_backend
+
+    def create_with_wider_guidance(name):
+        if name != "guidance":
+            return create(name)
+        vocab_size = manager.vllm_config.model_config.get_vocab_size() + 64
+        return GuidanceBackend(
+            manager.vllm_config, tokenizer=manager.tokenizer, vocab_size=vocab_size
+        )
+
+    monkeypatch.setattr(manager, "_create_backend", create_with_wider_guidance)
+    schema = (
+        '{"type": "object", "properties": {"a": {"type": "integer", "multipleOf": 2}}}'
+    )
+    requests = {}
+    for backend in ("xgrammar", "guidance"):
+        request = _structured_request(
+            backend, backend, StructuredOutputsParams(json=schema), tokenizer
+        )
+        manager.grammar_init(request)
+        assert request.structured_output_request._check_grammar_completion()
+        requests[backend] = request
+    guidance = requests["guidance"].structured_output_request.grammar
+    assert type(guidance).__name__ == "GuidanceGrammar"
+    shared_width = manager.backend.allocate_token_bitmask(1).shape[1]
+    guidance_width = manager._backends["guidance"].allocate_token_bitmask(1).shape[1]
+    assert guidance_width > shared_width
+    bitmask = manager.grammar_bitmask(requests, list(requests), {})
+    assert bitmask is not None and bitmask.shape[1] == shared_width
+
+
 def test_manager_falls_back_for_incompatible_backends(monkeypatch):
     """xgrammar anchors the bitmask under auto; a backend with a different bitmask
     layout is served by it, and a construction error is retried."""
