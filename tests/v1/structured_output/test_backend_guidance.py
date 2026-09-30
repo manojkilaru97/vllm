@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import time
 from concurrent.futures import Future
 
@@ -196,6 +197,33 @@ def test_grammar_init_async_and_sync(async_grammar):
 
     # Verify the grammar can accept valid tokens
     assert grammar.accept_tokens(request.request_id, prompt)
+
+
+def test_disable_any_whitespace_ignores_schema_whitespace_options():
+    """A request schema's x-guidance must not re-enable flexible whitespace."""
+    vllm_config = VllmConfig(
+        structured_outputs_config=StructuredOutputsConfig(
+            backend="guidance", disable_any_whitespace=True
+        )
+    )
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    backend = GuidanceBackend(vllm_config, tokenizer=tokenizer, vocab_size=50257)
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["a"],
+            "x-guidance": {
+                "whitespace_flexible": True,
+                "whitespace_pattern": "[\\n ]*",
+            },
+        }
+    )
+    spaced = tokenizer.encode("{" + " " * 200 + '"a":"x"}')
+    grammar = backend.compile_grammar(StructuredOutputOptions.JSON, schema)
+    assert len(grammar.validate_tokens(spaced)) < len(spaced)
+    grammar = backend.compile_grammar(StructuredOutputOptions.JSON, schema)
+    assert grammar.accept_tokens("", tokenizer.encode('{"a":"x"}'))
 
 
 def test_manager_compiles_each_request_with_its_selected_backend():
