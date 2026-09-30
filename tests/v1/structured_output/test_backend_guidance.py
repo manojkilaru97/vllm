@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import time
 from concurrent.futures import Future
 
@@ -14,7 +15,10 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import get_tokenizer
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.structured_output.backend_guidance import GuidanceBackend
+from vllm.v1.structured_output.backend_guidance import (
+    GuidanceBackend,
+    serialize_guidance_grammar,
+)
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 
 TOKENIZER = "openai-community/gpt2"
@@ -231,3 +235,28 @@ def test_mistral_tokenizer_compile_grammar(
     grammar = backend.compile_grammar(request_type, grammar_spec)
     assert grammar is not None
     assert not grammar.is_terminated()
+
+
+@pytest.mark.parametrize(
+    ("max_whitespace", "disable_any_whitespace", "expected_pattern"),
+    [
+        ("64", False, r"[\x20\x0A\x0D\x09]{0,64}"),
+        ("0", False, None),
+        ("64", True, None),
+    ],
+)
+def test_json_grammar_bounds_consecutive_whitespace(
+    monkeypatch, max_whitespace, disable_any_whitespace, expected_pattern
+):
+    """Unbounded JSON whitespace lets models loop on newlines until max_tokens."""
+    monkeypatch.setenv("VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE", max_whitespace)
+    for request_type, spec in (
+        (StructuredOutputOptions.JSON, '{"type": "object"}'),
+        (StructuredOutputOptions.JSON_OBJECT, ""),
+    ):
+        grammar = json.loads(
+            serialize_guidance_grammar(request_type, spec, disable_any_whitespace)
+        )
+        options = grammar["grammars"][0]["json_schema"]["x-guidance"]
+        assert options["whitespace_flexible"] is not disable_any_whitespace
+        assert options.get("whitespace_pattern") == expected_pattern
