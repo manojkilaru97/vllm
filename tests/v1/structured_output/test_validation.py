@@ -70,3 +70,14 @@ def test_degenerate_structured_outputs_rejected(structured_outputs, match):
             StructuredOutputsConfig(),
             tokenizer=object(),
         )
+
+
+@pytest.mark.parametrize("backend", ["auto", "xgrammar", "guidance"])
+def test_disable_any_whitespace_allowed_for_whitespace_aware_backends(backend):
+    config = StructuredOutputsConfig(backend=backend, disable_any_whitespace=True)
+    assert config.disable_any_whitespace
+
+
+def test_disable_any_whitespace_rejected_for_outlines():
+    with pytest.raises(ValueError, match="disable_any_whitespace"):
+        StructuredOutputsConfig(backend="outlines", disable_any_whitespace=True)
