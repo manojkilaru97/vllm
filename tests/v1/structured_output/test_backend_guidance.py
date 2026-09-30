@@ -198,6 +198,43 @@ def test_grammar_init_async_and_sync(async_grammar):
     assert grammar.accept_tokens(request.request_id, prompt)
 
 
+def test_manager_compiles_each_request_with_its_selected_backend():
+    """auto can select different backends per request; one engine must honour each."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    prompt = tokenizer.encode('{"a": "b"}')
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(tokenizer=TOKENIZER),
+        structured_outputs_config=StructuredOutputsConfig(backend="auto"),
+        parallel_config=ParallelConfig(
+            distributed_executor_backend="external_launcher"
+        ),
+    )
+    manager = StructuredOutputManager(vllm_config)
+    requests = {}
+    for backend in ("xgrammar", "guidance"):
+        sampling_params = SamplingParams(
+            structured_outputs=StructuredOutputsParams(json='{"type": "object"}')
+        )
+        sampling_params.structured_outputs._backend = backend
+        sampling_params.update_from_generation_config({}, tokenizer.eos_token_id)
+        request = Request(
+            backend,
+            prompt_token_ids=prompt,
+            sampling_params=sampling_params,
+            pooling_params=None,
+        )
+        manager.grammar_init(request)
+        assert request.structured_output_request._check_grammar_completion()
+        requests[backend] = request
+
+    grammars = {k: r.structured_output_request.grammar for k, r in requests.items()}
+    assert type(grammars["xgrammar"]).__name__ == "XgrammarGrammar"
+    assert type(grammars["guidance"]).__name__ == "GuidanceGrammar"
+    assert manager.grammar_bitmask(requests, list(requests), {}) is not None
+    for request_id, grammar in grammars.items():
+        assert grammar.accept_tokens(request_id, prompt)
+
+
 @pytest.mark.parametrize(
     "request_type,grammar_spec",
     [
