@@ -205,7 +205,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
-    VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE: int = 64
+    VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE: int = 128
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
@@ -1567,11 +1567,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # It can be changed with this variable if needed for some reason.
     "VLLM_XGRAMMAR_CACHE_MB": lambda: int(os.getenv("VLLM_XGRAMMAR_CACHE_MB", "512")),
     # Maximum run of consecutive whitespace characters allowed between JSON
-    # tokens under flexible-whitespace JSON grammars (xgrammar and guidance).
-    # Bounding it stops models from looping on whitespace until truncation.
-    # Set to 0 for unbounded whitespace.
+    # tokens in JSON and JSON-object grammars. Bounding it stops models from
+    # looping on whitespace until truncation. xgrammar enforces the limit
+    # directly, except inside free-form schema values such as
+    # additionalProperties: true; llguidance cannot bound a whitespace run, so
+    # the guidance backend emits single-line JSON while the limit is enabled.
+    # The per-request whitespace_pattern option is not applied by either backend.
+    # Set to 0 for the previous unbounded behaviour.
     "VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE": lambda: int(
-        os.getenv("VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE", "64")
+        os.getenv("VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE", "128")
     ),
     # Maximum time in seconds allowed for regex compilation in structured
     # output backends (xgrammar, outlines). Prevents ReDoS attacks where

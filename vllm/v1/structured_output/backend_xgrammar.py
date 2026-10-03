@@ -32,6 +32,22 @@ else:
 logger = init_logger(__name__)
 
 
+def bounded_json_object_grammar(max_whitespace: int) -> str:
+    """EBNF for any JSON object whose whitespace runs are at most max_whitespace."""
+    return rf"""
+root ::= object
+value ::= object | array | string | number | "true" | "false" | "null"
+object ::= "{{" ws ( member ( ws "," ws member )* ws )? "}}"
+member ::= string ws ":" ws value
+array ::= "[" ws ( value ( ws "," ws value )* ws )? "]"
+string ::= "\"" char* "\""
+char ::= [^"\\\x00-\x1f] | "\\" ( ["\\/bfnrt] | "u" hex hex hex hex )
+hex ::= [0-9a-fA-F]
+number ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )?
+ws ::= [ \n\t]{{0,{max_whitespace}}}
+"""
+
+
 @dataclass
 class XgrammarBackend(StructuredOutputBackend):
     def __post_init__(self):
@@ -78,7 +94,17 @@ class XgrammarBackend(StructuredOutputBackend):
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
-        if request_type in (
+        max_whitespace = vllm.envs.VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE
+        if (
+            request_type == StructuredOutputOptions.JSON_OBJECT
+            and not self.disable_any_whitespace
+            and max_whitespace > 0
+        ):
+            # xgrammar ignores max_whitespace_cnt for a bare object schema.
+            ctx = self.compiler.compile_grammar(
+                bounded_json_object_grammar(max_whitespace)
+            )
+        elif request_type in (
             StructuredOutputOptions.JSON,
             StructuredOutputOptions.JSON_OBJECT,
         ):
@@ -87,7 +113,6 @@ class XgrammarBackend(StructuredOutputBackend):
                 if request_type == StructuredOutputOptions.JSON
                 else '{"type": "object"}'
             )
-            max_whitespace = vllm.envs.VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE
             ctx = self.compiler.compile_json_schema(
                 schema,
                 any_whitespace=not self.disable_any_whitespace,

@@ -229,26 +229,31 @@ def serialize_guidance_grammar(
     disable_additional_properties: bool = False,
 ) -> str:
     json_defaults: dict[str, Any] = {"whitespace_flexible": not disable_any_whitespace}
-    max_whitespace = envs.VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE
-    if not disable_any_whitespace and max_whitespace > 0:
-        json_defaults["whitespace_pattern"] = (
-            rf"[\x20\x0A\x0D\x09]{{0,{max_whitespace}}}"
-        )
+    content_defaults = json_defaults
+    if not disable_any_whitespace and envs.VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE > 0:
+        # llguidance repeats its whitespace lexeme without bound, so a run limit
+        # needs fixed single-line separators.
+        content_defaults = {
+            "whitespace_flexible": False,
+            "item_separator": ", ",
+            "key_separator": ": ",
+        }
 
     def _process_schema(
         grammar_spec: str | dict[str, Any],
+        defaults: dict[str, Any],
     ) -> str:
         if disable_additional_properties:
             grammar_spec = process_for_additional_properties(grammar_spec)
         return llguidance.LLMatcher.grammar_from_json_schema(
-            grammar_spec, defaults=json_defaults
+            grammar_spec, defaults=defaults
         )
 
     if request_type == StructuredOutputOptions.JSON:
-        return _process_schema(grammar_spec)
+        return _process_schema(grammar_spec, content_defaults)
     elif request_type == StructuredOutputOptions.JSON_OBJECT:
         return llguidance.LLMatcher.grammar_from_json_schema(
-            '{"type": "object"}', defaults=json_defaults
+            '{"type": "object"}', defaults=content_defaults
         )
     else:
         if request_type == StructuredOutputOptions.REGEX:
@@ -275,7 +280,7 @@ def serialize_guidance_grammar(
                     llguidance.StructTag(
                         trigger=trig,
                         begin=s["begin"],
-                        grammar=_process_schema(s["schema"]),
+                        grammar=_process_schema(s["schema"], json_defaults),
                         end=s["end"],
                     )
                 )

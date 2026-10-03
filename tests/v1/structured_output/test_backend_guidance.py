@@ -237,26 +237,63 @@ def test_mistral_tokenizer_compile_grammar(
     assert not grammar.is_terminated()
 
 
+RUBRIC_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+        "required": ["a", "b"],
+    }
+)
+PRETTY = '{\n  "a": "x",\n  "b": 1\n}'
+LOOPING = "{" + "\n" * 5000 + '"a": "x", "b": 1}'
+
+
 @pytest.mark.parametrize(
-    ("max_whitespace", "disable_any_whitespace", "expected_pattern"),
+    ("max_whitespace", "disable_any_whitespace", "accepted", "rejected"),
     [
-        ("64", False, r"[\x20\x0A\x0D\x09]{0,64}"),
-        ("0", False, None),
-        ("64", True, None),
+        (
+            "128",
+            False,
+            ['{"a": "x", "b": 1}', '{"a": "  in  string  ", "b": 1}'],
+            [PRETTY, LOOPING],
+        ),
+        ("0", False, [PRETTY, LOOPING], []),
+        ("128", True, ['{"a":"x","b":1}'], ['{"a": "x", "b": 1}']),
     ],
 )
-def test_json_grammar_bounds_consecutive_whitespace(
-    monkeypatch, max_whitespace, disable_any_whitespace, expected_pattern
+def test_guidance_json_whitespace_is_bounded(
+    monkeypatch, max_whitespace, disable_any_whitespace, accepted, rejected
 ):
-    """Unbounded JSON whitespace lets models loop on newlines until max_tokens."""
+    """llguidance cannot bound a whitespace run, so the cap forces single-line JSON."""
     monkeypatch.setenv("VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE", max_whitespace)
+    vllm_config = VllmConfig(
+        structured_outputs_config=StructuredOutputsConfig(
+            backend="guidance", disable_any_whitespace=disable_any_whitespace
+        )
+    )
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    backend = GuidanceBackend(vllm_config, tokenizer=tokenizer, vocab_size=50257)
+    cases = [(text, True) for text in accepted] + [(text, False) for text in rejected]
     for request_type, spec in (
-        (StructuredOutputOptions.JSON, '{"type": "object"}'),
+        (StructuredOutputOptions.JSON, RUBRIC_SCHEMA),
         (StructuredOutputOptions.JSON_OBJECT, ""),
     ):
-        grammar = json.loads(
-            serialize_guidance_grammar(request_type, spec, disable_any_whitespace)
-        )
-        options = grammar["grammars"][0]["json_schema"]["x-guidance"]
-        assert options["whitespace_flexible"] is not disable_any_whitespace
-        assert options.get("whitespace_pattern") == expected_pattern
+        for text, expected in cases:
+            grammar = backend.compile_grammar(request_type, spec)
+            tokens = tokenizer.encode(text) + [tokenizer.eos_token_id]
+            assert grammar.accept_tokens("", tokens) is expected, (request_type, text)
+
+
+def test_guidance_structural_tag_whitespace_unchanged(monkeypatch):
+    monkeypatch.setenv("VLLM_STRUCTURED_OUTPUTS_MAX_WHITESPACE", "128")
+    structural_tag = {
+        "structures": [
+            {"begin": "<tool>", "schema": json.loads(RUBRIC_SCHEMA), "end": "</tool>"}
+        ],
+        "triggers": ["<tool>"],
+    }
+    grammar = serialize_guidance_grammar(
+        StructuredOutputOptions.STRUCTURAL_TAG, json.dumps(structural_tag)
+    )
+    assert '"whitespace_flexible":true' in grammar.replace(" ", "")
+    assert "item_separator" not in grammar
