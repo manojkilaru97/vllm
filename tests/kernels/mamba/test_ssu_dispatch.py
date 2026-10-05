@@ -6,7 +6,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.kernels.mamba.utils import assert_stochastically_rounded_fp16
 from vllm.config.mamba import MambaBackendEnum, MambaConfig, MambaSSUAlgorithm
+from vllm.model_executor.layers.mamba.ops import ssu_dispatch
+from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+    selective_state_update as triton_selective_state_update,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     FlashInferSSUBackend,
     TritonSSUBackend,
@@ -14,6 +19,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
     selective_state_update,
 )
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
@@ -186,3 +192,37 @@ def test_triton_basic_call():
         out=out,
     )
     assert not torch.isnan(out).any()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Stochastic rounding of the Mamba cache is CUDA-only.",
+)
+def test_triton_backend_stochastic_rounding_on_any_cuda_gpu(monkeypatch):
+    """SR-enabled Triton configs are accepted on every CUDA GPU (software
+    emulation without cvt.rs) and the dispatcher stochastically rounds."""
+    monkeypatch.setattr(ssu_dispatch, "_mamba_ssu_backend", None)
+    initialize_mamba_ssu_backend(
+        MambaConfig(backend=MambaBackendEnum.TRITON, enable_stochastic_rounding=True),
+        _kv_cache_config_with_ssu(),
+    )
+    set_random_seed(0)
+    device, batch_size, dim, dstate = "cuda", 2, 64, 16
+    state0 = torch.randn(batch_size, dim, dstate, device=device).half()
+    x = torch.randn(batch_size, dim, device=device)
+    dt = torch.randn(batch_size, dim, device=device)
+    dt_bias = torch.rand(dim, device=device) - 4.0
+    A = -torch.rand(dim, dstate, device=device)
+    B = torch.randn(batch_size, dstate, device=device)
+    C = torch.randn(batch_size, dstate, device=device)
+    D = torch.randn(dim, device=device)
+
+    def run(fn, state):
+        out = torch.empty_like(x)
+        fn(state, x, dt, A, B, C, D=D, dt_bias=dt_bias, dt_softplus=True, out=out)
+        return state
+
+    ref = run(triton_selective_state_update, state0.float())
+    assert_stochastically_rounded_fp16(
+        lambda: run(selective_state_update, state0.clone()), ref
+    )

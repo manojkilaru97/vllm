@@ -6,14 +6,19 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from tests.kernels.mamba.utils import selective_state_update_ref
+from tests.kernels.mamba.utils import (
+    assert_stochastically_rounded_fp16,
+    selective_state_update_ref,
+)
 from tests.kernels.utils import opcheck
 from vllm import _custom_ops as ops  # noqa: F401
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_scan_fn,
     selective_state_update,
 )
+from vllm.model_executor.layers.mamba.ops.triton_helpers import _convert_rs_fp16_sw
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -394,11 +399,8 @@ def test_selective_state_update(dim, dstate, has_z, itype):
 @pytest.mark.parametrize("dstate", [16, 64])
 @pytest.mark.parametrize("dim", [2048, 4096])
 @pytest.mark.skipif(
-    not (
-        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
-    ),
-    reason="Stochastic rounding in triton is only supported"
-    " on compute capability 10.0 CUDA devices.",
+    not current_platform.is_cuda(),
+    reason="Stochastic rounding of the Mamba cache is CUDA-only.",
 )
 def test_selective_state_update_stochastic_rounding(dim, dstate, has_z, philox_rounds):
     device = DEVICE
@@ -440,6 +442,155 @@ def test_selective_state_update_stochastic_rounding(dim, dstate, has_z, philox_r
     assert state.dtype == torch.float16
     assert torch.allclose(state, state_ref.to(torch.float16), rtol=rtol, atol=atol)
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("philox_rounds", [0, 4])
+@pytest.mark.parametrize("spec_decode", [False, True])
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Stochastic rounding of the Mamba cache is CUDA-only.",
+)
+def test_selective_state_update_stochastic_rounding_all_stores(
+    spec_decode, philox_rounds
+):
+    """Stochastic rounding must reach every SSM state store, including the
+    per-token stores of spec-decode verification (num_accepted_tokens)."""
+    set_random_seed(0)
+    batch, nheads, dim, dstate = 4, 4, 64, 32
+    seq_len = 3 if spec_decode else 1
+    num_tokens = batch * seq_len
+    x = torch.randn(num_tokens, nheads, dim, device=DEVICE, dtype=torch.bfloat16)
+    dt = torch.randn(num_tokens, nheads, dim, device=DEVICE, dtype=torch.bfloat16)
+    dt_bias = torch.rand(nheads, dim, device=DEVICE) - 4.0
+    A = -torch.rand(nheads, dim, dstate, device=DEVICE) - 1.0
+    B = torch.randn(num_tokens, 1, dstate, device=DEVICE)
+    C = torch.randn(num_tokens, 1, dstate, device=DEVICE)
+    D = torch.randn(nheads, dim, device=DEVICE)
+    init = torch.randn(
+        1 + batch + num_tokens, nheads, dim, dstate, device=DEVICE
+    ).half()
+
+    src = torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE)
+    dst = torch.arange(
+        batch + 1, batch + 1 + num_tokens, dtype=torch.int32, device=DEVICE
+    ).view(batch, seq_len)
+    if spec_decode:
+        src_2d = torch.full_like(dst, NULL_BLOCK_ID)
+        src_2d[:, 0] = src
+        kwargs = dict(
+            state_batch_indices=src_2d,
+            dst_state_batch_indices=dst,
+            num_accepted_tokens=torch.ones(batch, dtype=torch.int32, device=DEVICE),
+            cu_seqlens=torch.arange(
+                0, num_tokens + 1, seq_len, dtype=torch.int32, device=DEVICE
+            ),
+        )
+    else:
+        kwargs = dict(state_batch_indices=src, dst_state_batch_indices=dst[:, 0])
+
+    def run(state_dtype, sr):
+        state = init.to(state_dtype, copy=True)
+        selective_state_update(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            out=torch.empty_like(x),
+            enable_stochastic_rounding=sr,
+            cache_philox_rounds=philox_rounds,
+            **kwargs,
+        )
+        return state[dst.flatten().long()]
+
+    ref = run(torch.float32, sr=False)
+    assert torch.equal(run(torch.float16, sr=False), ref.half())
+    assert_stochastically_rounded_fp16(lambda: run(torch.float16, sr=True), ref)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Stochastic rounding of the Mamba cache is CUDA-only.",
+)
+def test_selective_state_update_stochastic_rounding_cuda_graph():
+    """A captured stochastic-rounding decode step must draw fresh random
+    bits on every replay, as in FULL CUDA-graph decode."""
+    set_random_seed(0)
+    batch, dim, dstate = 4, 256, 32
+    init = torch.randn(batch, dim, dstate, device=DEVICE).half()
+    x = torch.randn(batch, dim, device=DEVICE, dtype=torch.bfloat16)
+    dt = torch.randn(batch, dim, device=DEVICE, dtype=torch.bfloat16)
+    dt_bias = torch.rand(dim, device=DEVICE) - 4.0
+    A = -torch.rand(dim, dstate, device=DEVICE) - 1.0
+    B = torch.randn(batch, dstate, device=DEVICE)
+    C = torch.randn(batch, dstate, device=DEVICE)
+    D = torch.randn(dim, device=DEVICE)
+    out = torch.empty_like(x)
+
+    def step(state, sr):
+        selective_state_update(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            out=out,
+            enable_stochastic_rounding=sr,
+        )
+
+    ref = init.float()
+    step(ref, sr=False)
+    state = init.clone()
+    step(state, sr=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step(state, sr=True)
+
+    def replay():
+        state.copy_(init)
+        graph.replay()
+        return state.clone()
+
+    assert_stochastically_rounded_fp16(replay, ref)
+
+
+@triton.jit
+def _convert_rs_fp16_sw_kernel(x_ptr, out_ptr, seed, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    rand = tl.randint(seed, offs)
+    tl.store(out_ptr + offs, _convert_rs_fp16_sw(x, rand), mask=mask)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Triton GPU kernel test."
+)
+def test_convert_rs_fp16_sw_unbiased_including_subnormals():
+    """The software stochastic rounding used where `cvt.rs` is unavailable
+    must stay unbiased in the fp16 subnormal range instead of flushing it."""
+    set_random_seed(0)
+    n = 1 << 14
+    exponent = torch.empty(n, device=DEVICE).uniform_(-30.0, 10.0)
+    sign = torch.randint(0, 2, (n,), device=DEVICE) * 2 - 1
+    x = sign * torch.exp2(exponent) * torch.empty(n, device=DEVICE).uniform_(1, 2)
+    assert (x.abs() < 2.0**-14).float().mean() > 0.3
+
+    def run():
+        out = torch.empty(n, device=DEVICE, dtype=torch.float16)
+        seed = int(torch.randint(0, 2**31, (1,)).item())
+        _convert_rs_fp16_sw_kernel[(triton.cdiv(n, 1024),)](x, out, seed, n, 1024)
+        return out
+
+    assert_stochastically_rounded_fp16(run, x)
 
 
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])

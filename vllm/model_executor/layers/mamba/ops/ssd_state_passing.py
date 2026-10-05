@@ -8,7 +8,11 @@
 
 import torch
 
-from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
+from vllm.model_executor.layers.mamba.ops.triton_helpers import (
+    convert_rs_fp16x2,
+    fast_exp,
+    has_cvt_rs,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -21,7 +25,7 @@ from vllm.triton_utils import tl, triton
         triton.Config({"BLOCK_SIZE": 1024}),
         triton.Config({"BLOCK_SIZE": 2048}),
     ],
-    key=["dim"],
+    key=["dim", "USE_RS_ROUNDING", "PHILOX_ROUNDS", "RS_ALL_CHUNKS"],
 )
 @triton.jit
 def _state_passing_fwd_kernel(
@@ -31,6 +35,7 @@ def _state_passing_fwd_kernel(
     dA_cs_ptr,
     initstates_ptr,
     last_chunk_indices_ptr,
+    rand_seed_ptr,
     # Matrix dimensions
     dim: tl.constexpr,
     chunk_size: tl.constexpr,
@@ -49,6 +54,10 @@ def _state_passing_fwd_kernel(
     stride_initstates_dim: tl.constexpr,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    USE_RS_ROUNDING: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+    HW_RS: tl.constexpr,
+    RS_ALL_CHUNKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
@@ -86,13 +95,34 @@ def _state_passing_fwd_kernel(
     else:
         states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
+    if USE_RS_ROUNDING:
+        rand_seed = tl.load(rand_seed_ptr)
+        rand_offsets = (
+            chunk_start.to(tl.int64) * stride_out_chunk
+            + pid_h * stride_out_head
+            + offs_m * stride_out_dim
+        )
+
     # Loop over only this sequence's chunks — branchless
     nchunks_this_seq = chunk_end - chunk_start
-    for _ in range(nchunks_this_seq):
+    for c in range(nchunks_this_seq):
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         states = fast_exp(dA_cs) * states + new_states
-        tl.store(out_ptrs, states, mask=offs_m < dim)
+        # Only states that reach the cache need stochastic rounding: the
+        # final one, or every chunk boundary when they are all returned.
+        if USE_RS_ROUNDING and (RS_ALL_CHUNKS or c == nchunks_this_seq - 1):
+            if PHILOX_ROUNDS > 0:
+                rand = tl.randint(rand_seed, rand_offsets, PHILOX_ROUNDS)
+            else:
+                rand = tl.randint(rand_seed, rand_offsets)
+            tl.store(
+                out_ptrs, convert_rs_fp16x2(states, rand, HW_RS), mask=offs_m < dim
+            )
+        else:
+            tl.store(out_ptrs, states, mask=offs_m < dim)
+        if USE_RS_ROUNDING:
+            rand_offsets += stride_out_chunk
 
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
@@ -105,6 +135,9 @@ def _state_passing_fwd(
     last_chunk_indices,
     initial_states=None,
     out_dtype=None,
+    rand_seed=None,
+    philox_rounds=0,
+    rand_all_chunks=True,
 ):
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
@@ -112,6 +145,9 @@ def _state_passing_fwd(
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
     out_dtype = states.dtype if out_dtype is None else out_dtype
     out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
+    assert rand_seed is None or out_dtype == torch.float16, (
+        "stochastic rounding requires an fp16 SSM state"
+    )
 
     initial_states_strides = (
         (initial_states.stride(0), initial_states.stride(1), initial_states.stride(2))
@@ -127,6 +163,7 @@ def _state_passing_fwd(
             dA_cs_ptr=dA_cumsum,
             initstates_ptr=initial_states,
             last_chunk_indices_ptr=last_chunk_indices,
+            rand_seed_ptr=rand_seed,
             dim=dim,
             chunk_size=chunk_size,
             stride_states_chunk=states.stride(0),
@@ -142,5 +179,9 @@ def _state_passing_fwd(
             stride_initstates_head=initial_states_strides[1],
             stride_initstates_dim=initial_states_strides[2],
             HAS_INITSTATES=initial_states is not None,
+            USE_RS_ROUNDING=rand_seed is not None,
+            PHILOX_ROUNDS=philox_rounds,
+            HW_RS=rand_seed is not None and has_cvt_rs(states.device),
+            RS_ALL_CHUNKS=rand_seed is not None and rand_all_chunks,
         )
     return out

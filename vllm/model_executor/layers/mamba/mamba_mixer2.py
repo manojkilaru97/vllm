@@ -669,7 +669,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     initial_states=initial_states,
                     dt_softplus=True,
                     dt_limit=(0.0, float("inf")),
+                    return_intermediate_states=(
+                        self.cache_config.mamba_cache_mode == "all"
+                    ),
                     state_dtype=ssm_state_dtype,
+                    **self._ssd_rounding_kwargs(),
                 )
             except Exception:
                 logger.warning(
@@ -889,6 +893,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
                 state_dtype=ssm_state.dtype,
+                **self._ssd_rounding_kwargs(),
             )
 
             if is_mamba_cache_all:
@@ -1110,6 +1115,18 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+
+    def _ssd_rounding_kwargs(self) -> dict[str, bool | int]:
+        """Stochastic rounding for the prefill SSM state write, matching
+        what the decode SSU backends read from mamba_config."""
+        return {
+            "enable_stochastic_rounding": (
+                self.mamba_config.enable_stochastic_rounding
+            ),
+            "cache_philox_rounds": (
+                self.mamba_config.stochastic_rounding_philox_rounds
+            ),
+        }
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None

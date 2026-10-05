@@ -16,7 +16,11 @@ from packaging import version
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
+from vllm.model_executor.layers.mamba.ops.triton_helpers import (
+    convert_rs_fp16x2,
+    fast_exp,
+    has_cvt_rs,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.platform_utils import get_device_name_as_file_name
@@ -206,21 +210,6 @@ else:
         return dt
 
 
-@triton.jit
-def convert_rs_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
-    y = tl.inline_asm_elementwise(
-        asm="""{
-cvt.rs.f16x2.f32 $0, $2, $1, $3;
-}""",
-        constraints="=r,r,r,r,r",
-        args=(x, rand),
-        dtype=tl.float16,
-        is_pure=True,
-        pack=2,
-    )
-    return y
-
-
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
@@ -309,6 +298,7 @@ def _selective_scan_update_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     USE_RS_ROUNDING: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    HW_RS: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -391,6 +381,24 @@ def _selective_scan_update_kernel(
         D_ptrs = D_ptr + offs_m * stride_D_dim
     A_ptrs = A_ptr + offs_m[:, None] * stride_A_dim + offs_n[None, :] * stride_A_dstate
 
+    if USE_RS_ROUNDING:
+        rand_seed = tl.load(rand_seed_ptr)
+        if IS_SPEC_DECODING:
+            # One draw per element serves every token snapshot of this call:
+            # only the accepted snapshot is read back, so sharing the bits
+            # across snapshots keeps each stored state unbiased.
+            spec_rand_offsets = (
+                (state_batch_idx if HAS_STATE_BATCH_INDICES else pid_b)
+                * stride_state_batch
+                + pid_h * stride_state_head
+                + offs_m[:, None] * stride_state_dim
+                + offs_n[None, :] * stride_state_dstate
+            )
+            if PHILOX_ROUNDS > 0:
+                spec_rand = tl.randint(rand_seed, spec_rand_offsets, PHILOX_ROUNDS)
+            else:
+                spec_rand = tl.randint(rand_seed, spec_rand_offsets)
+
     for i_t in range(seq_len):
         x_ptrs = x_ptr + offs_m * stride_x_dim
         dt_ptrs = dt_ptr + offs_m * stride_dt_dim
@@ -443,9 +451,15 @@ def _selective_scan_update_kernel(
                     + offs_m[:, None] * stride_state_dim
                     + offs_n[None, :] * stride_state_dstate
                 )
-                tl.store(
-                    token_dst_ptrs, state.to(token_dst_ptrs.dtype.element_ty), mask=mask
-                )
+                if USE_RS_ROUNDING:
+                    tl.static_assert(
+                        token_dst_ptrs.dtype.element_ty == tl.float16,
+                        "stochastic rounding requires an fp16 SSM state cache",
+                    )
+                    token_state = convert_rs_fp16x2(state, spec_rand, HW_RS)
+                else:
+                    token_state = state.to(token_dst_ptrs.dtype.element_ty)
+                tl.store(token_dst_ptrs, token_state, mask=mask)
 
         out = tl.sum(state * C[None, :], axis=1)
         if HAS_D:
@@ -464,8 +478,6 @@ def _selective_scan_update_kernel(
 
     if not IS_SPEC_DECODING:
         if USE_RS_ROUNDING:
-            # Load random seed
-            rand_seed = tl.load(rand_seed_ptr)
             # Generate random offsets for each element in state
             if HAS_STATE_BATCH_INDICES:
                 rand_offsets = (
@@ -483,7 +495,7 @@ def _selective_scan_update_kernel(
             else:
                 rand = tl.randint(rand_seed, rand_offsets)
             # Convert state to fp16 with RS rounding
-            state = convert_rs_fp16x2(state, rand)
+            state = convert_rs_fp16x2(state, rand, HW_RS)
             tl.static_assert(state.dtype == tl.float16, "state must be fp16")
             tl.static_assert(
                 dst_state_ptrs.dtype.element_ty == tl.float16,
@@ -698,6 +710,7 @@ def selective_state_update(
             num_warps=num_warps,
             USE_RS_ROUNDING=enable_stochastic_rounding,
             PHILOX_ROUNDS=cache_philox_rounds,
+            HW_RS=enable_stochastic_rounding and has_cvt_rs(state.device),
         )
 
 

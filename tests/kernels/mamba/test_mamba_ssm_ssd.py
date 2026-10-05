@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from tests.kernels.mamba.utils import assert_stochastically_rounded_fp16
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
@@ -577,3 +578,63 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
             rtol=rtol,
             msg=lambda x, i=i: f"seq{i} state " + x,
         )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Stochastic rounding of the Mamba cache is CUDA-only.",
+)
+@pytest.mark.parametrize("return_intermediate_states", [False, True])
+def test_mamba_chunk_scan_stochastic_rounding(return_intermediate_states):
+    """Prefill/chunked-prefill states written to an fp16 cache must honor
+    --enable-mamba-cache-stochastic-rounding: each value lands on one of its
+    two fp16 neighbours, fresh seeds pick different neighbours, and the
+    average over seeds converges to the fp32 state."""
+    set_random_seed(0)
+    seqlen, nheads, headdim, dstate, chunk_size = 300, 4, 32, 16, 64
+    x = torch.randn(seqlen, nheads, headdim, device=DEVICE, dtype=torch.bfloat16)
+    dt = torch.randn(seqlen, nheads, device=DEVICE, dtype=torch.bfloat16)
+    dt_bias = torch.rand(nheads, device=DEVICE) - 4.0
+    A = -torch.rand(nheads, device=DEVICE) - 1.0
+    B = torch.randn(seqlen, 1, dstate, device=DEVICE, dtype=torch.bfloat16)
+    C = torch.randn(seqlen, 1, dstate, device=DEVICE, dtype=torch.bfloat16)
+    initial_states = torch.randn(
+        1, nheads, headdim, dstate, device=DEVICE, dtype=torch.float16
+    )
+    cu_seqlens = torch.tensor([0, seqlen], dtype=torch.int32, device=DEVICE)
+    cu_chunk_seqlens, last_chunk_indices, seq_idx = compute_varlen_chunk_metadata(
+        cu_seqlens, chunk_size
+    )
+
+    def run(state_dtype, sr, out=None):
+        out = torch.empty_like(x) if out is None else out
+        return mamba_chunk_scan_combined_varlen(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            cu_seqlens=cu_seqlens,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            seq_idx=seq_idx,
+            out=out,
+            dt_bias=dt_bias,
+            initial_states=initial_states.to(state_dtype),
+            dt_softplus=True,
+            return_intermediate_states=return_intermediate_states,
+            state_dtype=state_dtype,
+            enable_stochastic_rounding=sr,
+        )
+
+    ref = run(torch.float32, sr=False)
+    assert torch.equal(run(torch.float16, sr=False), ref.half())
+    assert_stochastically_rounded_fp16(lambda: run(torch.float16, sr=True), ref)
+
+    # Chunk outputs read the rounded boundary states back in bf16, so
+    # stochastic rounding must not move them beyond bf16 rounding noise.
+    out_rne, out_sr = torch.empty_like(x), torch.empty_like(x)
+    run(torch.float16, sr=False, out=out_rne)
+    run(torch.float16, sr=True, out=out_sr)
+    torch.testing.assert_close(out_sr, out_rne, atol=2e-2, rtol=1e-2)
