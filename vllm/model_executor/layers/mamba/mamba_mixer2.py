@@ -702,11 +702,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     initial_states=initial_states,
                     dt_softplus=True,
                     dt_limit=(0.0, float("inf")),
+                    # Real calls return all chunk states iff not writing finals.
+                    return_intermediate_states=not write_final_states,
                     state_dtype=ssm_state_dtype,
                     final_states_out=final_states if write_final_states else None,
                     final_state_indices=(
                         final_state_indices if write_final_states else None
                     ),
+                    **self._ssd_rounding_kwargs(),
                 )
             except Exception:
                 logger.warning(
@@ -885,6 +888,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 state_dtype=ssm_state.dtype,
                 final_states_out=None if has_checkpoints else ssm_state,
                 final_state_indices=None if has_checkpoints else state_indices_tensor_p,
+                **self._ssd_rounding_kwargs(),
             )
 
             if has_checkpoints:
@@ -1116,6 +1120,18 @@ class MambaMixer2(MambaBase, PluggableLayer):
         return replace(
             spec, num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=1
         )
+
+    def _ssd_rounding_kwargs(self) -> dict[str, bool | int]:
+        """Stochastic rounding for the prefill SSM state write, matching
+        what the decode SSU backends read from mamba_config."""
+        return {
+            "enable_stochastic_rounding": (
+                self.mamba_config.enable_stochastic_rounding
+            ),
+            "cache_philox_rounds": (
+                self.mamba_config.stochastic_rounding_philox_rounds
+            ),
+        }
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None

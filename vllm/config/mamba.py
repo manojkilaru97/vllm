@@ -41,9 +41,12 @@ class MambaConfig:
     """Mamba SSU backend to use."""
 
     enable_stochastic_rounding: bool = False
-    """Enable stochastic rounding when writing SSM state to fp16 cache.
-    Uses random bits to unbias the rounding error, which can improve
-    numerical stability for long sequences."""
+    """Enable stochastic rounding when writing SSM state to fp16 cache, on
+    the decode/spec-decode paths and on the Mamba2 prefill path (Mamba1
+    prefill still rounds to nearest). Uses random bits to
+    unbias the rounding error, which can improve numerical stability for
+    long sequences. GPUs without `cvt.rs` (pre-Blackwell) use a software
+    emulation in the Triton kernels."""
     stochastic_rounding_philox_rounds: int = 0
     """Number of Philox PRNG rounds for stochastic rounding random number
     generation. 0 uses the Triton default. Higher values improve randomness
@@ -90,15 +93,4 @@ class MambaConfig:
                     "Stochastic rounding for Mamba cache is only supported "
                     "on NVIDIA CUDA platforms. Please do not specify  "
                     "`--enable-mamba-cache-stochastic-rounding`."
-                )
-            if (
-                self.backend == MambaBackendEnum.TRITON
-                and not current_platform.is_device_capability_family(100)
-            ):
-                raise ValueError(
-                    "Stochastic rounding for Mamba cache with triton backend requires "
-                    "compute capability 10.0 (data center Blackwell). The `cvt.rs` "
-                    "PTX instruction is not supported on your GPU. Please do not "
-                    "specify `--enable-mamba-cache-stochastic-rounding`, "
-                    "or set `--mamba-backend flashinfer`."
                 )

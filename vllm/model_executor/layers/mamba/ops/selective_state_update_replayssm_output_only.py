@@ -4,8 +4,12 @@
 
 import torch
 
-from vllm.model_executor.layers.mamba.ops.mamba_ssm import convert_rs_fp16x2, softplus
+from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
 from vllm.model_executor.layers.mamba.ops.replayssm_config import get_replayssm_config
+from vllm.model_executor.layers.mamba.ops.triton_helpers import (
+    convert_rs_fp16x2,
+    has_cvt_rs,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -216,6 +220,7 @@ def _replayssm_output_only_kernel(
     DOT_INPUT_PRECISION: tl.constexpr,
     USE_RS_ROUNDING: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    HW_RS: tl.constexpr,
     # heuristic-computed
     BLOCK_SIZE_DSTATE: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
@@ -433,7 +438,7 @@ def _replayssm_output_only_kernel(
                 tl.float32
             )
             if USE_RS_ROUNDING:
-                # Stochastic-round fp32->fp16 (Blackwell cvt.rs), mirroring the
+                # Stochastic-round fp32->fp16 (cvt.rs or software), mirroring the
                 # baseline. Only the flush step stores state, so this runs at 1/L
                 # the baseline's per-step rate. Absolute per-element offsets seed
                 # the RNG so each state element draws independently.
@@ -452,7 +457,7 @@ def _replayssm_output_only_kernel(
                     state_ptrs.dtype.element_ty == tl.float16,
                     "stochastic rounding requires an fp16 SSM state cache",
                 )
-                state_store = convert_rs_fp16x2(state_new, rand)
+                state_store = convert_rs_fp16x2(state_new, rand, HW_RS)
             else:
                 state_store = state_new.to(st_f.dtype)
             tl.store(state_ptrs, state_store, mask=state_mask)
@@ -711,6 +716,7 @@ def selective_state_update_replayssm_output_only(
             dot_input_precision,
             enable_stochastic_rounding,
             cache_philox_rounds,
+            HW_RS=enable_stochastic_rounding and has_cvt_rs(state.device),
             num_warps=num_warps,
             num_stages=num_stages,
         )

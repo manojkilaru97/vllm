@@ -45,6 +45,8 @@ def _mamba_chunk_scan_combined_fwd(
     state_dtype=None,
     final_states_out=None,
     final_state_indices=None,
+    enable_stochastic_rounding=False,
+    cache_philox_rounds=0,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
@@ -106,6 +108,13 @@ def _mamba_chunk_scan_combined_fwd(
         B, x, dt, dA_cumsum, cu_chunk_seqlens, states_in_fp32=True
     )
 
+    out_dtype = state_dtype if state_dtype is not None else C.dtype
+    rand_seed = (
+        torch.randint(0, 2**32, (1,), device=x.device)
+        if enable_stochastic_rounding and out_dtype == torch.float16
+        else None
+    )
+
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
     # - parallelized across sequences using last_chunk_indices to derive
@@ -117,11 +126,14 @@ def _mamba_chunk_scan_combined_fwd(
         initial_states=initial_states.flatten(-2)
         if initial_states is not None
         else None,  # (batch, nheads, headdim*dstate)
-        out_dtype=state_dtype if state_dtype is not None else C.dtype,
+        out_dtype=out_dtype,
         final_states=final_states_out.flatten(-2)
         if final_states_out is not None
         else None,  # (num_slots, nheads, headdim*dstate)
         final_state_indices=final_state_indices,
+        rand_seed=rand_seed,
+        philox_rounds=cache_philox_rounds,
+        rand_all_chunks=return_intermediate_states,
     )
     states = states.unflatten(-1, (headdim, dstate))
 
@@ -183,6 +195,8 @@ def mamba_chunk_scan_combined_varlen(
     state_dtype=None,
     final_states_out=None,
     final_state_indices=None,
+    enable_stochastic_rounding=False,
+    cache_philox_rounds=0,
 ):
     """Argument:
         x: (seqlen, nheads, headdim)
@@ -205,8 +219,14 @@ def mamba_chunk_scan_combined_varlen(
         state_dtype: The data type of the ssm state
         final_states_out: (num_slots, nheads, headdim, dstate) state cache
         final_state_indices: (batch,) slot receiving each final state
+        enable_stochastic_rounding: Stochastically round the returned states
+            when state_dtype is fp16
+        cache_philox_rounds: Philox rounds for stochastic rounding (0 uses
+            the Triton default)
+
     Return:
         varlen_states: (batch, nheads, headdim, dstate), or None if written
+
     """
     assert cu_seqlens is not None, "cu_seqlens must be provided assuming varlen input"
     assert seq_idx is not None
@@ -234,6 +254,8 @@ def mamba_chunk_scan_combined_varlen(
         state_dtype=state_dtype,
         final_states_out=final_states_out,
         final_state_indices=final_state_indices,
+        enable_stochastic_rounding=enable_stochastic_rounding,
+        cache_philox_rounds=cache_philox_rounds,
     )
     if final_states_out is not None:
         if varlen_states is not None:

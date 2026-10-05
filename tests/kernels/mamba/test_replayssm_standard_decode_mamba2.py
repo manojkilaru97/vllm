@@ -33,6 +33,7 @@ import torch
 
 from tests.kernels.mamba.utils import (
     allocate_update_caches,
+    assert_stochastically_rounded_fp16,
     selective_state_update_ref,
     selective_state_update_replayssm_output_only_ref,
 )
@@ -671,3 +672,51 @@ def test_replayssm_standard_decode_tp_head_shard_equivalence(
                 )
 
         write_pos = torch.where(is_flush, torch.zeros_like(write_pos), write_pos + 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
+def test_replayssm_flush_stochastic_rounding():
+    """The ReplaySSM flush store must stochastically round the fp16 state
+    (software emulation where cvt.rs is unavailable)."""
+    set_random_seed(0)
+    batch, nheads, headdim, dstate, ngroups = 4, 8, 64, 64, 4
+    device, act = "cuda", torch.bfloat16
+    state0 = torch.randn(batch, nheads, headdim, dstate, device=device).half()
+    A = _tied_A(nheads, headdim, dstate, device)
+    dt_bias = _tied_dt_bias(nheads, headdim, device)
+    D = torch.randn(nheads, headdim, device=device)
+    x = torch.randn(batch, nheads, headdim, device=device, dtype=act)
+    dt = _tied_dt(batch, nheads, headdim, device, act)
+    B = torch.randn(batch, ngroups, dstate, device=device, dtype=act)
+    C = torch.randn(batch, ngroups, dstate, device=device, dtype=act)
+
+    def run(state_dtype, sr):
+        state = state0.to(state_dtype, copy=True)
+        x_cache, dt_cache, B_cache, _ = allocate_update_caches(
+            batch, nheads, ngroups, headdim, dstate, 1, device, act, act
+        )
+        selective_state_update_replayssm_output_only(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            x_cache=x_cache,
+            dt_cache=dt_cache,
+            B_cache=B_cache,
+            bc_pre=torch.empty(batch, ngroups, 1, device=device),
+            write_pos=torch.zeros(batch, dtype=torch.int32, device=device),
+            is_flush=torch.ones(batch, dtype=torch.bool, device=device),
+            max_cache_len=1,
+            out=torch.empty_like(x),
+            enable_stochastic_rounding=sr,
+        )
+        return state
+
+    ref = run(torch.float32, sr=False)
+    assert torch.equal(run(torch.float16, sr=False), ref.half())
+    assert_stochastically_rounded_fp16(lambda: run(torch.float16, sr=True), ref)

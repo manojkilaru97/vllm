@@ -6,6 +6,54 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 
+def assert_stochastically_rounded_fp16(run_sr, ref, num_runs=128):
+    """Check that `run_sr()` stochastically rounds the fp32 `ref` to fp16.
+
+    Every sample must be one of the two fp16 neighbours of `ref` (or `ref`
+    itself when exact). Every element whose remainder lies in [0.2, 0.8] ulp
+    must take both neighbours across calls, which round-to-nearest on any
+    element fails (a stochastic element fails with probability < 1e-12). The
+    away-from-zero frequency must match the remainder for normal and
+    subnormal values, and the mean over calls must converge to `ref`.
+    """
+    rne = ref.half()
+    down = torch.where(
+        rne.float().abs() > ref.abs(), torch.nextafter(rne, torch.zeros_like(rne)), rne
+    )
+    up = torch.nextafter(down, torch.where(ref < 0, -torch.inf, torch.inf).half())
+    exact = down.float() == ref
+    ulp = (up.float() - down.float()).abs()
+    remainder = (ref - down.float()).abs() / ulp
+
+    acc = torch.zeros_like(ref)
+    ups = torch.zeros_like(ref, dtype=torch.int32)
+    off_grid = torch.zeros_like(ref, dtype=torch.bool)
+    for _ in range(num_runs):
+        sample = run_sr()
+        assert sample.dtype == torch.float16
+        is_up = (sample == up) & ~exact
+        off_grid |= ~((sample == down) | is_up)
+        ups += is_up
+        acc += sample.float()
+    assert not off_grid.any()
+    mixed = (remainder > 0.2) & (remainder < 0.8)
+    assert mixed.float().mean() > 0.3
+    assert torch.all((ups[mixed] > 0) & (ups[mixed] < num_runs))
+
+    # The away-from-zero frequency must match the remainder in each range
+    # (sign-independent, so rounding toward zero cannot cancel out).
+    freq_err = ups.float() / num_runs - remainder
+    for in_range in (ref.abs() >= 2.0**-14, ref.abs() < 2.0**-14):
+        sel = in_range & ~exact
+        if sel.sum() >= 1000:
+            assert freq_err[sel].mean().abs().item() < 0.01
+
+    sr_err = (acc / num_runs - ref) / ulp
+    rne_err = ((rne.float() - ref) / ulp).abs().mean().item()
+    assert sr_err.mean().abs().item() < 0.01
+    assert sr_err.abs().mean().item() < 0.05 < 0.1 < rne_err
+
+
 def selective_state_update_ref(
     state, x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False
 ):
