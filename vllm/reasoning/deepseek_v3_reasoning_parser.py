@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 from transformers import PreTrainedTokenizerBase
 
 from vllm.reasoning import ReasoningParser
-from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 
 from .identity_reasoning_parser import IdentityReasoningParser
 
@@ -85,7 +85,8 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
     def create_reasoning_token_counter(
         self, prompt_token_ids: Sequence[int] | None
     ) -> ReasoningTokenCounter | None:
-        return self._parser.create_reasoning_token_counter(prompt_token_ids)
+        factory = getattr(self._parser, "create_reasoning_token_counter", None)
+        return factory(prompt_token_ids) if factory is not None else None
 
 
 class DeepSeekV3ReasoningWithThinkingParser(DeepSeekV3ReasoningParser):

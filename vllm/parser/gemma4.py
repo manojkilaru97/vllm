@@ -436,7 +436,7 @@ class Gemma4Parser(ParserEngine):
         self._reasoning_text: str = ""
         self._prefix_stripped: bool = False
         self._is_first_feed: bool = True
-        self._reasoning_start_injected: bool = False
+        self._reasoning_start_injected = False
 
     def _reset(self, initial_state=None) -> None:
         super()._reset(initial_state=initial_state)

@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.logger import init_logger
-from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.tokenizers import TokenizerLike
 
 if TYPE_CHECKING:
@@ -88,9 +88,7 @@ class HYV3ReasoningParser(BaseThinkingReasoningParser):
         self, prompt_token_ids: Sequence[int] | None
     ) -> ReasoningTokenCounter | None:
         if self._identity_parser is not None:
-            return self._identity_parser.create_reasoning_token_counter(
-                prompt_token_ids
-            )
+            return None
         return super().create_reasoning_token_counter(prompt_token_ids)
 
     def extract_reasoning(

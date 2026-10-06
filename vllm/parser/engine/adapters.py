@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from vllm.parser.engine.parser_engine_config import ParserState
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
 if TYPE_CHECKING:
@@ -149,6 +150,22 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         )
         return self._counting_parser_engine.count_reasoning_tokens(token_ids)
 
+    def is_reasoning_end_for_usage(self, input_ids: Sequence[int]) -> bool:
+        engine = self._parser_engine
+        for token_id in reversed(input_ids):
+            if token_id in engine.reasoning_end_token_ids:
+                return True
+            if token_id == engine._reasoning_start_token_id:
+                return False
+            if token_id in engine._turn_boundary_token_ids:
+                break
+        return False
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        return self._parser_engine._create_reasoning_token_counter(prompt_token_ids)
+
 
 class ParserEngineToolAdapter(ToolParser):
     """Adapts a :class:`ParserEngine` to the :class:`ToolParser` interface.
@@ -172,6 +189,23 @@ class ParserEngineToolAdapter(ToolParser):
 
     _parser_engine_cls: type[ParserEngine]
     engine_based_streaming: bool = True
+
+    @property
+    def can_reenter_reasoning(self) -> bool:
+        reachable = {ParserState.CONTENT}
+        while True:
+            discovered: set[ParserState] = set()
+            transitions = self._parser_engine.parser_engine_config.transitions
+            for (state, _), transition in transitions.items():
+                if state not in reachable:
+                    continue
+                if transition.next_state == ParserState.REASONING:
+                    return True
+                if transition.next_state not in reachable:
+                    discovered.add(transition.next_state)
+            if not discovered:
+                return False
+            reachable.update(discovered)
 
     def __init__(
         self,

@@ -41,6 +41,7 @@ from vllm.logger import init_logger
 from vllm.parser.metrics import record_tool_parser_invocation
 from vllm.parser.utils import count_history_tool_calls
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser
@@ -248,6 +249,11 @@ class Parser:
         """Return the number of reasoning tokens in generated token IDs."""
         return 0
 
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        return None
+
 
 def structured_outputs_to_format(params: StructuredOutputsParams) -> Format | None:
     """Map StructuredOutputsParams in a XGrammar Format."""
@@ -322,6 +328,28 @@ class DelegatingParser(Parser):
     If either parser is None, the corresponding methods will return default
     values (no reasoning extraction, no tool calls).
     """
+
+    def create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
+        reasoning_parser = self._reasoning_parser
+        factory = getattr(reasoning_parser, "create_reasoning_token_counter", None)
+        if factory is None:
+            return None
+        prompt_reasoning_ended = getattr(
+            reasoning_parser,
+            "is_reasoning_end_for_usage",
+            reasoning_parser.is_reasoning_end,
+        )
+        if (
+            prompt_token_ids is not None
+            and prompt_reasoning_ended(prompt_token_ids)
+            and not getattr(self._tool_parser, "can_reenter_reasoning", False)
+        ):
+            # Legacy extraction latches content mode after a closed prompt.
+            # Keep usage closed even if later content contains thinking markers.
+            return ReasoningTokenCounter()
+        return factory(prompt_token_ids)
 
     def extract_reasoning(
         self,

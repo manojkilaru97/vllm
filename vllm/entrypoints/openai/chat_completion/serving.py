@@ -61,6 +61,7 @@ from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -157,7 +158,7 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_log_deltas = enable_log_deltas
 
         self.enable_auto_tools: bool = enable_auto_tools
-        self._include_reasoning_tokens_details = bool(reasoning_parser)
+        self._include_reasoning_tokens_details = True
         self.parser_cls = ParserManager.get_parser(
             tool_parser_name=tool_parser,
             reasoning_parser_name=reasoning_parser,
@@ -479,6 +480,10 @@ class OpenAIServingChat(GenerateBaseServing):
         # TODO: Remove once all reasoning parsers use the Parser Engine.
         generated_token_ids: list[list[int]] = [[] for _ in range(num_choices)]
         previous_reasoning_tokens = [0] * num_choices
+        reasoning_token_counters: list[ReasoningTokenCounter | None] = [
+            None
+        ] * num_choices
+        reasoning_token_counters_initialized = [False] * num_choices
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
@@ -677,8 +682,21 @@ class OpenAIServingChat(GenerateBaseServing):
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
                     if parser is not None and self._include_reasoning_tokens_details:
-                        generated_token_ids[i].extend(output.token_ids)
-                        if include_continuous_usage:
+                        if not reasoning_token_counters_initialized[i]:
+                            reasoning_token_counters[i] = (
+                                parser.create_reasoning_token_counter(
+                                    res.prompt_token_ids
+                                )
+                            )
+                            reasoning_token_counters_initialized[i] = True
+                        if (counter := reasoning_token_counters[i]) is not None:
+                            previous_reasoning_tokens[i] = counter.update(
+                                as_list(output.token_ids),
+                                finished=output.finish_reason is not None,
+                            )
+                        else:
+                            generated_token_ids[i].extend(output.token_ids)
+                        if include_continuous_usage and counter is None:
                             previous_reasoning_tokens[i] = (
                                 parser.count_reasoning_tokens(
                                     tuple(generated_token_ids[i])
@@ -810,14 +828,14 @@ class OpenAIServingChat(GenerateBaseServing):
 
                     # handle usage stats if requested & if continuous
                     if include_continuous_usage:
-                        completion_tokens = previous_num_tokens[i]
+                        completion_tokens = sum(previous_num_tokens)
                         chunk.usage = UsageInfo(
                             prompt_tokens=num_prompt_tokens,
                             completion_tokens=completion_tokens,
                             total_tokens=num_prompt_tokens + completion_tokens,
                             completion_tokens_details=(
                                 _make_completion_tokens_details(
-                                    previous_reasoning_tokens[i]
+                                    sum(previous_reasoning_tokens)
                                 )
                                 if self._include_reasoning_tokens_details
                                 else None
@@ -1002,7 +1020,14 @@ class OpenAIServingChat(GenerateBaseServing):
                 suppress_metadata = not request.include_reasoning and parser is not None
                 if not request.include_reasoning:
                     reasoning = None
-                total_reasoning_tokens += parser.count_reasoning_tokens(token_ids)
+                if (
+                    counter := parser.create_reasoning_token_counter(
+                        final_res.prompt_token_ids
+                    )
+                ) is not None:
+                    total_reasoning_tokens += counter.update(token_ids, finished=True)
+                else:
+                    total_reasoning_tokens += parser.count_reasoning_tokens(token_ids)
                 if suppress_metadata:
                     logprobs = None
             else:

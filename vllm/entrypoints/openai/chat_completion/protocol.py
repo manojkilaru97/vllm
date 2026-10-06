@@ -124,14 +124,6 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     routed_experts: str | None = None
 
 
-class CompletionTokenUsageInfo(OpenAIBaseModel):
-    reasoning_tokens: int = 0
-
-
-class ChatCompletionUsageInfo(UsageInfo):
-    completion_tokens_details: CompletionTokenUsageInfo | None = None
-
-
 class ChatCompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: Literal["chat.completion"] = "chat.completion"
@@ -140,7 +132,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     choices: list[ChatCompletionResponseChoice]
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     system_fingerprint: str | None = None
-    usage: SerializeAsAny[UsageInfo]
+    usage: UsageInfo
 
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
@@ -177,7 +169,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: list[ChatCompletionResponseStreamChoice]
-    usage: SerializeAsAny[UsageInfo] | None = Field(default=None)
+    usage: UsageInfo | None = Field(default=None)
     # Set only on the final chunk of a stream to mirror non-streaming responses
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
@@ -618,9 +610,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         return TokenizeParams(
             max_total_tokens=model_config.max_model_len,
-            # Validate that the prompt leaves room for a completion. The actual
-            # output limit is clamped to the remaining context after rendering,
-            # when the exact prompt token count is known.
+            # Clamp the output after rendering, when the exact prompt length is
+            # known. The prompt must still leave room for a completion.
             max_output_tokens=1,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             truncation_side=self.truncation_side,

@@ -236,21 +236,45 @@ class InklingParser(ParserEngine):
         continues inside a thinking block, a text block, a model message
         header, or between blocks.
         """
-        if (state := self._prompt_initial_state(prompt_token_ids)) is not None:
-            self._engine.reset(initial_state=state)
-            self._streaming_initialized = True
+        vocab = self.vocab
+        thinking_id = vocab.get(CONTENT_THINKING)
+        text_id = vocab.get(CONTENT_TEXT)
+        model_id = vocab.get(MESSAGE_MODEL)
+        special_ids = {vocab[text] for text in INKLING_SPECIAL_TOKENS if text in vocab}
+        for token_id in reversed(prompt_token_ids):
+            if token_id == thinking_id:
+                self._engine.reset(initial_state=ParserState.REASONING)
+                self._streaming_initialized = True
+                return
+            if token_id == text_id:
+                self._engine.reset(initial_state=ParserState.CONTENT)
+                self._streaming_initialized = True
+                return
+            if token_id == model_id:
+                self._engine.reset(initial_state=ParserState.MESSAGE_HEADER)
+                self._streaming_initialized = True
+                return
+            if token_id in special_ids:
+                break
+
+    def is_reasoning_end(self, input_ids: list[int]) -> bool:
+        vocab = self.vocab
+        thinking_id = vocab.get(CONTENT_THINKING)
+        text_id = vocab.get(CONTENT_TEXT)
+        model_id = vocab.get(MESSAGE_MODEL)
+        end_sampling_id = vocab.get(CONTENT_MODEL_END_SAMPLING)
+        for token_id in reversed(input_ids):
+            if token_id in (thinking_id, model_id):
+                return False
+            if token_id in (text_id, end_sampling_id):
+                return True
+        return False
 
     def _reasoning_counter_starts_in_reasoning(
         self, prompt_token_ids: Sequence[int] | None
     ) -> bool:
-        return bool(
-            prompt_token_ids
-            and self._prompt_initial_state(prompt_token_ids) == ParserState.REASONING
-        )
-
-    def _prompt_initial_state(
-        self, prompt_token_ids: Sequence[int]
-    ) -> ParserState | None:
+        if not prompt_token_ids:
+            return False
         vocab = self.vocab
         state_by_token_id = {
             vocab[text]: state
@@ -264,22 +288,9 @@ class InklingParser(ParserEngine):
         special_ids = {vocab[text] for text in INKLING_SPECIAL_TOKENS if text in vocab}
         for token_id in reversed(prompt_token_ids):
             if token_id in state_by_token_id:
-                return state_by_token_id[token_id]
+                return state_by_token_id[token_id] == ParserState.REASONING
             if token_id in special_ids:
                 break
-        return None
-
-    def is_reasoning_end(self, input_ids: list[int]) -> bool:
-        vocab = self.vocab
-        thinking_id = vocab.get(CONTENT_THINKING)
-        text_id = vocab.get(CONTENT_TEXT)
-        model_id = vocab.get(MESSAGE_MODEL)
-        end_sampling_id = vocab.get(CONTENT_MODEL_END_SAMPLING)
-        for token_id in reversed(input_ids):
-            if token_id in (thinking_id, model_id):
-                return False
-            if token_id in (text_id, end_sampling_id):
-                return True
         return False
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
