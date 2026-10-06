@@ -30,7 +30,7 @@ from vllm.parser.engine.parser_engine_config import (
     ParserState,
 )
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
-from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.renderers.chat_utils import get_tool_call_id_type, make_tool_call_id
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
@@ -229,6 +229,19 @@ class ParserEngine(Parser):
     def create_reasoning_token_counter(
         self, prompt_token_ids: Sequence[int] | None
     ) -> ReasoningTokenCounter | None:
+        initial_reasoning = self._reasoning_counter_starts_in_reasoning(
+            prompt_token_ids
+        )
+        if initial_reasoning == (
+            self.parser_engine_config.initial_state == ParserState.REASONING
+        ):
+            # Stock event accounting already covers the default initial state.
+            return None
+        return self._create_reasoning_token_counter(prompt_token_ids)
+
+    def _create_reasoning_token_counter(
+        self, prompt_token_ids: Sequence[int] | None
+    ) -> ReasoningTokenCounter | None:
         if not self._has_reasoning:
             return None
 
@@ -256,7 +269,7 @@ class ParserEngine(Parser):
             ):
                 neutral_terminals.add(terminal)
 
-        counter = ReasoningTokenCounter(
+        return ReasoningTokenCounter(
             start_sequences=(
                 sequence
                 for terminal in start_terminals
@@ -276,7 +289,6 @@ class ParserEngine(Parser):
                 prompt_token_ids
             ),
         )
-        return counter
 
     def _reasoning_counter_starts_in_reasoning(
         self, prompt_token_ids: Sequence[int] | None
@@ -838,21 +850,10 @@ class ParserEngine(Parser):
         return not wait_for_reasoning
 
     def is_reasoning_end_for_usage(self, input_ids: Sequence[int]) -> bool:
-        """Inspect tokenized prompt state without reading live engine state."""
-        end_id = self._reasoning_end_token_id
-        if end_id is None:
-            # Text-only terminals are interpreted from generated text by the
-            # engine; the default prompt hook does not replay them.
-            return False
-        start_id = self._reasoning_start_token_id
-        if not input_ids:
-            return self.parser_engine_config.initial_state != ParserState.REASONING
-        for token_id in reversed(input_ids):
-            if token_id == end_id:
-                return True
-            if start_id is not None and token_id == start_id:
-                return False
-        return False
+        """Prompt reasoning state for usage counters (no live engine state)."""
+        # v0.33 is_reasoning_end is stateless and honors turn boundaries,
+        # implicit ends and multi-token markers.
+        return self.is_reasoning_end(list(input_ids))
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         config = self.parser_engine_config

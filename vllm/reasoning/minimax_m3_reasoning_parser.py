@@ -5,8 +5,8 @@ from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
-from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -325,6 +325,9 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
                 )
             ),
         )
+
+    def is_reasoning_end_for_usage(self, input_ids: Sequence[int]) -> bool:
+        return MiniMaxM3ReasoningParser.is_reasoning_end(self, input_ids)
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         start_index = self._rfind_token_sequence(input_ids, self._start_token_ids)

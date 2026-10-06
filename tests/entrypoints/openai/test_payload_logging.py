@@ -10,6 +10,15 @@ import pytest
 from vllm import payload_logging
 
 
+@pytest.fixture(autouse=True)
+def _undo_leaked_logging_disable():
+    # A failed server fixture elsewhere can leak vllm's suppress_logging().
+    previous = logging.root.manager.disable
+    logging.disable(logging.NOTSET)
+    yield
+    logging.disable(previous)
+
+
 class _RecordHandler(logging.Handler):
     def __init__(self) -> None:
         super().__init__()

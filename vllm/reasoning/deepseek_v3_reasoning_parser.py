@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 from transformers import PreTrainedTokenizerBase
 
 from vllm.reasoning import ReasoningParser
-from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 
 from .identity_reasoning_parser import IdentityReasoningParser
 

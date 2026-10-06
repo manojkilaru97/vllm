@@ -237,7 +237,9 @@ def test_implicit_reasoning_end_of_parsers(
 class TestReasoningTokenUsage:
     def test_counter_uses_prompt_state(self):
         engine = _make_engine()
-        counter = engine.create_reasoning_token_counter([200])
+        # Default initial state: native event accounting, no counter.
+        assert engine.create_reasoning_token_counter([200]) is None
+        counter = engine._create_reasoning_token_counter([200])
         assert counter is not None
 
         assert counter.update([65, 66, 201, 67], finished=True) == 2
@@ -245,7 +247,8 @@ class TestReasoningTokenUsage:
     def test_content_initial_counter_matches_live_parser_state(self):
         config = replace(_combined_config(), initial_state=ParserState.CONTENT)
         engine = _make_engine(config)
-        counter = engine.create_reasoning_token_counter([200])
+        assert engine.create_reasoning_token_counter([200]) is None
+        counter = engine._create_reasoning_token_counter([200])
         assert counter is not None
 
         # The default prompt-state hook is a no-op, so the live parser remains
@@ -268,7 +271,7 @@ class TestReasoningTokenUsage:
         }.get(text, [1, 2, 3])
         engine = ParserEngine(tokenizer, parser_engine_config=config)
         engine._reasoning_ended = True
-        counter = engine.create_reasoning_token_counter([99])
+        counter = engine._create_reasoning_token_counter([99])
         assert counter is not None
 
         assert counter.update([210, 211, 65, 212, 213], finished=True) == 1
@@ -287,7 +290,7 @@ class TestReasoningTokenUsage:
             (EventType.REASONING_END, EventType.TOOL_CALL_START),
         )
         engine = _make_engine(config)
-        counter = engine.create_reasoning_token_counter([])
+        counter = engine._create_reasoning_token_counter([])
         assert counter is not None
 
         assert counter.update([65, 202, 66], finished=True) == 1

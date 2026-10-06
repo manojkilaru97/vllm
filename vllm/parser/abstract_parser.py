@@ -37,10 +37,8 @@ from vllm.logger import init_logger
 from vllm.parser.engine.adapters import ParserEngineToolAdapter
 from vllm.parser.metrics import record_tool_parser_invocation
 from vllm.parser.utils import count_history_tool_calls
-from vllm.reasoning.abs_reasoning_parsers import (
-    ReasoningParser,
-    ReasoningTokenCounter,
-)
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.renderers.chat_utils import (
     get_tool_call_id_type,
     make_tool_call_id,

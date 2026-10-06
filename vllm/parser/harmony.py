@@ -41,8 +41,8 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.parser.abstract_parser import DelegatingParser, structured_outputs_to_format
-from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.renderers.chat_utils import make_tool_call_id
 from vllm.tool_parsers.gptoss_tool_parser import GptOssToolParser
 from vllm.tool_parsers.structural_tag_registry import (

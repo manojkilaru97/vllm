@@ -38,7 +38,6 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseChoice,
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
-    ChatCompletionUsageInfo,
     ChatMessage,
 )
 from vllm.entrypoints.openai.chat_completion.stream_processor import (
@@ -49,6 +48,7 @@ from vllm.entrypoints.serve.engine.protocol import (
     CompletionTokenUsageInfo,
     ErrorResponse,
     PromptTokenUsageInfo,
+    UsageInfo,
 )
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
@@ -62,7 +62,7 @@ from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
-from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.renderers.chat_utils import (
     ChatTemplateContentFormatOption,
     ConversationMessage,
@@ -121,6 +121,16 @@ def _make_completion_tokens_details(
     return CompletionTokenUsageInfo(reasoning_tokens=reasoning_tokens)
 
 
+def _create_reasoning_token_counter(
+    parser: Parser, prompt_token_ids: GenericSequence[int] | None
+) -> ReasoningTokenCounter | None:
+    # None (or a non-counter from a duck-typed parser) falls back to the
+    # parser's native count_reasoning_tokens recount.
+    factory = getattr(parser, "create_reasoning_token_counter", None)
+    counter = factory(prompt_token_ids) if factory is not None else None
+    return counter if isinstance(counter, ReasoningTokenCounter) else None
+
+
 class OpenAIServingChat(GenerateBaseServing):
     def __init__(
         self,
@@ -163,6 +173,7 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_log_deltas = enable_log_deltas
 
         self.enable_auto_tools: bool = enable_auto_tools
+        self._include_reasoning_tokens_details = True
         self.parser_cls = ParserManager.get_parser(
             tool_parser_name=tool_parser,
             reasoning_parser_name=reasoning_parser,
@@ -525,6 +536,8 @@ class OpenAIServingChat(GenerateBaseServing):
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
+        # TODO: Remove once all reasoning parsers use the Parser Engine.
+        generated_token_ids: list[list[int]] = [[] for _ in range(num_choices)]
         previous_reasoning_tokens = [0] * num_choices
         reasoning_token_counters: list[ReasoningTokenCounter | None] = [
             None
@@ -571,6 +584,7 @@ class OpenAIServingChat(GenerateBaseServing):
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
+
         last_res: RequestOutput | None = None
         try:
             async for res in result_generator:
@@ -623,12 +637,14 @@ class OpenAIServingChat(GenerateBaseServing):
 
                         # if continuous usage stats are requested, add it
                         if include_continuous_usage:
-                            chunk.usage = ChatCompletionUsageInfo(
+                            chunk.usage = UsageInfo(
                                 prompt_tokens=num_prompt_tokens,
                                 completion_tokens=0,
                                 total_tokens=num_prompt_tokens,
-                                completion_tokens_details=_make_completion_tokens_details(
-                                    0
+                                completion_tokens_details=(
+                                    _make_completion_tokens_details(0)
+                                    if self._include_reasoning_tokens_details
+                                    else None
                                 ),
                             )
 
@@ -661,12 +677,14 @@ class OpenAIServingChat(GenerateBaseServing):
                                     model=model_name,
                                 )
                                 if include_continuous_usage:
-                                    chunk.usage = ChatCompletionUsageInfo(
+                                    chunk.usage = UsageInfo(
                                         prompt_tokens=num_prompt_tokens,
                                         completion_tokens=0,
                                         total_tokens=num_prompt_tokens,
-                                        completion_tokens_details=_make_completion_tokens_details(
-                                            0
+                                        completion_tokens_details=(
+                                            _make_completion_tokens_details(0)
+                                            if self._include_reasoning_tokens_details
+                                            else None
                                         ),
                                     )
 
@@ -715,24 +733,27 @@ class OpenAIServingChat(GenerateBaseServing):
 
                     previous_texts[i] += delta_text
 
-                    if (
-                        include_usage
-                        and parser is not None
-                        and not reasoning_token_counters_initialized[i]
-                    ):
-                        reasoning_token_counters[i] = (
-                            parser.create_reasoning_token_counter(res.prompt_token_ids)
-                        )
-                        reasoning_token_counters_initialized[i] = True
-                    if (
-                        include_usage
-                        and parser is not None
-                        and (counter := reasoning_token_counters[i]) is not None
-                    ):
-                        previous_reasoning_tokens[i] = counter.update(
-                            as_list(output.token_ids),
-                            finished=output.finish_reason is not None,
-                        )
+                    if parser is not None and self._include_reasoning_tokens_details:
+                        if not reasoning_token_counters_initialized[i]:
+                            reasoning_token_counters[i] = (
+                                _create_reasoning_token_counter(
+                                    parser, res.prompt_token_ids
+                                )
+                            )
+                            reasoning_token_counters_initialized[i] = True
+                        if (counter := reasoning_token_counters[i]) is not None:
+                            previous_reasoning_tokens[i] = counter.update(
+                                as_list(output.token_ids),
+                                finished=output.finish_reason is not None,
+                            )
+                        else:
+                            generated_token_ids[i].extend(output.token_ids)
+                            if include_continuous_usage:
+                                previous_reasoning_tokens[i] = (
+                                    parser.count_reasoning_tokens(
+                                        tuple(generated_token_ids[i])
+                                    )
+                                )
 
                     # if the message delta is None (e.g. because it was a
                     # "control token" for tool calls or the parser otherwise
@@ -842,29 +863,44 @@ class OpenAIServingChat(GenerateBaseServing):
 
                     # handle usage stats if requested & if continuous
                     if include_continuous_usage:
+                        # Continuous usage is cumulative across all choices.
                         completion_tokens = sum(p.num_output_tokens for p in processors)
-                        chunk.usage = ChatCompletionUsageInfo(
+                        chunk.usage = UsageInfo(
                             prompt_tokens=num_prompt_tokens,
                             completion_tokens=completion_tokens,
-                            completion_tokens_details=_make_completion_tokens_details(
-                                sum(previous_reasoning_tokens)
-                            ),
                             total_tokens=num_prompt_tokens + completion_tokens,
+                            completion_tokens_details=(
+                                _make_completion_tokens_details(
+                                    sum(previous_reasoning_tokens)
+                                )
+                                if self._include_reasoning_tokens_details
+                                else None
+                            ),
                         )
 
                     yield chunk
+
+            if self._include_reasoning_tokens_details and not include_continuous_usage:
+                for i, processor in enumerate(processors):
+                    parser = processor.parser
+                    if parser is not None and generated_token_ids[i]:
+                        previous_reasoning_tokens[i] = parser.count_reasoning_tokens(
+                            tuple(generated_token_ids[i])
+                        )
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
             if include_usage:
                 completion_tokens = sum(p.num_output_tokens for p in processors)
-                final_usage = ChatCompletionUsageInfo(
+                final_usage = UsageInfo(
                     prompt_tokens=num_prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
                     completion_tokens_details=_make_completion_tokens_details(
                         sum(previous_reasoning_tokens)
-                    ),
+                    )
+                    if self._include_reasoning_tokens_details
+                    else None,
                 )
                 final_usage.prompt_tokens_details = _make_prompt_tokens_details(
                     self.enable_prompt_tokens_details,
@@ -907,13 +943,15 @@ class OpenAIServingChat(GenerateBaseServing):
 
             # report to FastAPI middleware aggregate usage across all choices
             num_completion_tokens = sum(p.num_output_tokens for p in processors)
-            request_metadata.final_usage_info = ChatCompletionUsageInfo(
+            request_metadata.final_usage_info = UsageInfo(
                 prompt_tokens=num_prompt_tokens,
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
                 completion_tokens_details=_make_completion_tokens_details(
                     sum(previous_reasoning_tokens)
-                ),
+                )
+                if self._include_reasoning_tokens_details
+                else None,
             )
 
             # Log complete streaming response if output logging is enabled
@@ -972,7 +1010,7 @@ class OpenAIServingChat(GenerateBaseServing):
             )
 
         choices: list[ChatCompletionResponseChoice] = []
-        num_reasoning_tokens = 0
+        total_reasoning_tokens = 0
 
         role = self.get_chat_request_role(request)
         for i, output in enumerate(final_res.outputs):
@@ -1009,13 +1047,15 @@ class OpenAIServingChat(GenerateBaseServing):
                     enable_auto_tools=self.enable_auto_tools,
                     model_output_token_ids=token_ids,
                 )
+                suppress_metadata = not request.include_reasoning and parser is not None
                 if (
-                    counter := parser.create_reasoning_token_counter(
-                        final_res.prompt_token_ids
+                    counter := _create_reasoning_token_counter(
+                        parser, final_res.prompt_token_ids
                     )
                 ) is not None:
-                    num_reasoning_tokens += counter.update(token_ids, finished=True)
-                suppress_metadata = not request.include_reasoning and parser is not None
+                    total_reasoning_tokens += counter.update(token_ids, finished=True)
+                else:
+                    total_reasoning_tokens += parser.count_reasoning_tokens(token_ids)
                 if suppress_metadata:
                     logprobs = None
             else:
@@ -1095,13 +1135,15 @@ class OpenAIServingChat(GenerateBaseServing):
         num_generated_tokens = sum(
             len(output.token_ids) for output in final_res.outputs
         )
-        usage = ChatCompletionUsageInfo(
+        usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
             completion_tokens_details=_make_completion_tokens_details(
-                num_reasoning_tokens
-            ),
+                total_reasoning_tokens
+            )
+            if self._include_reasoning_tokens_details
+            else None,
         )
         usage.prompt_tokens_details = _make_prompt_tokens_details(
             self.enable_prompt_tokens_details,

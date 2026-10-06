@@ -7,10 +7,8 @@ from itertools import islice
 from typing import TYPE_CHECKING
 
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
-from vllm.reasoning.abs_reasoning_parsers import (
-    ReasoningParser,
-    ReasoningTokenCounter,
-)
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.tokenizers import TokenizerLike
 
 if TYPE_CHECKING:
@@ -197,6 +195,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
             if depth > 0:
                 count += 1
         return count
+
+    def is_reasoning_end_for_usage(self, input_ids: Sequence[int]) -> bool:
+        return BaseThinkingReasoningParser.is_reasoning_end(self, input_ids)
 
     def create_reasoning_token_counter(
         self, prompt_token_ids: Sequence[int] | None

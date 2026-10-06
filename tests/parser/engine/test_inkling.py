@@ -354,7 +354,9 @@ class TestStreaming:
         reasoning_counter = parser.create_reasoning_token_counter(
             [_TML_VOCAB[THINK_START]]
         )
-        content_counter = parser.create_reasoning_token_counter(
+        # A content tail matches the default state, so native accounting is used.
+        assert parser.create_reasoning_token_counter([_TML_VOCAB[TEXT_START]]) is None
+        content_counter = parser._create_reasoning_token_counter(
             [_TML_VOCAB[TEXT_START]]
         )
 

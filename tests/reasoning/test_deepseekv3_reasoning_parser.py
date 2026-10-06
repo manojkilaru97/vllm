@@ -43,7 +43,9 @@ def test_responses_reasoning_count_remains_unchanged(tokenizer):
     )
     token_ids = tokenizer.encode("<think>reasoning</think>answer")
 
-    assert parser.count_reasoning_tokens(token_ids) == 0
+    # v0.33 delegates Responses counting to the R1 parser; counters must not alter it.
+    expected = DeepSeekR1ReasoningParser(tokenizer).count_reasoning_tokens(token_ids)
+    assert parser.count_reasoning_tokens(token_ids) == expected
 
 
 class _PoolsideTokenizer:

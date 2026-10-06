@@ -793,7 +793,9 @@ class TestThinkingDisabled:
             mock_tokenizer,
             chat_template_kwargs={"enable_thinking": False},
         )
-        counter = p.create_reasoning_token_counter(None)
+        # Default state uses native event accounting; check the counter itself.
+        assert p.create_reasoning_token_counter(None) is None
+        counter = p._create_reasoning_token_counter(None)
         assert counter is not None
 
         assert counter.update([_THINK_START_ID, _TEXT_ID], finished=True) == 0
@@ -803,7 +805,9 @@ class TestThinkingDisabled:
             mock_tokenizer,
             chat_template_kwargs={"enable_thinking": True},
         )
-        counter = p.create_reasoning_token_counter(None)
+        # Default state uses native event accounting; check the counter itself.
+        assert p.create_reasoning_token_counter(None) is None
+        counter = p._create_reasoning_token_counter(None)
         assert counter is not None
 
         assert (
@@ -819,7 +823,9 @@ class TestThinkingDisabled:
             mock_tokenizer,
             chat_template_kwargs={"enable_thinking": True},
         )
-        counter = p.create_reasoning_token_counter(None)
+        # Default state uses native event accounting; check the counter itself.
+        assert p.create_reasoning_token_counter(None) is None
+        counter = p._create_reasoning_token_counter(None)
         assert counter is not None
 
         assert (

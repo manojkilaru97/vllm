@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.logger import init_logger
-from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.tokenizers import TokenizerLike
 
 if TYPE_CHECKING:

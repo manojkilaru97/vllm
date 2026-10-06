@@ -15,10 +15,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from vllm.parser.engine.parser_engine_config import ParserState
-from vllm.reasoning.abs_reasoning_parsers import (
-    ReasoningParser,
-    ReasoningTokenCounter,
-)
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
 if TYPE_CHECKING:
@@ -164,10 +162,23 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         )
         return self._counting_parser_engine.count_reasoning_tokens(token_ids)
 
+    def is_reasoning_end_for_usage(self, input_ids: Sequence[int]) -> bool:
+        engine = self._parser_engine
+        for token_id in reversed(input_ids):
+            if token_id in engine.reasoning_end_token_ids:
+                return True
+            if token_id == engine._reasoning_start_token_id:
+                return False
+            if token_id in engine._turn_boundary_token_ids:
+                break
+        return False
+
     def create_reasoning_token_counter(
         self, prompt_token_ids: Sequence[int] | None
     ) -> ReasoningTokenCounter | None:
-        return self._parser_engine.create_reasoning_token_counter(prompt_token_ids)
+        # Delegating (legacy) parsers always get a prompt-aware counter here;
+        # only engine-native parsers fall back to event accounting.
+        return self._parser_engine._create_reasoning_token_counter(prompt_token_ids)
 
 
 class ParserEngineToolAdapter(ToolParser):

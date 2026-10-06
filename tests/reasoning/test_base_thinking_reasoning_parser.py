@@ -6,8 +6,8 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from tests.reasoning.utils import run_reasoning_extraction
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-from vllm.reasoning.abs_reasoning_parsers import ReasoningTokenCounter
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
+from vllm.reasoning.token_counter import ReasoningTokenCounter
 
 
 # Create a concrete test implementation of BaseThinkingReasoningParser
