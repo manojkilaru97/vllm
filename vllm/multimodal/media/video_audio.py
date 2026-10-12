@@ -24,7 +24,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_MAX_EBML_DEPTH = 8
+_MAX_BOX_DEPTH = 8
 
 
 class UnsupportedVideoAudioError(ValueError):
@@ -67,15 +67,17 @@ def _iter_mp4_boxes(data: bytes, start: int, end: int):
 
 
 def _mp4_audio_track(data: bytes) -> _AudioTrack | None:
-    def walk(start: int, end: int, track: dict[str, bytes]):
+    def walk(start: int, end: int, track: dict[str, bytes], depth: int = 0):
+        if depth > _MAX_BOX_DEPTH:
+            raise ValueError("MP4 boxes are nested too deeply")
         for box_type, body, box_end in _iter_mp4_boxes(data, start, end):
             if box_type == b"trak":
                 inner: dict[str, bytes] = {}
-                walk(body, box_end, inner)
+                walk(body, box_end, inner, depth + 1)
                 if inner.get("handler") == b"soun":
                     return inner.get("codec", b"????")
             elif box_type in _MP4_CONTAINER_BOXES:
-                found = walk(body, box_end, track)
+                found = walk(body, box_end, track, depth + 1)
                 if found is not None:
                     return found
             elif box_type == b"hdlr" and body + 12 <= box_end:
@@ -112,16 +114,19 @@ _CLUSTER = 0x1F43B675
 _SIMPLE_BLOCK = 0xA3
 _BLOCK_GROUP = 0xA0
 _BLOCK = 0xA1
-_SEGMENT_CHILDREN = {
-    0x114D9B74,  # SeekHead
-    0x1549A966,  # Info
-    _TRACKS,
-    _CLUSTER,
-    0x1C53BB6B,  # Cues
-    0x1941A469,  # Attachments
-    0x1043A770,  # Chapters
-    0x1254C367,  # Tags
-}
+_DISCARD_PADDING = 0x75A2
+_SEGMENT_CHILDREN = frozenset(
+    {
+        0x114D9B74,  # SeekHead
+        0x1549A966,  # Info
+        _TRACKS,
+        _CLUSTER,
+        0x1C53BB6B,  # Cues
+        0x1941A469,  # Attachments
+        0x1043A770,  # Chapters
+        0x1254C367,  # Tags
+    }
+)
 
 
 def _read_vint(data: bytes, offset: int, keep_marker: bool) -> tuple[int, int, bool]:
@@ -172,9 +177,34 @@ def _ebml_float(data: bytes, start: int, end: int) -> float:
     return 0.0
 
 
+def _segment_children(data: bytes, start: int, end: int):
+    """Yield ``(id, body, end)`` for each Segment child.
+
+    An unknown-size child (a live/streamed Cluster) ends where the next
+    Segment-level element starts, so later Tracks/Clusters stay reachable.
+    """
+    offset = start
+    while offset < end:
+        element_id, id_len, _ = _read_vint(data, offset, keep_marker=True)
+        size, size_len, unknown = _read_vint(data, offset + id_len, keep_marker=False)
+        body = offset + id_len + size_len
+        if unknown:
+            element_end = body
+            for _, _, child_end, _ in _iter_ebml(
+                data, body, end, stop_ids=_SEGMENT_CHILDREN
+            ):
+                element_end = child_end
+        else:
+            element_end = min(body + size, end)
+        yield element_id, body, element_end
+        if element_end <= offset:
+            return
+        offset = element_end
+
+
 def _matroska_audio_track(data: bytes, segment: tuple[int, int]) -> _AudioTrack | None:
     seg_start, seg_end = segment
-    for element_id, body, end, _ in _iter_ebml(data, seg_start, seg_end):
+    for element_id, body, end in _segment_children(data, seg_start, seg_end):
         if element_id != _TRACKS:
             continue
         for entry_id, entry, entry_end, _ in _iter_ebml(data, body, end):
@@ -271,49 +301,40 @@ def _split_laced_frames(payload: bytes, lacing: int) -> list[bytes]:
 
 def _matroska_track_packets(
     data: bytes, segment: tuple[int, int], track_number: int
-) -> list[bytes]:
+) -> tuple[list[bytes], int]:
+    """Return the track's packets and the trailing ``DiscardPadding`` (ns)."""
     packets: list[bytes] = []
+    trailing_discard_ns = 0
 
-    def block_packets(body: int, end: int) -> None:
+    def block_packets(body: int, end: int) -> bool:
         number, length, _ = _read_vint(data, body, keep_marker=False)
         if number != track_number:
-            return
+            return False
         header = body + length
         flags = data[header + 2]
         packets.extend(_split_laced_frames(data[header + 3 : end], (flags >> 1) & 3))
+        return True
 
     seg_start, seg_end = segment
-    offset = seg_start
-    while offset < seg_end:
-        element_id, id_len, _ = _read_vint(data, offset, keep_marker=True)
-        size, size_len, unknown = _read_vint(data, offset + id_len, keep_marker=False)
-        body = offset + id_len + size_len
-        end = seg_end if unknown else min(body + size, seg_end)
+    for element_id, body, end in _segment_children(data, seg_start, seg_end):
         if element_id != _CLUSTER:
-            if unknown:
-                break
-            offset = end
             continue
-        cursor = body
-        for child_id, cbody, cend, cunknown in _iter_ebml(
-            data,
-            body,
-            end,
-            stop_ids=frozenset(_SEGMENT_CHILDREN) if unknown else frozenset(),
-        ):
-            cursor = cend
+        for child_id, cbody, cend, _ in _iter_ebml(data, body, end):
             if child_id == _SIMPLE_BLOCK:
-                block_packets(cbody, cend)
+                if block_packets(cbody, cend):
+                    trailing_discard_ns = 0
             elif child_id == _BLOCK_GROUP:
+                ours, discard_ns = False, 0
                 for gid, gbody, gend, _ in _iter_ebml(data, cbody, cend):
                     if gid == _BLOCK:
-                        block_packets(gbody, gend)
-            if cunknown:
-                break
-        offset = cursor if unknown else end
-        if unknown and cursor >= seg_end:
-            break
-    return packets
+                        ours = block_packets(gbody, gend)
+                    elif gid == _DISCARD_PADDING and gend > gbody:
+                        discard_ns = int.from_bytes(
+                            data[gbody:gend], "big", signed=True
+                        )
+                if ours:
+                    trailing_discard_ns = max(discard_ns, 0)
+    return packets, trailing_discard_ns
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +411,9 @@ def _opus_head(track: _AudioTrack) -> bytes:
     return struct.pack("<8sBBHIhB", b"OpusHead", 1, channels, 312, rate, 0, 0)
 
 
-def _ogg_opus_from_packets(track: _AudioTrack, packets: list[bytes]) -> bytes:
+def _ogg_opus_from_packets(
+    track: _AudioTrack, packets: list[bytes], trailing_discard_ns: int = 0
+) -> bytes:
     vendor = b"vllm"
     tags = b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)
     pages = [
@@ -401,6 +424,12 @@ def _ogg_opus_from_packets(track: _AudioTrack, packets: list[bytes]) -> bytes:
     for index, packet in enumerate(packets):
         granule += _opus_packet_samples(packet)
         last = index == len(packets) - 1
+        if last and trailing_discard_ns:
+            # RFC 7845 section 4.4: end trimming via a short final granule.
+            granule -= min(
+                round(trailing_discard_ns * 48000 / 1_000_000_000),
+                _opus_packet_samples(packet),
+            )
         pages.append(
             _ogg_page(
                 packet,
@@ -440,7 +469,7 @@ def _decode_with_soundfile(
 def _is_iso_bmff(data: bytes) -> bool:
     return any(
         box_type in (b"ftyp", b"moov")
-        for box_type, _, _ in _iter_mp4_boxes(data, 0, min(len(data), 1 << 20))
+        for box_type, _, _ in _iter_mp4_boxes(data, 0, len(data))
     )
 
 
@@ -484,19 +513,23 @@ def load_video_audio_without_pyav(
             "the video frames only."
         )
         return None
-    except (ValueError, IndexError, struct.error) as exc:
+    except Exception as exc:
         raise UnsupportedVideoAudioError(
             f"Cannot parse the video container to find its audio track: {exc}"
         ) from exc
     if track is None:
         return None
-    if track.container == "matroska" and track.codec == "opus":
-        assert track.number is not None
-        try:
-            packets = _matroska_track_packets(
-                data, _matroska_segment(data), track.number
+    segment = _matroska_segment(data) if track.container == "matroska" else None
+    if segment is not None and track.codec == "opus":
+        if track.number is None:
+            raise UnsupportedVideoAudioError(
+                "The video's Opus audio track has no TrackNumber."
             )
-        except (ValueError, IndexError, struct.error) as exc:
+        try:
+            packets, trailing_discard_ns = _matroska_track_packets(
+                data, segment, track.number
+            )
+        except Exception as exc:
             raise UnsupportedVideoAudioError(
                 f"Cannot read the Opus audio track of the video: {exc}"
             ) from exc
@@ -504,7 +537,8 @@ def load_video_audio_without_pyav(
             return None
         try:
             return _decode_with_soundfile(
-                _ogg_opus_from_packets(track, packets), max_duration_s
+                _ogg_opus_from_packets(track, packets, trailing_discard_ns),
+                max_duration_s,
             )
         except ValueError:
             raise

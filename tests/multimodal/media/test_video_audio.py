@@ -13,8 +13,12 @@ import pytest
 
 from vllm.multimodal.media.video_audio import (
     UnsupportedVideoAudioError,
+    _iter_mp4_boxes,
+    _matroska_segment,
     _ogg_crc,
     _opus_packet_samples,
+    _segment_children,
+    find_video_audio_track,
     load_video_audio_without_pyav,
 )
 
@@ -40,7 +44,8 @@ def test_webm_opus_track_is_decoded(name):
     assert result is not None
     audio, sample_rate = result
     assert audio.dtype == np.float32 and audio.ndim == 1
-    assert 0.9 <= len(audio) / sample_rate <= 1.1
+    # DiscardPadding end trimming (RFC 7845 section 4.4) keeps the exact length.
+    assert abs(len(audio) / sample_rate - 1.0) < 0.005
     assert abs(_dominant_hz(audio, sample_rate) - 440) < 10
 
 
@@ -161,3 +166,54 @@ def test_nemotron_data_parser_only_changes_for_audio_models(monkeypatch, pyav):
     omni = get_parser(info(SimpleNamespace(sampling_rate=16000)))
     assert omni.audio_resampler.target_sr == 16000
     assert omni.audio_resampler.method == ("pyav" if pyav else "scipy")
+
+
+def test_tracks_after_an_unknown_size_cluster_are_found():
+    """Matroska allows Tracks after the first Cluster (referenced by SeekHead)."""
+    pytest.importorskip("soundfile")
+    data = _read("tone_opus_live.webm")
+    seg_start, seg_end = _matroska_segment(data)
+    children, offset = [], seg_start
+    for element_id, _, end in _segment_children(data, seg_start, seg_end):
+        children.append((element_id, data[offset:end]))
+        offset = end
+    ids = [element_id for element_id, _ in children]
+    tracks = ids.index(0x1654AE6B)
+    first_cluster = ids.index(0x1F43B675)
+    assert tracks < first_cluster
+    reordered = children[:tracks] + children[tracks + 1 : first_cluster + 1]
+    reordered += [children[tracks]] + children[first_cluster + 1 :]
+    moved = data[:seg_start] + b"".join(body for _, body in reordered)
+
+    assert find_video_audio_track(moved).codec == "opus"
+    assert load_video_audio_without_pyav(moved) is not None
+
+
+def test_mov_without_ftyp_and_large_leading_mdat_is_still_probed():
+    data = _read("tone_aac.mp4")
+    boxes = [
+        data[body - 8 : end]
+        for box_type, body, end in _iter_mp4_boxes(data, 0, len(data))
+        if box_type != b"ftyp"
+    ]
+    filler = (8 + (2 << 20)).to_bytes(4, "big") + b"mdat" + bytes(2 << 20)
+    with pytest.raises(UnsupportedVideoAudioError, match="'aac'"):
+        load_video_audio_without_pyav(filler + b"".join(boxes))
+
+
+def test_deeply_nested_mp4_boxes_are_a_client_error():
+    nested = b""
+    for _ in range(2000):
+        nested = (8 + len(nested)).to_bytes(4, "big") + b"moov" + nested
+    ftyp = (16).to_bytes(4, "big") + b"ftypisom" + bytes(4)
+    with pytest.raises(UnsupportedVideoAudioError):
+        load_video_audio_without_pyav(ftyp + nested)
+
+
+def test_opus_track_without_track_number_is_a_client_error():
+    data = _read("tone_opus.webm")
+    track_number = bytes([0xD7, 0x81, 0x02])  # TrackNumber 2 (the Opus track)
+    assert data.count(track_number) == 1
+    patched = data.replace(track_number, bytes([0xEC, 0x81, 0x00]))  # EBML Void
+    with pytest.raises(UnsupportedVideoAudioError, match="TrackNumber"):
+        load_video_audio_without_pyav(patched)
