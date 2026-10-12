@@ -301,7 +301,11 @@ def test_extract_audio_from_videos_passes_max_duration():
     )
 
     target = "vllm.model_executor.models.nano_nemotron_vl.load_audio_pyav"
-    with patch(target, return_value=dummy_audio) as mock_load:
+    pyav = "vllm.model_executor.models.nano_nemotron_vl._pyav_available"
+    with (
+        patch(pyav, return_value=True),
+        patch(target, return_value=dummy_audio) as mock_load,
+    ):
         processor._extract_audio_from_videos(mm_items)
 
     mock_load.assert_called_once()
@@ -317,9 +321,13 @@ def test_extract_audio_from_videos_rejects_oversized_audio():
     processor = object.__new__(NanoNemotronVLMultiModalProcessor)
 
     target = "vllm.model_executor.models.nano_nemotron_vl.load_audio_pyav"
-    with patch(
-        target,
-        side_effect=ValueError("Audio exceeds maximum allowed duration"),
+    pyav = "vllm.model_executor.models.nano_nemotron_vl._pyav_available"
+    with (
+        patch(pyav, return_value=True),
+        patch(
+            target,
+            side_effect=ValueError("Audio exceeds maximum allowed duration"),
+        ),
     ):
         _, audio_items, has_audio = processor._extract_audio_from_videos(mm_items)
 
