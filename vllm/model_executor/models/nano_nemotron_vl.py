@@ -96,6 +96,40 @@ from .utils import _merge_multimodal_embeddings
 
 logger = init_logger(__name__)
 
+
+def _pyav_available() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("av") is not None
+
+
+def _load_audio_from_video_bytes(video_bytes: bytes, idx: int) -> AudioItem | None:
+    """Decode a video's audio track; ``None`` when it has no audio stream.
+
+    With PyAV installed this is the original ``load_audio_pyav`` path. Without
+    it (codec-restricted images), the track is located and decoded through
+    libsndfile; an audio track that cannot be decoded raises instead of being
+    silently dropped.
+    """
+    if _pyav_available():
+        try:
+            return load_audio_pyav(BytesIO(video_bytes))
+        except Exception:
+            logger.debug(
+                "Video %d: no audio stream found, skipping audio extraction.",
+                idx,
+                exc_info=True,
+            )
+            return None
+
+    import vllm.envs as envs
+    from vllm.multimodal.media.video_audio import load_video_audio_without_pyav
+
+    return load_video_audio_without_pyav(
+        video_bytes, max_duration_s=envs.VLLM_MAX_AUDIO_DECODE_DURATION_S
+    )
+
+
 MAX_AUDIO_LEN_S = 10 * 60  # 10 minutes
 
 _VISION_FINAL_NORM_PREFIX = "vision_projector.vision_final_layernorm."
@@ -315,6 +349,16 @@ class NanoNemotronVLProcessingInfo(BaseProcessingInfo):
         if self.sound_config:
             target_sr = self.sound_config.sampling_rate
             target_channels = 1
+
+        if self.sound_config and not _pyav_available():
+            # PyAV-less images: resample audio with SciPy instead of libswresample.
+            return MultiModalDataParser(
+                video_needs_metadata=True,
+                target_sr=target_sr,
+                target_channels=target_channels,
+                expected_hidden_size=self._get_expected_hidden_size(),
+                audio_resample_method="scipy",
+            )
 
         return MultiModalDataParser(
             video_needs_metadata=True,
@@ -696,16 +740,12 @@ class NanoNemotronVLMultiModalProcessor(
                     "video must be loaded with keep_video_bytes=True (e.g. via "
                     "the chat API with a model that sets use_audio_in_video)."
                 )
-            try:
-                audio_items.append(load_audio_pyav(BytesIO(video_bytes)))
-                has_audio.append(True)
-            except Exception:
-                logger.debug(
-                    "Video %d: no audio stream found, skipping audio extraction.",
-                    idx,
-                    exc_info=True,
-                )
+            audio = _load_audio_from_video_bytes(video_bytes, idx)
+            if audio is None:
                 has_audio.append(False)
+            else:
+                audio_items.append(audio)
+                has_audio.append(True)
 
         # Create a new VideoProcessorItems with metadata that does not contain
         # the large video bytes, to avoid modifying the input `mm_items`.
