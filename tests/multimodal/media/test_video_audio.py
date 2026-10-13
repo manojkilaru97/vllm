@@ -3,13 +3,15 @@
 """PyAV-free audio-in-video extraction (Nemotron Omni ``use_audio_in_video``).
 
 Fixtures are 1 s, 32x32 clips: a 440 Hz tone muxed as Opus in WebM (seekable
-and live/unknown-size), as AAC in MP4, as Vorbis in WebM, as MP3 in Matroska,
-and silent MP4/WebM. Tests use no audio-decoder CLI unless they request the
-``audio_cli`` fixture (``NV_TEST_OMNI_AUDIO_FFMPEG``).
+and live/unknown-size), as AAC in MP4, as Vorbis in WebM, as MP3 in Matroska
+(also with a 1000 s timestamp jump), and silent MP4/WebM. Tests use no
+audio-decoder CLI unless they request the ``audio_cli`` fixture
+(``NV_TEST_OMNI_AUDIO_FFMPEG``).
 """
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -392,7 +394,9 @@ def _cli_load(name_or_data, **kwargs):
     return load_video_audio_without_pyav(data, decoder_cli=True, **kwargs)
 
 
-@pytest.mark.parametrize("name", ["tone_aac.mp4", "tone_vorbis.webm", "tone_mp3.mkv"])
+@pytest.mark.parametrize(
+    "name", ["tone_aac.mp4", "tone_vorbis.webm", "tone_mp3.mkv", "tone_mp3_tsjump.mkv"]
+)
 def test_non_opus_tracks_are_decoded_by_the_audio_cli(audio_cli, name):
     result = _cli_load(name, max_duration_s=600)
 
@@ -445,15 +449,40 @@ def test_audio_cli_is_not_used_for_silent_or_opus_videos(audio_cli, name):
 
 
 def test_audio_cli_retries_opus_tracks_libsndfile_cannot_decode(audio_cli, monkeypatch):
-    import vllm.multimodal.media.video_audio as video_audio
+    import vllm.multimodal.media.video_audio_cli as video_audio_cli
 
-    def unsupported(*args):
+    def unsupported(*args, **kwargs):
         raise UnsupportedVideoAudioError("interior DiscardPadding")
 
-    monkeypatch.setattr(video_audio, "_decode_matroska_opus", unsupported)
+    monkeypatch.setattr(video_audio_cli, "load_video_audio_without_pyav", unsupported)
     audio, sample_rate = _cli_load("tone_opus.webm", max_duration_s=600)
     assert abs(_dominant_hz(audio, sample_rate) - 440) < 10
     assert len(audio_cli) == 1
+
+
+_SUPER_PATH_PROBE = """
+import sys
+from pathlib import Path
+from vllm.multimodal.media.video_audio import (
+    UnsupportedVideoAudioError,
+    load_video_audio_without_pyav,
+)
+assets = Path(sys.argv[1])
+assert load_video_audio_without_pyav((assets / "silent.mp4").read_bytes()) is None
+try:
+    load_video_audio_without_pyav((assets / "tone_aac.mp4").read_bytes())
+except UnsupportedVideoAudioError:
+    pass
+assert "vllm.multimodal.media.video_audio_cli" not in sys.modules
+"""
+
+
+def test_super_requests_never_import_the_cli_module():
+    """decoder_cli=False (models without sound_config) is the pre-CLI module path."""
+    env = {**os.environ, "NV_OMNI_AUDIO_FFMPEG": "/bin/false"}
+    subprocess.run(
+        [sys.executable, "-c", _SUPER_PATH_PROBE, str(ASSETS)], check=True, env=env
+    )
 
 
 def test_audio_cli_decoder_failures_are_client_errors_without_paths(audio_cli):
@@ -476,6 +505,20 @@ def test_audio_cli_rejects_corrupt_packets_instead_of_dropping_narration(audio_c
     data[middle : middle + 40] = bytes(40)
     with pytest.raises(UnsupportedVideoAudioError, match="decoder"):
         _cli_load(bytes(data))
+
+
+@pytest.mark.parametrize("name", ["tone_mp3.mkv", "tone_vorbis.webm"])
+def test_audio_cli_rejects_truncated_tracks_instead_of_dropping_narration(
+    audio_cli, name
+):
+    data = _read(name)
+    with pytest.raises(UnsupportedVideoAudioError, match="ended prematurely"):
+        _cli_load(data[: int(len(data) * 0.8)])
+
+
+def test_encoder_priming_does_not_fail_a_clip_at_the_limit(audio_cli):
+    audio, sample_rate = _cli_load("tone_aac.mp4", max_duration_s=1)
+    assert len(audio) / sample_rate > 1.0  # AAC priming samples
 
 
 def test_audio_cli_output_obeys_the_duration_limit(audio_cli):
@@ -501,14 +544,15 @@ def test_audio_cli_output_is_bounded_despite_repeated_timestamps(audio_cli):
         + data[seg_start:seg_end]
         + b"".join(clusters) * 20
     )
-    with pytest.raises(ValueError, match="maximum allowed duration"):
+    # Rejected either by the sample bound or as a decode error; never buffered.
+    with pytest.raises(ValueError):
         _cli_load(forged, max_duration_s=1)
 
 
 def test_oversized_videos_are_rejected_before_staging(audio_cli, monkeypatch):
-    import vllm.multimodal.media.video_audio as video_audio
+    import vllm.multimodal.media.video_audio_cli as video_audio_cli
 
-    monkeypatch.setattr(video_audio, "_CLI_MAX_INPUT_BYTES", 1024)
+    monkeypatch.setattr(video_audio_cli, "_MAX_INPUT_BYTES", 1024)
     with pytest.raises(UnsupportedVideoAudioError, match="larger than"):
         _cli_load("tone_aac.mp4")
     assert audio_cli == []
