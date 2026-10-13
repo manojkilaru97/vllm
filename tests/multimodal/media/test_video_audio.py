@@ -5,7 +5,7 @@
 Fixtures are 1 s, 32x32 clips: a 440 Hz tone muxed as Opus in WebM (seekable
 and live/unknown-size), as AAC in MP4, as Vorbis in WebM, as MP3 in Matroska
 (also with a 1000 s timestamp jump and an 80 ms rewind), as PCM (ipcm) in MP4,
-and silent MP4/WebM.
+as AAC in an edit-list-trimmed MP4, and silent MP4/WebM.
 Tests use no audio-decoder CLI unless they request the ``audio_cli`` fixture
 (``NV_TEST_OMNI_AUDIO_FFMPEG``).
 """
@@ -631,16 +631,36 @@ def test_audio_cli_bounds_output_without_a_duration_limit(audio_cli):
     assert "atrim=end_sample=172848000" in command[command.index("-af") + 1]
 
 
-def test_audio_cli_ignores_crafted_mp4_sample_deltas(audio_cli):
-    """FFmpeg's advanced edit-list index would emit only a prefix of the track."""
+def test_audio_cli_honours_mp4_edit_list_trims(audio_cli):
+    audio, sample_rate = _cli_load("tone_aac_trim.mp4")  # -ss 0.25 -t 0.5 -c copy
+    assert 0.45 < len(audio) / sample_rate < 0.6
+
+
+@pytest.mark.parametrize(("delta", "accepted"), [(1088, True), (10240, False)])
+def test_audio_cli_rejects_sample_tables_that_truncate_the_track(
+    audio_cli, delta, accepted
+):
+    """A crafted stts delta can make the mov index emit only a prefix."""
     import struct
 
     data = _read("tone_aac.mp4")
     entry = struct.pack(">II", 16, 1024)
     assert data.count(entry) == 1
-    audio, sample_rate = _cli_load(data.replace(entry, struct.pack(">II", 16, 1088)))
-    assert len(audio) / sample_rate > 1.0
-    assert "-advanced_editlist" in audio_cli[0]
+    crafted = data.replace(entry, struct.pack(">II", 16, delta))
+    if accepted:
+        audio, sample_rate = _cli_load(crafted)
+        assert len(audio) / sample_rate > 0.9
+    else:
+        with pytest.raises(UnsupportedVideoAudioError, match="decoded to"):
+            _cli_load(crafted)
+
+
+def test_audio_cli_rejects_matroska_audio_entries_without_an_audio_codec_id(audio_cli):
+    data = _read("tone_mp3.mkv").replace(b"A_MPEG/L3", b"MPEG/L3\0\0")
+    assert find_video_audio_track(data).codec == "mpeg"
+    with pytest.raises(UnsupportedVideoAudioError, match="non-audio codec id"):
+        _cli_load(data)
+    assert audio_cli == []
 
 
 def test_encoder_priming_does_not_fail_a_clip_at_the_limit(audio_cli):
