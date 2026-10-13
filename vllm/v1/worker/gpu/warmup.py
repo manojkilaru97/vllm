@@ -26,6 +26,11 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
+from vllm.v1.sample.no_eos_in_reasoning import (
+    BLOCKED_IDS,
+    END_IDS,
+    NO_EOS_IN_REASONING_KEY,
+)
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
@@ -329,11 +334,16 @@ def _warmup_kernels(
         pooling_params = PoolingParams(task=pooling_task)
         pooling_params.verify(model_runner.model_config)
     else:
-        sampling_params = (
-            SamplingParams(temperature=0)
-            if greedy
-            else SamplingParams.for_sampler_warmup()
-        )
+        if greedy:
+            # Greedy pass must skip logits processing, so no flag here.
+            sampling_params = SamplingParams(temperature=0)
+        else:
+            sampling_params = SamplingParams.for_sampler_warmup()
+            # Compile the no-EOS-in-reasoning kernels (normalized form, as the
+            # worker reads it) so the first opted-in request does not stall.
+            sampling_params.extra_args = {
+                NO_EOS_IN_REASONING_KEY: {END_IDS: [3], BLOCKED_IDS: [4]}
+            }
         pooling_params = None
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.
