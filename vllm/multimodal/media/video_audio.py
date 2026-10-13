@@ -639,7 +639,9 @@ def load_video_audio_without_pyav(
                 f"Cannot read the Opus audio track of the video: {exc}"
             ) from exc
         if not blocks.packets:
-            return None
+            raise UnsupportedVideoAudioError(
+                "The video declares an Opus audio track but contains no audio data."
+            )
         try:
             return _decode_with_soundfile(
                 _ogg_opus_from_packets(track, blocks), max_duration_s

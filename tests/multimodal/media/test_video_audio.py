@@ -347,3 +347,15 @@ def test_every_rejection_names_the_visual_only_remedy():
         load_video_audio_without_pyav(_read("tone_opus.webm"), max_duration_s=0.1)
     for error in (padding, aac, duration):
         assert str(error.value).count('{"use_audio_in_video": false}') == 1
+
+
+def test_declared_opus_track_without_packets_is_rejected_not_dropped():
+    data = _read("tone_opus.webm")
+    seg_start, seg_end = _matroska_segment(data)
+    kept, offset = [], seg_start
+    for element_id, _, end in _segment_children(data, seg_start, seg_end):
+        if element_id != 0x1F43B675:  # drop every Cluster, keep Tracks
+            kept.append(data[offset:end])
+        offset = end
+    with pytest.raises(UnsupportedVideoAudioError, match="no audio data"):
+        load_video_audio_without_pyav(data[:seg_start] + b"".join(kept))
