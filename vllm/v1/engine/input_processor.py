@@ -34,7 +34,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.sample.no_eos_in_reasoning import (
     NO_EOS_IN_REASONING_KEY,
     normalize_no_eos_in_reasoning,
-    resolve_default_reasoning_end_token_ids,
+    resolve_default_token_ids,
 )
 
 logger = init_logger(__name__)
@@ -57,7 +57,7 @@ class InputProcessor:
         self.structured_outputs_config = vllm_config.structured_outputs_config
         self.observability_config = vllm_config.observability_config
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
-        self._default_reasoning_end_token_ids: list[int] | None = None
+        self._no_eos_default_token_ids: tuple[list[int], list[int]] | None = None
 
         self.generation_config_fields = model_config.try_get_generation_config()
 
@@ -151,22 +151,22 @@ class InputProcessor:
                 f"but got {type(params).__name__}"
             )
 
-    def _normalize_no_eos_in_reasoning(self, params: SamplingParams) -> None:
+    def normalize_no_eos_in_reasoning(self, params: SamplingParams) -> None:
+        """Validate and normalize the opt-in no-EOS-in-reasoning flag."""
         extra_args = params.extra_args
         if not extra_args or NO_EOS_IN_REASONING_KEY not in extra_args:
             return
-        default_end_token_ids = None
+        default_token_ids = None
         if extra_args[NO_EOS_IN_REASONING_KEY] is True and self.tokenizer is not None:
-            if self._default_reasoning_end_token_ids is None:
-                self._default_reasoning_end_token_ids = (
-                    resolve_default_reasoning_end_token_ids(self.tokenizer)
+            if self._no_eos_default_token_ids is None:
+                self._no_eos_default_token_ids = resolve_default_token_ids(
+                    self.tokenizer
                 )
-            default_end_token_ids = self._default_reasoning_end_token_ids
-        params.extra_args = normalize_no_eos_in_reasoning(
-            extra_args,
-            default_end_token_ids=default_end_token_ids,
+            default_token_ids = self._no_eos_default_token_ids
+        normalize_no_eos_in_reasoning(
+            params,
+            default_token_ids=default_token_ids,
             vocab_size=self.model_config.get_vocab_size(),
-            all_stop_token_ids=params.all_stop_token_ids,
             use_v2_model_runner=self.use_v2_model_runner,
         )
 
@@ -353,7 +353,7 @@ class InputProcessor:
             )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
-            self._normalize_no_eos_in_reasoning(sampling_params)
+            self.normalize_no_eos_in_reasoning(sampling_params)
         else:
             pooling_params = params.clone()
 

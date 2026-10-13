@@ -240,6 +240,10 @@ class LLMEngine:
             )
 
             request = prompt
+            if request.sampling_params is not None:
+                self.input_processor.normalize_no_eos_in_reasoning(
+                    request.sampling_params
+                )
             if request_id != request.request_id:
                 logger.warning_once(
                     "LLMEngine.add_request() was passed a request_id parameter that "

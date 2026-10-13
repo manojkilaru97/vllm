@@ -10,7 +10,11 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.no_eos_in_reasoning import NO_EOS_IN_REASONING_KEY
+from vllm.v1.sample.no_eos_in_reasoning import (
+    BLOCKED_IDS,
+    END_IDS,
+    NO_EOS_IN_REASONING_KEY,
+)
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.states import RequestState
@@ -20,13 +24,18 @@ pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA")
 VOCAB = 20_000
 EOS, IM_END, THINK, THINK_END, TOOL_CALL = 2, 11, 12, 13, 14
 STOP_IDS = [EOS, IM_END]
-END_IDS = [THINK_END, TOOL_CALL]
+END_IDS_ = [THINK_END, TOOL_CALL]
 PROMPT = [100, 101, THINK_END, 102, THINK]  # history `</think>` is ignored
 NUM_SPEC = 3
 
 
-def _params(flag: bool, **kwargs) -> SamplingParams:
-    extra_args = {NO_EOS_IN_REASONING_KEY: END_IDS} if flag else None
+def _params(flag: bool, blocked=STOP_IDS, **kwargs) -> SamplingParams:
+    # The worker reads the input processor's normalized form.
+    extra_args = (
+        {NO_EOS_IN_REASONING_KEY: {END_IDS: END_IDS_, BLOCKED_IDS: blocked}}
+        if flag
+        else None
+    )
     return SamplingParams(stop_token_ids=STOP_IDS, extra_args=extra_args, **kwargs)
 
 
@@ -35,8 +44,8 @@ class _Harness:
         self.device = torch.device("cuda")
         self.req_states = RequestState(
             max_num_reqs=max_num_reqs,
-            max_model_len=4096,
-            max_num_batched_tokens=4096,
+            max_model_len=16384,
+            max_num_batched_tokens=16384,
             num_speculative_steps=NUM_SPEC,
             vocab_size=VOCAB,
             device=self.device,
@@ -172,13 +181,40 @@ def test_no_flag_leaves_logits_untouched():
     assert out is logits
 
 
-def test_fail_open_when_only_stop_tokens_are_allowed():
+def test_unflagged_requests_ignore_unnormalized_values():
+    h = _Harness()
+    params = SamplingParams(
+        stop_token_ids=STOP_IDS, extra_args={NO_EOS_IN_REASONING_KEY: True}
+    )
+    idx = h.add("r", [], params)
+    assert not _masked(h.processed(_logits(1), h.batch([idx]))[0])
+
+
+def test_blocks_every_listed_stop_token():
+    h = _Harness()
+    idx = h.add("r", [], _params(True, blocked=[EOS, 7, IM_END]))
+    out = h.processed(_logits(1, {EOS: 30.0, 7: 30.0, IM_END: 30.0}), h.batch([idx]))
+    assert torch.isneginf(out[0, [EOS, 7, IM_END]]).all()
+
+
+def test_grammar_row_with_only_a_stop_token_is_kept():
+    # A structured-output grammar that allows only a stop token wins.
     h = _Harness()
     idx = h.add("r", [], _params(True))
     logits = torch.full((1, VOCAB), float("-inf"), device="cuda")
     logits[0, IM_END] = 0.0
     out = h.processed(logits, h.batch([idx]))
     assert out[0, IM_END] == 0.0
+
+
+def test_readd_after_preemption_rescans_generated_tokens():
+    h = _Harness()
+    outputs = [300] * 3000 + [THINK_END] + [301] * 5000
+    idx = h.add("r", outputs, _params(True))
+    assert not _masked(h.processed(_logits(1), h.batch([idx]))[0])
+    h.remove("r")
+    idx = h.add("r", [300] * 5000, _params(True))
+    assert _masked(h.processed(_logits(1), h.batch([idx]))[0])
 
 
 def test_slot_reuse_resets_state():
