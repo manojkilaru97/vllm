@@ -8,9 +8,11 @@ libsndfile, which reads Ogg Opus. This module finds the audio track of an
 ISO-BMFF (MP4/MOV) or Matroska (WebM/MKV) container, remuxes a Matroska Opus
 track into an in-memory Ogg Opus stream, and decodes it with ``soundfile``.
 
-``load_video_audio`` returns ``None`` when the container has no audio track
-and raises ``UnsupportedVideoAudioError`` when an audio track exists that this
-process cannot decode, so callers never silently drop narration.
+``load_video_audio_without_pyav`` returns ``None`` only when an MP4/MOV or
+Matroska/WebM container has no audio track, and raises
+``UnsupportedVideoAudioError`` when an audio track exists that this process
+cannot decode or the container cannot be inspected, so callers never silently
+drop narration.
 """
 
 import struct
@@ -29,6 +31,14 @@ _MAX_BOX_DEPTH = 8
 
 class UnsupportedVideoAudioError(ValueError):
     """The video has an audio track that cannot be decoded here."""
+
+
+class _DurationExceeded(ValueError):
+    def __init__(self, max_duration_s: float | None) -> None:
+        super().__init__(
+            f"Audio exceeds maximum allowed duration of {max_duration_s}s. "
+            "Set VLLM_MAX_AUDIO_DECODE_DURATION_S to increase this limit."
+        )
 
 
 @dataclass
@@ -299,21 +309,50 @@ def _split_laced_frames(payload: bytes, lacing: int) -> list[bytes]:
     return frames
 
 
-def _matroska_track_packets(
-    data: bytes, segment: tuple[int, int], track_number: int
-) -> tuple[list[bytes], int]:
-    """Return the track's packets and the trailing ``DiscardPadding`` (ns)."""
-    packets: list[bytes] = []
-    trailing_discard_ns = 0
+@dataclass
+class _OpusBlocks:
+    packets: list[bytes]
+    leading_discard_ns: int = 0
+    trailing_discard_ns: int = 0
+    trailing_block_samples: int = 0
 
-    def block_packets(body: int, end: int) -> bool:
+
+def _matroska_track_packets(
+    data: bytes,
+    segment: tuple[int, int],
+    track_number: int,
+    max_duration_s: float | None = None,
+) -> _OpusBlocks:
+    """Collect the track's packets and the stream-edge ``DiscardPadding``.
+
+    Matroska ``DiscardPadding`` applies to a whole (possibly laced) block:
+    negative on the first block trims its start, positive on the last block
+    trims its end. Ogg can only express those two edges (pre-skip and the
+    final granule); padding on interior blocks is not representable.
+    """
+    blocks = _OpusBlocks(packets=[])
+    first_block = True
+    total_samples = 0
+    max_samples = None if max_duration_s is None else max_duration_s * 48000
+
+    def block_packets(body: int, end: int, discard_ns: int) -> None:
+        nonlocal first_block, total_samples
         number, length, _ = _read_vint(data, body, keep_marker=False)
         if number != track_number:
-            return False
+            return
         header = body + length
         flags = data[header + 2]
-        packets.extend(_split_laced_frames(data[header + 3 : end], (flags >> 1) & 3))
-        return True
+        frames = _split_laced_frames(data[header + 3 : end], (flags >> 1) & 3)
+        block_samples = sum(_opus_packet_samples(f) for f in frames)
+        total_samples += block_samples
+        if max_samples is not None and total_samples > max_samples:
+            raise _DurationExceeded(max_duration_s)
+        blocks.packets.extend(frames)
+        if first_block and discard_ns < 0:
+            blocks.leading_discard_ns = -discard_ns
+        first_block = False
+        blocks.trailing_discard_ns = max(discard_ns, 0)
+        blocks.trailing_block_samples = block_samples
 
     seg_start, seg_end = segment
     for element_id, body, end in _segment_children(data, seg_start, seg_end):
@@ -321,20 +360,19 @@ def _matroska_track_packets(
             continue
         for child_id, cbody, cend, _ in _iter_ebml(data, body, end):
             if child_id == _SIMPLE_BLOCK:
-                if block_packets(cbody, cend):
-                    trailing_discard_ns = 0
+                block_packets(cbody, cend, 0)
             elif child_id == _BLOCK_GROUP:
-                ours, discard_ns = False, 0
+                block, discard_ns = None, 0
                 for gid, gbody, gend, _ in _iter_ebml(data, cbody, cend):
                     if gid == _BLOCK:
-                        ours = block_packets(gbody, gend)
+                        block = (gbody, gend)
                     elif gid == _DISCARD_PADDING and gend > gbody:
                         discard_ns = int.from_bytes(
                             data[gbody:gend], "big", signed=True
                         )
-                if ours:
-                    trailing_discard_ns = max(discard_ns, 0)
-    return packets, trailing_discard_ns
+                if block is not None:
+                    block_packets(*block, discard_ns)
+    return blocks
 
 
 # ---------------------------------------------------------------------------
@@ -403,32 +441,42 @@ def _opus_packet_samples(packet: bytes) -> int:
     return frames * _OPUS_FRAME_SAMPLES_48K[toc >> 3]
 
 
-def _opus_head(track: _AudioTrack) -> bytes:
+def _ns_to_48k(ns: int) -> int:
+    return round(ns * 48000 / 1_000_000_000)
+
+
+def _opus_head(track: _AudioTrack, extra_pre_skip: int = 0) -> bytes:
     if track.codec_private and track.codec_private.startswith(b"OpusHead"):
-        return track.codec_private
-    channels = track.channels or 1
-    rate = int(track.sampling_rate or 48000)
-    return struct.pack("<8sBBHIhB", b"OpusHead", 1, channels, 312, rate, 0, 0)
+        head = bytearray(track.codec_private)
+    else:
+        channels = track.channels or 1
+        rate = int(track.sampling_rate or 48000)
+        head = bytearray(
+            struct.pack("<8sBBHIhB", b"OpusHead", 1, channels, 312, rate, 0, 0)
+        )
+    if extra_pre_skip and len(head) >= 12:
+        pre_skip = struct.unpack_from("<H", head, 10)[0]
+        struct.pack_into("<H", head, 10, min(pre_skip + extra_pre_skip, 0xFFFF))
+    return bytes(head)
 
 
-def _ogg_opus_from_packets(
-    track: _AudioTrack, packets: list[bytes], trailing_discard_ns: int = 0
-) -> bytes:
+def _ogg_opus_from_packets(track: _AudioTrack, blocks: _OpusBlocks) -> bytes:
     vendor = b"vllm"
     tags = b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)
+    head = _opus_head(track, _ns_to_48k(blocks.leading_discard_ns))
     pages = [
-        _ogg_page(_opus_head(track), granule=0, sequence=0, header_type=0x02),
+        _ogg_page(head, granule=0, sequence=0, header_type=0x02),
         _ogg_page(tags, granule=0, sequence=1, header_type=0x00),
     ]
     granule = 0
+    packets = blocks.packets
     for index, packet in enumerate(packets):
         granule += _opus_packet_samples(packet)
         last = index == len(packets) - 1
-        if last and trailing_discard_ns:
+        if last and blocks.trailing_discard_ns:
             # RFC 7845 section 4.4: end trimming via a short final granule.
             granule -= min(
-                round(trailing_discard_ns * 48000 / 1_000_000_000),
-                _opus_packet_samples(packet),
+                _ns_to_48k(blocks.trailing_discard_ns), blocks.trailing_block_samples
             )
         pages.append(
             _ogg_page(
@@ -507,12 +555,12 @@ def load_video_audio_without_pyav(
     try:
         track = find_video_audio_track(data)
     except _UnknownContainer:
-        logger.warning(
-            "Video container is neither MP4/MOV nor Matroska/WebM; its audio "
-            "track (if any) cannot be extracted without PyAV. Answering from "
-            "the video frames only."
-        )
-        return None
+        raise UnsupportedVideoAudioError(
+            "use_audio_in_video supports MP4/MOV and Matroska/WebM videos on this "
+            "server; this container cannot be inspected for an audio track. Use "
+            'an MP4 or WebM video, or set mm_processor_kwargs {"use_audio_in_video": '
+            "false} for a visual-only answer."
+        ) from None
     except Exception as exc:
         raise UnsupportedVideoAudioError(
             f"Cannot parse the video container to find its audio track: {exc}"
@@ -526,19 +574,20 @@ def load_video_audio_without_pyav(
                 "The video's Opus audio track has no TrackNumber."
             )
         try:
-            packets, trailing_discard_ns = _matroska_track_packets(
-                data, segment, track.number
+            blocks = _matroska_track_packets(
+                data, segment, track.number, max_duration_s
             )
+        except _DurationExceeded:
+            raise
         except Exception as exc:
             raise UnsupportedVideoAudioError(
                 f"Cannot read the Opus audio track of the video: {exc}"
             ) from exc
-        if not packets:
+        if not blocks.packets:
             return None
         try:
             return _decode_with_soundfile(
-                _ogg_opus_from_packets(track, packets, trailing_discard_ns),
-                max_duration_s,
+                _ogg_opus_from_packets(track, blocks), max_duration_s
             )
         except ValueError:
             raise
@@ -548,8 +597,8 @@ def load_video_audio_without_pyav(
             ) from exc
     raise UnsupportedVideoAudioError(
         f"The video's audio track uses codec '{track.codec}' in a {track.container} "
-        "container, which this server cannot decode. Send the audio separately "
-        "as audio_url/input_audio (WAV, MP3, FLAC or Ogg), use a WebM/Opus video, "
-        'or set mm_processor_kwargs {"use_audio_in_video": false} for a '
-        "visual-only answer."
+        "container, which this server cannot decode. Use a WebM/Opus video, or set "
+        'mm_processor_kwargs {"use_audio_in_video": false} for a visual-only answer '
+        "(optionally sending the audio as audio_url/input_audio in WAV, MP3, FLAC "
+        "or Ogg in that same request)."
     )

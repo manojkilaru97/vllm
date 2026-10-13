@@ -45,7 +45,7 @@ def test_webm_opus_track_is_decoded(name):
     audio, sample_rate = result
     assert audio.dtype == np.float32 and audio.ndim == 1
     # DiscardPadding end trimming (RFC 7845 section 4.4) keeps the exact length.
-    assert abs(len(audio) / sample_rate - 1.0) < 0.005
+    assert abs(len(audio) / sample_rate - 1.0) < 0.002
     assert abs(_dominant_hz(audio, sample_rate) - 440) < 10
 
 
@@ -59,8 +59,9 @@ def test_undecodable_audio_track_is_rejected_not_dropped():
         load_video_audio_without_pyav(_read("tone_aac.mp4"))
 
 
-def test_unknown_container_is_treated_as_visual_only():
-    assert load_video_audio_without_pyav(b"\x00\x01not-a-video-container") is None
+def test_uninspectable_container_is_rejected_not_dropped():
+    with pytest.raises(UnsupportedVideoAudioError, match="use_audio_in_video"):
+        load_video_audio_without_pyav(b"RIFF\x00\x01\x00\x00AVI LIST")
 
 
 @pytest.mark.parametrize(
@@ -217,3 +218,40 @@ def test_opus_track_without_track_number_is_a_client_error():
     patched = data.replace(track_number, bytes([0xEC, 0x81, 0x00]))  # EBML Void
     with pytest.raises(UnsupportedVideoAudioError, match="TrackNumber"):
         load_video_audio_without_pyav(patched)
+
+
+def test_discard_padding_edges_map_to_pre_skip_and_final_granule():
+    from vllm.multimodal.media.video_audio import (
+        _AudioTrack,
+        _ogg_opus_from_packets,
+        _OpusBlocks,
+    )
+
+    celt_20ms = bytes([(31 << 3) | 0, 0])
+    laced_pair = bytes([(31 << 3) | 1, 0])  # two 20 ms frames in one packet
+    track = _AudioTrack(container="matroska", codec="opus", channels=1)
+    blocks = _OpusBlocks(
+        packets=[celt_20ms, laced_pair],
+        leading_discard_ns=5_000_000,
+        trailing_discard_ns=25_000_000,
+        trailing_block_samples=1920,
+    )
+    ogg = _ogg_opus_from_packets(track, blocks)
+
+    pages = [p for p in ogg.split(b"OggS") if p]  # header fields follow "OggS"
+    head = pages[0][23 + pages[0][22] :]
+    assert int.from_bytes(head[10:12], "little") == 312 + 240
+    final_granule = int.from_bytes(pages[-1][2:10], "little", signed=True)
+    assert final_granule == 960 + 1920 - 1200
+
+
+def test_duration_limit_stops_packet_extraction_early(monkeypatch):
+    import vllm.multimodal.media.video_audio as video_audio
+
+    muxed = []
+    monkeypatch.setattr(
+        video_audio, "_ogg_opus_from_packets", lambda *a: muxed.append(a) or b""
+    )
+    with pytest.raises(ValueError, match="maximum allowed duration"):
+        load_video_audio_without_pyav(_read("tone_opus.webm"), max_duration_s=0.1)
+    assert muxed == []
