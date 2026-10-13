@@ -14,9 +14,9 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.no_eos_in_reasoning import (
-    MAX_BLOCKED_STOP_TOKEN_IDS,
+    MAX_BLOCKED_TOKEN_IDS,
     MAX_REASONING_END_TOKEN_IDS,
-    get_reasoning_end_token_ids,
+    get_normalized_token_ids,
 )
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 from vllm.v1.worker.gpu.states import RequestState
@@ -28,6 +28,7 @@ _VOCAB_BLOCK = 1024
 class NoEosInReasoningState:
     def __init__(self, req_states: RequestState):
         self.req_states = req_states
+        self.vocab_size = req_states.vocab_size
         max_num_reqs = req_states.max_num_reqs
         device = req_states.device
 
@@ -41,7 +42,7 @@ class NoEosInReasoningState:
         )
         self.num_blocked_ids = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
         self.blocked_ids = StagedWriteTensor(
-            (max_num_reqs, MAX_BLOCKED_STOP_TOKEN_IDS),
+            (max_num_reqs, MAX_BLOCKED_TOKEN_IDS),
             dtype=torch.int32,
             device=device,
         )
@@ -56,20 +57,18 @@ class NoEosInReasoningState:
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
-        end_ids = get_reasoning_end_token_ids(sampling_params.extra_args)
-        blocked_ids = sorted(sampling_params.all_stop_token_ids)
-        active = (
-            end_ids is not None and 0 < len(blocked_ids) <= MAX_BLOCKED_STOP_TOKEN_IDS
+        token_ids = get_normalized_token_ids(
+            sampling_params.extra_args, self.vocab_size
         )
-        if not active and not self.active[req_idx]:
+        if token_ids is None and not self.active[req_idx]:
             return
         self._dirty = True
-        self.active[req_idx] = active
-        if not active:
+        self.active[req_idx] = token_ids is not None
+        if token_ids is None:
             self.num_end_ids.np[req_idx] = 0
             self.num_blocked_ids.np[req_idx] = 0
             return
-        assert end_ids is not None
+        end_ids, blocked_ids = token_ids
         self.num_end_ids.np[req_idx] = len(end_ids)
         self.end_ids.stage_write(req_idx, 0, end_ids)
         self.num_blocked_ids.np[req_idx] = len(blocked_ids)
@@ -158,11 +157,13 @@ def _update_closed_kernel(
     )
     row_ptr = all_token_ids_ptr + req_state_idx.to(tl.int64) * all_token_ids_stride
     found = 0
-    for start in tl.range(scan_pos, total_len, BLOCK):
+    start = scan_pos
+    while (found == 0) & (start < total_len):
         offs = start + tl.arange(0, BLOCK)
         tokens = tl.load(row_ptr + offs, mask=offs < total_len, other=-2)
         hit = (tokens[:, None] == end_ids[None, :]).to(tl.int32)
-        found = tl.maximum(found, tl.max(tl.max(hit, axis=1), axis=0))
+        found = tl.max(tl.max(hit, axis=1), axis=0)
+        start += BLOCK
     tl.store(closed_ptr + req_state_idx, found)
     tl.store(scan_pos_ptr + req_state_idx, total_len)
 
@@ -226,10 +227,12 @@ def _mask_stop_tokens_kernel(
         )
         num_finite_blocked = tl.sum((blocked_logits > float("-inf")).to(tl.int32))
 
-        # Fail open: never remove the last finite logits (e.g. a grammar that
-        # only allows a stop token). Blocked ids are unique, so a row has a
-        # finite non-stop token iff it has more finite logits than finite
-        # stop-token logits. Usually decided by the first block.
+        # A structured-output grammar that allows only a stop token wins: never
+        # remove the last finite logits. (Static conflicts such as
+        # allowed_token_ids of stop tokens only are rejected at admission.)
+        # Blocked ids are unique, so a row has a finite non-stop token iff it
+        # has more finite logits than finite stop-token logits; usually decided
+        # by the first block.
         num_finite = 0
         start = 0
         while (num_finite <= num_finite_blocked) & (start < vocab_size):
@@ -287,6 +290,6 @@ def apply_no_eos_in_reasoning(
         blocked_ids.stride(0),
         closed,
         MAX_END=MAX_REASONING_END_TOKEN_IDS,
-        MAX_BLOCKED=MAX_BLOCKED_STOP_TOKEN_IDS,
+        MAX_BLOCKED=MAX_BLOCKED_TOKEN_IDS,
         VOCAB_BLOCK=_VOCAB_BLOCK,
     )
