@@ -31,6 +31,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
     LogprobTokenIdsState,
     compute_topk_scores,
 )
+from vllm.v1.worker.gpu.sample.no_eos_in_reasoning import NoEosInReasoningState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
@@ -79,6 +80,7 @@ class Sampler:
         self.thinking_budget_state = ThinkingBudgetState(
             req_states, vllm_config.reasoning_config
         )
+        self.no_eos_in_reasoning_state = NoEosInReasoningState(req_states)
         self.trace_replay_state = (
             TraceReplayState(req_states) if enable_trace_replay else None
         )
@@ -100,6 +102,10 @@ class Sampler:
         )
         for processor in self.logits_processors:
             needs_processing |= processor.add_request(req_idx, sampling_params)
+        # Reads prompt_len staged by RequestState.add_request for this slot.
+        prompt_len = int(self.req_states.prompt_len.np[req_idx])
+        self.no_eos_in_reasoning_state.add_request(req_idx, prompt_len, sampling_params)
+        needs_processing |= bool(self.no_eos_in_reasoning_state.active[req_idx])
         self.needs_logits_processing[req_idx] = needs_processing
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
@@ -114,6 +120,7 @@ class Sampler:
         self.logprob_token_ids_state.apply_staged_writes()
         if self.trace_replay_state is not None:
             self.trace_replay_state.apply_staged_writes()
+        self.no_eos_in_reasoning_state.apply_staged_writes()
 
     def get_logprobs_dims(
         self, idx_mapping_np: np.ndarray, include_token_ids: bool = True
@@ -254,6 +261,17 @@ class Sampler:
         # Apply logits processors (native + any custom).
         for processor in self.logits_processors:
             logits = processor.apply(logits, ctx)
+
+        # Mask stop tokens while an opted-in request's reasoning is open. This
+        # also masks the target logits for spec-decode verification.
+        self.no_eos_in_reasoning_state.apply(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping,
+            idx_mapping_np,
+            input_ids,
+            expanded_local_pos,
+        )
 
         # Forcing runs last so no stage can overwrite the forced end marker
         # or weaken it by scaling.

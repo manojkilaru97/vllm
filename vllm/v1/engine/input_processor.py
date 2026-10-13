@@ -34,6 +34,11 @@ from vllm.utils.diffusion import validate_diffusion_sampling_params
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
+from vllm.v1.sample.no_eos_in_reasoning import (
+    NO_EOS_IN_REASONING_KEY,
+    normalize_no_eos_in_reasoning,
+    resolve_default_reasoning_end_token_ids,
+)
 
 logger = init_logger(__name__)
 
@@ -60,6 +65,8 @@ class InputProcessor:
         self.validate_logits_processors_params = (
             self._build_logits_processors_params_validator()
         )
+        self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        self._default_reasoning_end_token_ids: list[int] | None = None
 
         self.generation_config_fields = model_config.try_get_generation_config()
 
@@ -274,6 +281,25 @@ class InputProcessor:
         sampling_params.stop = []
         sampling_params.stop_token_ids = []
         sampling_params._all_stop_token_ids = set()
+
+    def _normalize_no_eos_in_reasoning(self, params: SamplingParams) -> None:
+        extra_args = params.extra_args
+        if not extra_args or NO_EOS_IN_REASONING_KEY not in extra_args:
+            return
+        default_end_token_ids = None
+        if extra_args[NO_EOS_IN_REASONING_KEY] is True and self.tokenizer is not None:
+            if self._default_reasoning_end_token_ids is None:
+                self._default_reasoning_end_token_ids = (
+                    resolve_default_reasoning_end_token_ids(self.tokenizer)
+                )
+            default_end_token_ids = self._default_reasoning_end_token_ids
+        params.extra_args = normalize_no_eos_in_reasoning(
+            extra_args,
+            default_end_token_ids=default_end_token_ids,
+            vocab_size=self.model_config.get_vocab_size(),
+            all_stop_token_ids=params.all_stop_token_ids,
+            use_v2_model_runner=self.use_v2_model_runner,
+        )
 
     def _validate_lora(self, lora_request: LoRARequest | None) -> None:
         if lora_request is None:
@@ -494,6 +520,7 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
+            self._normalize_no_eos_in_reasoning(sampling_params)
         else:
             pooling_params = params.clone()
 
