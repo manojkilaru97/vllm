@@ -83,21 +83,29 @@ def _iter_mp4_boxes(data: bytes, start: int, end: int, strict: bool = False):
 
 
 def _mp4_audio_track(data: bytes) -> _AudioTrack | None:
-    def walk(start: int, end: int, track: dict[str, bytes], depth: int = 0):
+    def walk(
+        start: int,
+        end: int,
+        track: dict[str, bytes],
+        depth: int = 0,
+        parent: bytes = b"",
+    ):
         if depth > _MAX_BOX_DEPTH:
             raise ValueError("MP4 boxes are nested too deeply")
         for box_type, body, box_end in _iter_mp4_boxes(data, start, end, strict=True):
             if box_type == b"trak":
                 inner: dict[str, bytes] = {}
-                walk(body, box_end, inner, depth + 1)
+                walk(body, box_end, inner, depth + 1, box_type)
                 if inner.get("handler") == b"soun":
                     return inner.get("codec", b"????")
             elif box_type in _MP4_CONTAINER_BOXES:
-                found = walk(body, box_end, track, depth + 1)
+                found = walk(body, box_end, track, depth + 1, box_type)
                 if found is not None:
                     return found
-            elif box_type == b"hdlr" and body + 12 <= box_end:
-                track.setdefault("handler", data[body + 8 : body + 12])
+            elif box_type == b"hdlr" and parent == b"mdia" and body + 12 <= box_end:
+                # Only the media handler identifies the track type; QuickTime
+                # also puts data-reference handlers (`url `, `alis`) in `minf`.
+                track["handler"] = data[body + 8 : body + 12]
             elif box_type == b"stsd" and body + 16 <= box_end:
                 track["codec"] = data[body + 12 : body + 16]
         return None
