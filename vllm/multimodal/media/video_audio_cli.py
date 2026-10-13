@@ -24,6 +24,7 @@ import numpy.typing as npt
 
 from vllm.logger import init_logger
 from vllm.multimodal.media.video_audio import (
+    _CODEC_ID,
     _COLLECTION_SLACK_S,
     _TRACK_ENTRY,
     _TRACK_TYPE,
@@ -33,6 +34,7 @@ from vllm.multimodal.media.video_audio import (
     _DurationExceeded,
     _ebml_uint,
     _iter_ebml,
+    _iter_mp4_boxes,
     _matroska_segment,
     _segment_children,
     load_video_audio_without_pyav,
@@ -96,11 +98,11 @@ def decode_with_cli_fallback(
     return result
 
 
-def _matroska_audio_track_is_encoded(data: bytes) -> bool:
-    """Whether the probed (first) Matroska audio TrackEntry has ContentEncodings."""
+def _matroska_audio_entry_problem(data: bytes) -> str | None:
+    """Why FFmpeg would not decode the probed (first) Matroska audio entry."""
     segment = _matroska_segment(data)
     if segment is None:
-        return False
+        return None
     for element_id, body, end in _segment_children(data, *segment):
         if element_id != _TRACKS:
             continue
@@ -110,10 +112,62 @@ def _matroska_audio_track_is_encoded(data: bytes) -> bool:
             fields = {
                 fid: (fb, fe) for fid, fb, fe, _ in _iter_ebml(data, entry, entry_end)
             }
-            if _TRACK_TYPE in fields and _ebml_uint(data, *fields[_TRACK_TYPE]) == 2:
-                return _CONTENT_ENCODINGS in fields
-        return False
-    return False
+            if _TRACK_TYPE not in fields or _ebml_uint(data, *fields[_TRACK_TYPE]) != 2:
+                continue
+            codec_id = data[slice(*fields.get(_CODEC_ID, (0, 0)))].rstrip(b"\0")
+            # FFmpeg skips entries whose CodecID is not an audio id, so its first
+            # audio stream would be a later track.
+            if not codec_id.startswith(b"A_"):
+                return "declares a non-audio codec id"
+            # FFmpeg drops packets failing zlib decompression without an error.
+            if _CONTENT_ENCODINGS in fields:
+                return "uses Matroska content encoding (compression or encryption)"
+            return None
+        return None
+    return None
+
+
+def _mp4_audio_presentation_s(data: bytes) -> float | None:
+    """The first sound track's edited duration (tkhd, in mvhd timescale)."""
+    import struct
+
+    def children(start: int, end: int):
+        return _iter_mp4_boxes(data, start, end)
+
+    moov = next(((b, e) for t, b, e in children(0, len(data)) if t == b"moov"), None)
+    if moov is None:
+        return None
+    timescale = None
+    for box, body, end in children(*moov):
+        if box == b"mvhd" and end - body >= 32:
+            version = data[body]
+            timescale = struct.unpack_from(">I", data, body + (20 if version else 12))[
+                0
+            ]
+        elif box == b"trak" and timescale:
+            tkhd = mdia = None
+            for sub, sbody, send in children(body, end):
+                tkhd = (sbody, send) if sub == b"tkhd" else tkhd
+                mdia = (sbody, send) if sub == b"mdia" else mdia
+            if tkhd is None or mdia is None:
+                continue
+            handler = next(
+                (
+                    data[hb + 8 : hb + 12]
+                    for t, hb, _ in children(*mdia)
+                    if t == b"hdlr"
+                ),
+                None,
+            )
+            if handler != b"soun":
+                continue
+            version = data[tkhd[0]]
+            fmt, offset = (">Q", 28) if version else (">I", 20)
+            if tkhd[1] - tkhd[0] < offset + struct.calcsize(fmt):
+                return None
+            duration = struct.unpack_from(fmt, data, tkhd[0] + offset)[0]
+            return duration / timescale if duration else None
+    return None
 
 
 def _reason(stderr: bytes, returncode: int) -> str:
@@ -198,12 +252,12 @@ def decode_with_cli(
             f"{track.container} container, which this server cannot decode. Use "
             "AAC, MP3, Opus, Vorbis, FLAC or PCM audio."
         )
-    # FFmpeg drops audio packets that fail zlib decompression without an error,
-    # so compressed or encrypted audio tracks are refused rather than truncated.
-    if track.container == "matroska" and _matroska_audio_track_is_encoded(data):
+    problem = (
+        _matroska_audio_entry_problem(data) if track.container == "matroska" else None
+    )
+    if problem is not None:
         raise UnsupportedVideoAudioError(
-            "The video's audio track uses Matroska content encoding (compression "
-            "or encryption), which this server does not decode."
+            f"The video's audio track {problem}, which this server does not decode."
         )
     if len(data) > _MAX_INPUT_BYTES:
         raise UnsupportedVideoAudioError(
@@ -219,9 +273,6 @@ def decode_with_cli(
     )
     # Restamp from the sample count so client timestamps never reach the muxer.
     filters += ",asetpts=N/SR/TB"
-    # mov demuxer: the advanced edit-list index can emit only a prefix of a
-    # track with crafted sample deltas; plain edit lists are still applied.
-    demuxer_options = ["-advanced_editlist", "0"] if track.container == "mp4" else []
     if not _SLOTS.acquire(timeout=_TIMEOUT_S):
         raise RuntimeError("All audio decoder slots are busy.")
     try:
@@ -239,8 +290,7 @@ def decode_with_cli(
                 _PRLIMIT, f"--as={_MEMORY_BYTES}", "--",
                 cli, "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
                 "-threads", "1", "-filter_threads", "1",
-                "-protocol_whitelist", "file", *demuxer_options,
-                "-i", source,
+                "-protocol_whitelist", "file", "-i", source,
                 "-map", "0:a:0", "-vn", "-sn", "-dn", "-af", filters,
                 "-f", "f32le", "-c:a", "pcm_f32le", "pipe:1",
             ]  # fmt: skip
@@ -260,6 +310,15 @@ def decode_with_cli(
     audio = np.frombuffer(stdout, dtype="<f4")
     if audio.size == 0:
         raise UnsupportedVideoAudioError("The video's decoded audio track is empty.")
-    if audio.size / _SAMPLE_RATE > limit_s + _DURATION_TOLERANCE_S:
+    decoded_s = audio.size / _SAMPLE_RATE
+    if decoded_s > limit_s + _DURATION_TOLERANCE_S:
         raise _DurationExceeded(limit_s)
+    # Edit lists are honoured (trims stay trimmed); a decode far shorter than the
+    # track's edited duration means the sample table was inconsistent.
+    expected_s = _mp4_audio_presentation_s(data) if track.container == "mp4" else None
+    if expected_s is not None and decoded_s < min(expected_s, limit_s) * 0.9 - 0.1:
+        raise UnsupportedVideoAudioError(
+            f"The video's {track.codec} audio track decoded to {decoded_s:.2f} s of "
+            f"its declared {expected_s:.2f} s."
+        )
     return audio.astype(np.float32), float(_SAMPLE_RATE)
