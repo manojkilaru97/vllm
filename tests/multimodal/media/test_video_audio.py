@@ -516,6 +516,16 @@ def test_audio_cli_rejects_truncated_tracks_instead_of_dropping_narration(
         _cli_load(data[: int(len(data) * 0.8)])
 
 
+def test_audio_cli_rejects_a_track_without_a_codec_id(audio_cli):
+    from vllm.multimodal.media.video_audio import _AudioTrack
+    from vllm.multimodal.media.video_audio_cli import decode_with_cli
+
+    track = _AudioTrack(container="matroska", codec="unknown", number=2)
+    with pytest.raises(UnsupportedVideoAudioError, match="does not declare"):
+        decode_with_cli("/bin/false", _read("tone_mp3.mkv"), track, 600)
+    assert audio_cli == []
+
+
 def test_encoder_priming_does_not_fail_a_clip_at_the_limit(audio_cli):
     audio, sample_rate = _cli_load("tone_aac.mp4", max_duration_s=1)
     assert len(audio) / sample_rate > 1.0  # AAC priming samples

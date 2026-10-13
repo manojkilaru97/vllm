@@ -22,6 +22,7 @@ import time
 import numpy as np
 import numpy.typing as npt
 
+from vllm.logger import init_logger
 from vllm.multimodal.media.video_audio import (
     _COLLECTION_SLACK_S,
     UnsupportedVideoAudioError,
@@ -42,6 +43,8 @@ _MAX_STDERR_BYTES = 64 << 10
 _DURATION_TOLERANCE_S = 0.25
 _SLOTS = threading.BoundedSemaphore(4)
 
+logger = init_logger(__name__)
+
 
 def audio_decoder_cli() -> str | None:
     path = os.environ.get(_AUDIO_CLI_ENV, _DEFAULT_AUDIO_CLI)
@@ -56,6 +59,12 @@ def decode_with_cli_fallback(
     """libsndfile first (Matroska Opus); the CLI for anything it cannot decode."""
     cli = audio_decoder_cli()
     if cli is None:
+        logger.warning_once(
+            "No executable audio-only FFmpeg CLI at %s (set %s); video audio "
+            "tracks other than Matroska Opus will be rejected.",
+            os.environ.get(_AUDIO_CLI_ENV, _DEFAULT_AUDIO_CLI),
+            _AUDIO_CLI_ENV,
+        )
         result = load_video_audio_without_pyav(data, max_duration_s=max_duration_s)
         assert result is not None
         return result
@@ -126,7 +135,7 @@ def _run_bounded(
         ) from None
     except _OutputLimit as exc:
         if exc.args[0]:
-            return -1, b"", b""
+            raise
         raise UnsupportedVideoAudioError(
             "Decoding the video's audio track produced too many errors."
         ) from None
@@ -143,6 +152,12 @@ def decode_with_cli(
     cli: str, data: bytes, track: _AudioTrack, max_duration_s: float | None
 ) -> tuple[npt.NDArray, float]:
     """Decode the first audio stream to 48 kHz mono float32 with the FFmpeg CLI."""
+    # FFmpeg skips tracks without a codec id, so its first audio stream would
+    # no longer be the track the probe found.
+    if not track.codec or track.codec in ("????", "unknown"):
+        raise UnsupportedVideoAudioError(
+            "The video's audio track does not declare its codec."
+        )
     if len(data) > _MAX_INPUT_BYTES:
         raise UnsupportedVideoAudioError(
             f"The video is larger than {_MAX_INPUT_BYTES >> 20} MiB, the limit for "
@@ -176,11 +191,12 @@ def decode_with_cli(
                 "-f", "f32le", "-c:a", "pcm_f32le", "pipe:1",
             ]  # fmt: skip
             max_bytes = None if max_samples is None else max_samples * 4
-            returncode, stdout, stderr = _run_bounded(command, max_bytes)
+            try:
+                returncode, stdout, stderr = _run_bounded(command, max_bytes)
+            except _OutputLimit:
+                raise _DurationExceeded(max_duration_s) from None
     finally:
         _SLOTS.release()
-    if returncode == -1:
-        raise _DurationExceeded(max_duration_s)
     # At -loglevel error any diagnostic (e.g. "File ended prematurely") means the
     # track was not decoded in full, even when FFmpeg exits 0.
     if returncode != 0 or stderr.strip():
