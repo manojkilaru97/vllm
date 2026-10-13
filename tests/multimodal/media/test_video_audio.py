@@ -5,7 +5,8 @@
 Fixtures are 1 s, 32x32 clips: a 440 Hz tone muxed as Opus in WebM (seekable
 and live/unknown-size), as AAC in MP4, as Vorbis in WebM, as MP3 in Matroska
 (also with a 1000 s timestamp jump and an 80 ms rewind), as PCM (ipcm) in MP4,
-as AAC in edit-list trimmed/delayed MP4s, and silent MP4/WebM.
+as AAC in edit-list trimmed/delayed MP4s and switching mono to stereo, and
+silent MP4/WebM.
 Tests use no audio-decoder CLI unless they request the ``audio_cli`` fixture
 (``NV_TEST_OMNI_AUDIO_FFMPEG``).
 """
@@ -629,6 +630,17 @@ def test_audio_cli_bounds_output_without_a_duration_limit(audio_cli):
     _cli_load("tone_aac.mp4")
     command = audio_cli[0]
     assert "atrim=end_sample=172848000" in command[command.index("-af") + 1]
+
+
+def test_audio_cli_accepts_mid_stream_format_changes(audio_cli):
+    """1 s mono then 1 s stereo AAC (stream-copied join): the filtergraph is
+    rebuilt and the raw muxer complains about timestamps it does not use."""
+    audio, sample_rate = _cli_load("tone_aac_mono_stereo.mp4", max_duration_s=600)
+    assert 1.9 < len(audio) / sample_rate < 2.2
+    assert abs(_dominant_hz(audio, sample_rate) - 440) < 10
+    # atrim restarts with the filtergraph; the stdout byte ceiling still holds.
+    with pytest.raises(ValueError, match="maximum allowed duration"):
+        _cli_load("tone_aac_mono_stereo.mp4", max_duration_s=0.5)
 
 
 def test_audio_cli_honours_mp4_edit_lists(audio_cli):

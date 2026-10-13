@@ -142,6 +142,31 @@ class _OutputLimit(Exception):
     pass
 
 
+# Raw-PCM muxer complaints about timestamps it does not use: a mid-stream format
+# change rebuilds the filtergraph and restarts asetpts, but every sample is
+# still written. Dropped as they stream in (they can repeat per packet).
+_BENIGN_STDERR = re.compile(
+    rb"^(\[f32le @ 0x[0-9a-f]+\] Application provided invalid, non monotonically "
+    rb"increasing dts to muxer in stream 0: \d+ >= \d+"
+    rb"|Last message repeated \d+ times)$"
+)
+
+
+def _keep_stderr_lines(pending: bytearray, chunk: bytes, final: bool) -> bytes:
+    pending += chunk
+    *lines, rest = bytes(pending).split(b"\n")
+    if final:
+        lines.append(rest)
+        rest = b""
+    pending[:] = rest
+    kept = [
+        line
+        for line in lines
+        if line.strip() and not _BENIGN_STDERR.match(line.strip())
+    ]
+    return b"".join(line + b"\n" for line in kept)
+
+
 def _run_bounded(command: list[str], max_stdout: int) -> tuple[int, bytes, bytes]:
     """Run ``command`` with bounded stdout/stderr and a deadline; always reap it."""
     process = subprocess.Popen(
@@ -156,6 +181,7 @@ def _run_bounded(command: list[str], max_stdout: int) -> tuple[int, bytes, bytes
     sizes = {process.stdout: 0, process.stderr: 0}
     limits = {process.stdout: max_stdout, process.stderr: _MAX_STDERR_BYTES}
     buffers = {process.stdout: stdout, process.stderr: stderr}
+    pending = bytearray()
     deadline = time.monotonic() + _TIMEOUT_S
     try:
         with selectors.DefaultSelector() as selector:
@@ -167,9 +193,15 @@ def _run_bounded(command: list[str], max_stdout: int) -> tuple[int, bytes, bytes
                     raise TimeoutError
                 for key, _ in selector.select(remaining):
                     stream = key.fileobj
-                    chunk = os.read(stream.fileno(), 1 << 20)
-                    if not chunk:
+                    raw = os.read(stream.fileno(), 1 << 20)
+                    if not raw:
                         selector.unregister(stream)
+                    chunk = raw
+                    if stream is process.stderr:
+                        chunk = _keep_stderr_lines(pending, raw, final=not raw)
+                        if len(pending) > _MAX_STDERR_BYTES:
+                            raise _OutputLimit(False)
+                    if not chunk:
                         continue
                     sizes[stream] += len(chunk)
                     limit = limits[stream]
