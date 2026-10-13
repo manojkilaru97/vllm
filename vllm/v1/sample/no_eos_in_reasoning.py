@@ -6,7 +6,8 @@ A request opts in with ``SamplingParams.extra_args`` (``vllm_xargs`` in the
 OpenAI server) key ``nemotron_block_eos_in_reasoning``. While none of the
 request's *generated* tokens is a reasoning-end token, every stop token of the
 request (EOS, generation-config EOS ids, ``stop_token_ids``, and for ``true``
-also ``<|im_end|>``) is masked to ``-inf`` in the target distribution. Once a
+also ``<|im_end|>``; a stop token that is itself a reasoning-end token stays
+allowed) is masked to ``-inf`` in the target distribution. Once a
 reasoning-end token has been generated the constraint is lifted for the rest of
 the request. ``max_tokens`` still applies.
 
@@ -16,7 +17,8 @@ Accepted values:
   (Nemotron: a tool call can follow reasoning without ``</think>``), resolved
   with the tokenizer. Both must be single tokens.
 - a non-empty list of reasoning-end token ids.
-- ``false`` / ``null``: disabled.
+- ``false`` / ``null``: disabled (``vllm_xargs`` sends ``1``/``0`` for
+  ``true``/``false``; both spellings are accepted).
 
 The engine normalizes the value into ``{"reasoning_end_token_ids": [...],
 "blocked_token_ids": [...]}`` (also accepted, and re-validated, as input);
@@ -118,6 +120,9 @@ def normalize_no_eos_in_reasoning(
         return
     value = extra_args[NO_EOS_IN_REASONING_KEY]
     rest = {k: v for k, v in extra_args.items() if k != NO_EOS_IN_REASONING_KEY}
+    if type(value) is int and value in (0, 1):
+        # vllm_xargs coerces JSON true/false to 1/0.
+        value = bool(value)
     if value is None or value is False:
         params.extra_args = rest
         return
@@ -136,7 +141,8 @@ def normalize_no_eos_in_reasoning(
     else:
         end_ids = _token_ids(value, "reasoning-end token ids")
 
-    blocked = sorted(request_stop_token_ids(params).union(extra_blocked))
+    # A caller that stops on a reasoning-end token keeps that stop.
+    blocked = sorted(request_stop_token_ids(params).union(extra_blocked) - set(end_ids))
     if not blocked:
         params.extra_args = rest
         return
@@ -148,12 +154,10 @@ def normalize_no_eos_in_reasoning(
         raise _invalid(f"at most {MAX_BLOCKED_TOKEN_IDS} stop token ids")
     if any(i < 0 or i >= vocab_size for i in (*end_ids, *blocked)):
         raise _invalid(f"token ids must be in [0, {vocab_size})", value)
-    if set(end_ids) & set(blocked):
-        raise _invalid("a reasoning-end token cannot also be a stop token", value)
-    if params.allowed_token_ids is not None and set(params.allowed_token_ids) <= set(
-        blocked
-    ):
-        raise _invalid("allowed_token_ids leaves only stop tokens")
+    if params.allowed_token_ids is not None:
+        banned = {w[0] for w in params.bad_words_token_ids or () if len(w) == 1}
+        if set(params.allowed_token_ids) - banned <= set(blocked):
+            raise _invalid("allowed_token_ids leaves only stop tokens")
     if not use_v2_model_runner:
         logger.warning_once(
             "%s is ignored: it requires the V2 model runner "

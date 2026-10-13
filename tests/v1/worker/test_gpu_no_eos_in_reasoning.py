@@ -207,6 +207,15 @@ def test_grammar_row_with_only_a_stop_token_is_kept():
     assert out[0, IM_END] == 0.0
 
 
+def test_rows_without_finite_stop_logits_are_untouched():
+    h = _Harness()
+    idx = h.add("r", [], _params(True))
+    logits = torch.full((1, VOCAB), float("-inf"), device="cuda")
+    logits[0, VOCAB - 1] = 0.0
+    out = h.processed(logits, h.batch([idx]))
+    assert torch.equal(out, logits)
+
+
 def test_readd_after_preemption_rescans_generated_tokens():
     h = _Harness()
     outputs = [300] * 3000 + [THINK_END] + [301] * 5000

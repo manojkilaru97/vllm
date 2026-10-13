@@ -226,8 +226,8 @@ def _mask_stop_tokens_kernel(
             row_ptr + blocked_ids, mask=blocked_valid, other=float("-inf")
         )
         num_finite_blocked = tl.sum((blocked_logits > float("-inf")).to(tl.int32))
-
-        # A structured-output grammar that allows only a stop token wins: never
+        # Nothing to mask if every stop logit is already -inf. Otherwise a
+        # structured-output grammar that allows only a stop token wins: never
         # remove the last finite logits. (Static conflicts such as
         # allowed_token_ids of stop tokens only are rejected at admission.)
         # Blocked ids are unique, so a row has a finite non-stop token iff it
@@ -235,13 +235,15 @@ def _mask_stop_tokens_kernel(
         # by the first block.
         num_finite = 0
         start = 0
+        if num_finite_blocked == 0:
+            start = vocab_size
         while (num_finite <= num_finite_blocked) & (start < vocab_size):
             offs = start + tl.arange(0, VOCAB_BLOCK)
             x = tl.load(row_ptr + offs, mask=offs < vocab_size, other=float("-inf"))
             num_finite += tl.sum((x > float("-inf")).to(tl.int32))
             start += VOCAB_BLOCK
 
-        if num_finite > num_finite_blocked:
+        if (num_finite_blocked > 0) & (num_finite > num_finite_blocked):
             tl.store(row_ptr + blocked_ids, float("-inf"), mask=blocked_valid)
 
 

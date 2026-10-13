@@ -80,7 +80,7 @@ def test_normalized_form_is_idempotent():
         [True],
         ["13"],
         [13.0],
-        1,
+        2,
         "true",
         {"ids": [13]},
         {END_IDS: []},
@@ -93,15 +93,25 @@ def test_malformed_values_are_rejected(value):
         _normalize(_params({KEY: value}))
 
 
-def test_end_token_cannot_be_a_stop_token():
-    with pytest.raises(VLLMValidationError):
-        _normalize(_params({KEY: [11, 13]}))
+def test_stop_on_a_reasoning_end_token_is_kept():
+    normalized = _normalize(_params({KEY: [13, 14]}, stop_token_ids=[13]))
+    assert normalized == {KEY: {END_IDS: [13, 14], BLOCKED_IDS: [2, 11]}}
+
+
+@pytest.mark.parametrize("value, enabled", [(1, True), (0, False)])
+def test_vllm_xargs_integer_booleans(value, enabled):
+    normalized = _normalize(_params({KEY: value}))
+    assert (KEY in (normalized or {})) is enabled
 
 
 def test_allowed_tokens_must_leave_a_non_stop_token():
     with pytest.raises(VLLMValidationError, match="allowed_token_ids"):
         _normalize(_params({KEY: True}, allowed_token_ids=[2, 11]))
     assert _normalize(_params({KEY: True}, allowed_token_ids=[2, 11, 99]))
+    params = _params({KEY: True}, allowed_token_ids=[2, 11, 99])
+    params._bad_words_token_ids = [[99], [98, 99]]
+    with pytest.raises(VLLMValidationError, match="allowed_token_ids"):
+        _normalize(params)
 
 
 def test_v1_model_runner_ignores_the_flag():
