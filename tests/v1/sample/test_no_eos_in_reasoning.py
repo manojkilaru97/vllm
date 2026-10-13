@@ -104,11 +104,24 @@ def test_vllm_xargs_integer_booleans(value, enabled):
     assert (KEY in (normalized or {})) is enabled
 
 
-def test_client_token_constraints_disable_the_flag():
-    assert _normalize(_params({KEY: True}, allowed_token_ids=[2, 11, 99])) == {}
+def test_allowed_tokens_that_are_all_stops_disable_the_flag():
+    assert _normalize(_params({KEY: True}, allowed_token_ids=[2, 11])) == {}
+    params = _params({KEY: True}, allowed_token_ids=[2, 11, 99])
+    params._bad_words_token_ids = [[99], [98, 99]]
+    assert _normalize(params) == {}
+    kept = _normalize(_params({KEY: True}, allowed_token_ids=[2, 11, 99]))
+    assert kept == {KEY: {END_IDS: [13, 14], BLOCKED_IDS: [2, 11]}}
     params = _params({KEY: True})
     params._bad_words_token_ids = [[99, 99]]
-    assert _normalize(params) == {}
+    assert KEY in _normalize(params)
+
+
+def test_request_stop_ids_bounds():
+    # Out-of-vocab stop ids can never be sampled and are left out of the mask.
+    normalized = _normalize(_params({KEY: True}, stop_token_ids=[VOCAB + 5]))
+    assert normalized == {KEY: {END_IDS: [13, 14], BLOCKED_IDS: [2, 11]}}
+    with pytest.raises(VLLMValidationError, match="stop token ids"):
+        _normalize(_params({KEY: True}, stop_token_ids=list(range(200, 400))))
 
 
 def test_v1_model_runner_ignores_the_flag():

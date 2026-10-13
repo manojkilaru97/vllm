@@ -24,10 +24,11 @@ The engine normalizes the value into ``{"reasoning_end_token_ids": [...],
 "blocked_token_ids": [...]}`` (also accepted, and re-validated, as input);
 the Model Runner V2 sampler reads only that form.
 
-The flag is ignored (with a warning) for requests with ``allowed_token_ids`` or
-bad words, whose token constraints take precedence, and by engines without the
-V2 model runner. If a structured-output grammar permits only a stop token while
-reasoning is open, the grammar wins and the stop token is kept.
+The flag is ignored (with a warning) by engines without the V2 model runner and
+for requests whose ``allowed_token_ids`` (minus single-token bad words) are all
+stop tokens. Client constraints that leave only stop tokens at some step (a
+structured-output grammar, or a multi-token bad word that bans the last allowed
+non-stop token) win at runtime: the stop tokens are then kept.
 """
 
 from collections.abc import Callable
@@ -133,16 +134,6 @@ def normalize_no_eos_in_reasoning(
         )
         params.extra_args = rest
         return
-    if params.allowed_token_ids is not None or params.bad_words_token_ids:
-        # Client token constraints take precedence: combined with them the mask
-        # could leave only stop tokens.
-        logger.warning_once(
-            "%s is ignored for requests with allowed_token_ids or bad words.",
-            NO_EOS_IN_REASONING_KEY,
-        )
-        params.extra_args = rest
-        return
-
     extra_blocked: list[int] = []
     if value is True:
         if resolve_default_token_ids is None:
@@ -157,19 +148,37 @@ def normalize_no_eos_in_reasoning(
     else:
         end_ids = _token_ids(value, "reasoning-end token ids")
 
-    # A caller that stops on a reasoning-end token keeps that stop.
-    blocked = sorted(request_stop_token_ids(params).union(extra_blocked) - set(end_ids))
-    if not blocked:
-        params.extra_args = rest
-        return
     if len(end_ids) > MAX_REASONING_END_TOKEN_IDS:
         raise _invalid(
             f"at most {MAX_REASONING_END_TOKEN_IDS} reasoning-end token ids", value
         )
-    if len(blocked) > MAX_BLOCKED_TOKEN_IDS:
-        raise _invalid(f"at most {MAX_BLOCKED_TOKEN_IDS} stop token ids")
-    if any(i < 0 or i >= vocab_size for i in (*end_ids, *blocked)):
+    if any(i < 0 or i >= vocab_size for i in (*end_ids, *extra_blocked)):
         raise _invalid(f"token ids must be in [0, {vocab_size})", value)
+    # The request's own stop ids only shape the mask: out-of-vocab ids can never
+    # be sampled, and a caller that stops on a reasoning-end token keeps it.
+    blocked = sorted(
+        {i for i in request_stop_token_ids(params) if 0 <= i < vocab_size}.union(
+            extra_blocked
+        )
+        - set(end_ids)
+    )
+    if not blocked:
+        params.extra_args = rest
+        return
+    if len(blocked) > MAX_BLOCKED_TOKEN_IDS:
+        # Same limit as min_tokens stop-token masking.
+        raise _invalid(f"at most {MAX_BLOCKED_TOKEN_IDS} stop token ids")
+    if params.allowed_token_ids is not None:
+        banned = {w[0] for w in params.bad_words_token_ids or () if len(w) == 1}
+        if set(params.allowed_token_ids) - banned <= set(blocked):
+            # The client allows only stop tokens: nothing to protect.
+            logger.warning_once(
+                "%s is ignored for requests whose allowed_token_ids are all "
+                "stop tokens.",
+                NO_EOS_IN_REASONING_KEY,
+            )
+            params.extra_args = rest
+            return
     params.extra_args = {
         **rest,
         NO_EOS_IN_REASONING_KEY: {END_IDS: end_ids, BLOCKED_IDS: blocked},

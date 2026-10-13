@@ -20,6 +20,11 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.kv_cache_interface import CrossAttentionSpec, MambaSpec
 from vllm.v1.request import Request
+from vllm.v1.sample.no_eos_in_reasoning import (
+    BLOCKED_IDS,
+    END_IDS,
+    NO_EOS_IN_REASONING_KEY,
+)
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
@@ -237,6 +242,11 @@ def warmup_kernels(
         pooling_params.verify(model_runner.model_config)
     else:
         sampling_params = SamplingParams.for_sampler_warmup()
+        # Compile the no-EOS-in-reasoning kernels (normalized form, as the worker
+        # reads it) so the first opted-in request does not stall the batch.
+        sampling_params.extra_args = {
+            NO_EOS_IN_REASONING_KEY: {END_IDS: [3], BLOCKED_IDS: [4]}
+        }
         pooling_params = None
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.
