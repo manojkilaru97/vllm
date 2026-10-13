@@ -287,3 +287,32 @@ def test_interior_discard_padding_is_rejected():
     earlier_trailing = _OpusBlocks(packets=[b"x"], trailing_discard_ns=10)
     with pytest.raises(UnsupportedVideoAudioError, match="DiscardPadding"):
         _check_block_padding(earlier_trailing, 0, first_block=False)
+
+
+def test_quicktime_data_handler_in_minf_does_not_hide_the_audio_track():
+    """QuickTime may place a data handler `hdlr` (`url `) in `minf` first."""
+
+    def box(kind: bytes, body: bytes) -> bytes:
+        return (8 + len(body)).to_bytes(4, "big") + kind + body
+
+    def rebuild(data: bytes, start: int, end: int) -> bytes:
+        out = b""
+        for kind, body, box_end in _iter_mp4_boxes(data, start, end):
+            if kind in (b"moov", b"trak", b"mdia"):
+                inner = rebuild(data, body, box_end)
+                if kind == b"mdia":
+                    children = list(_iter_mp4_boxes(inner, 0, len(inner)))
+                    minf = [inner[b - 8 : e] for k, b, e in children if k == b"minf"]
+                    rest = [inner[b - 8 : e] for k, b, e in children if k != b"minf"]
+                    url_handler = box(b"hdlr", bytes(8) + b"url " + bytes(12))
+                    minf_body = url_handler + minf[0][8:]
+                    inner = box(b"minf", minf_body) + b"".join(rest)
+                out += box(kind, inner)
+            else:
+                out += data[body - 8 : box_end]
+        return out
+
+    data = _read("tone_aac.mp4")
+    reordered = rebuild(data, 0, len(data))
+    with pytest.raises(UnsupportedVideoAudioError, match="'aac'"):
+        load_video_audio_without_pyav(reordered)
