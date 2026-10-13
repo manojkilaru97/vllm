@@ -4,7 +4,8 @@
 
 Fixtures are 1 s, 32x32 clips: a 440 Hz tone muxed as Opus in WebM (seekable
 and live/unknown-size), as AAC in MP4, as Vorbis in WebM, as MP3 in Matroska
-(also with a 1000 s timestamp jump and an 80 ms rewind), and silent MP4/WebM.
+(also with a 1000 s timestamp jump and an 80 ms rewind), as PCM (ipcm) in MP4,
+and silent MP4/WebM.
 Tests use no audio-decoder CLI unless they request the ``audio_cli`` fixture
 (``NV_TEST_OMNI_AUDIO_FFMPEG``).
 """
@@ -402,6 +403,7 @@ def _cli_load(name_or_data, **kwargs):
         "tone_mp3.mkv",
         "tone_mp3_tsjump.mkv",
         "tone_mp3_tsrewind.mkv",
+        "tone_pcm.mp4",
     ],
 )
 def test_non_opus_tracks_are_decoded_by_the_audio_cli(audio_cli, name):
@@ -578,6 +580,67 @@ def _with_zlib_subtitle_track(data: bytes) -> bytes:
 def test_audio_cli_tolerates_zlib_encoded_side_tracks(audio_cli):
     audio, sample_rate = _cli_load(_with_zlib_subtitle_track(_read("tone_mp3.mkv")))
     assert abs(_dominant_hz(audio, sample_rate) - 440) < 10
+
+
+def _with_zlib_audio_encoding(data: bytes) -> bytes:
+    """Declare zlib ContentEncoding on the first audio TrackEntry."""
+    from vllm.multimodal.media.video_audio import _read_vint
+
+    uint = lambda element_id, value: _ebml(element_id, bytes([value]))  # noqa: E731
+    encodings = _ebml(
+        0x6D80,
+        _ebml(0x6240, uint(0x5031, 0) + uint(0x5032, 1) + uint(0x5033, 0)
+              + _ebml(0x5034, uint(0x4254, 0))),
+    )  # fmt: skip
+    seg_start, seg_end = _matroska_segment(data)
+    children, offset = [], seg_start
+    while offset < seg_end:
+        element_id, id_len, _ = _read_vint(data, offset, keep_marker=True)
+        size, size_len, _ = _read_vint(data, offset + id_len, keep_marker=False)
+        body = offset + id_len + size_len
+        end = min(body + size, seg_end)
+        if element_id == 0x1654AE6B:  # Tracks: append to the audio TrackEntry
+            entries, inner = [], body
+            while inner < end:
+                eid, eid_len, _ = _read_vint(data, inner, keep_marker=True)
+                esize, esize_len, _ = _read_vint(
+                    data, inner + eid_len, keep_marker=False
+                )
+                ebody = inner + eid_len + esize_len
+                entry = data[ebody : ebody + esize]
+                is_audio = b"\x83\x81\x02" in entry
+                entries.append(_ebml(eid, entry + (encodings if is_audio else b"")))
+                inner = ebody + esize
+            children.append(_ebml(element_id, b"".join(entries)))
+        elif element_id not in (0x114D9B74, 0x1C53BB6B):
+            children.append(data[offset:end])
+        offset = end
+    return data[: seg_start - 12] + _ebml(0x18538067, b"".join(children))
+
+
+def test_audio_cli_refuses_content_encoded_audio_tracks(audio_cli):
+    data = _with_zlib_audio_encoding(_read("tone_mp3.mkv"))
+    with pytest.raises(UnsupportedVideoAudioError, match="content encoding"):
+        _cli_load(data)
+    assert audio_cli == []
+
+
+def test_audio_cli_bounds_output_without_a_duration_limit(audio_cli):
+    _cli_load("tone_aac.mp4")
+    command = audio_cli[0]
+    assert "atrim=end_sample=172848000" in command[command.index("-af") + 1]
+
+
+def test_audio_cli_ignores_crafted_mp4_sample_deltas(audio_cli):
+    """FFmpeg's advanced edit-list index would emit only a prefix of the track."""
+    import struct
+
+    data = _read("tone_aac.mp4")
+    entry = struct.pack(">II", 16, 1024)
+    assert data.count(entry) == 1
+    audio, sample_rate = _cli_load(data.replace(entry, struct.pack(">II", 16, 1088)))
+    assert len(audio) / sample_rate > 1.0
+    assert "-advanced_editlist" in audio_cli[0]
 
 
 def test_encoder_priming_does_not_fail_a_clip_at_the_limit(audio_cli):
