@@ -42,6 +42,14 @@ _MAX_STDERR_BYTES = 64 << 10
 # Encoder priming/padding (e.g. 1024 AAC samples) lengthens decoded output.
 _DURATION_TOLERANCE_S = 0.25
 _SLOTS = threading.BoundedSemaphore(4)
+# Codec names as reported by video_audio's track probe.
+_DECODABLE = {
+    "mp4": frozenset(
+        {"aac", "opus", "flac", ".mp3", "lpcm", "sowt", "twos", "in24", "in32",
+         "fl32", "fl64", "raw", "ulaw", "alaw"}
+    ),
+    "matroska": frozenset({"aac", "mpeg", "opus", "vorbis", "flac", "pcm"}),
+}  # fmt: skip
 
 logger = init_logger(__name__)
 
@@ -83,7 +91,9 @@ def _reason(stderr: bytes, returncode: int) -> str:
         re.sub(r"\[[^\]]* @ 0x[0-9a-f]+\]\s*", "", line).strip()
         for line in stderr.decode("utf-8", "replace").splitlines()
     ]
-    lines = [line for line in lines if line]
+    lines = [
+        line for line in lines if line and not line.startswith("Last message repeated")
+    ]
     decoder_lines = [line for line in lines if "decoder" in line.lower()]
     return (decoder_lines or lines or [f"exit status {returncode}"])[-1][:200]
 
@@ -152,11 +162,13 @@ def decode_with_cli(
     cli: str, data: bytes, track: _AudioTrack, max_duration_s: float | None
 ) -> tuple[npt.NDArray, float]:
     """Decode the first audio stream to 48 kHz mono float32 with the FFmpeg CLI."""
-    # FFmpeg skips tracks without a codec id, so its first audio stream would
-    # no longer be the track the probe found.
-    if not track.codec or track.codec in ("????", "unknown"):
+    # Only tracks this CLI decodes. FFmpeg skips entries with a missing or
+    # non-audio codec id, so its first audio stream would not be the probed one.
+    if track.codec not in _DECODABLE.get(track.container, ()):
         raise UnsupportedVideoAudioError(
-            "The video's audio track does not declare its codec."
+            f"The video's audio track uses codec '{track.codec or 'unknown'}' in a "
+            f"{track.container} container, which this server cannot decode. Use "
+            "AAC, MP3, Opus, Vorbis, FLAC or PCM audio."
         )
     if len(data) > _MAX_INPUT_BYTES:
         raise UnsupportedVideoAudioError(
@@ -169,6 +181,8 @@ def decode_with_cli(
     if max_duration_s is not None:
         max_samples = int((max_duration_s + _COLLECTION_SLACK_S) * _SAMPLE_RATE)
         filters += f",atrim=end_sample={max_samples}"
+    # Restamp from the sample count so client timestamps never reach the muxer.
+    filters += ",asetpts=N/SR/TB"
     if not _SLOTS.acquire(timeout=_TIMEOUT_S):
         raise RuntimeError("All audio decoder slots are busy.")
     try:

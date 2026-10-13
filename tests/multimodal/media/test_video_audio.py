@@ -4,8 +4,8 @@
 
 Fixtures are 1 s, 32x32 clips: a 440 Hz tone muxed as Opus in WebM (seekable
 and live/unknown-size), as AAC in MP4, as Vorbis in WebM, as MP3 in Matroska
-(also with a 1000 s timestamp jump), and silent MP4/WebM. Tests use no
-audio-decoder CLI unless they request the ``audio_cli`` fixture
+(also with a 1000 s timestamp jump and an 80 ms rewind), and silent MP4/WebM.
+Tests use no audio-decoder CLI unless they request the ``audio_cli`` fixture
 (``NV_TEST_OMNI_AUDIO_FFMPEG``).
 """
 
@@ -395,7 +395,14 @@ def _cli_load(name_or_data, **kwargs):
 
 
 @pytest.mark.parametrize(
-    "name", ["tone_aac.mp4", "tone_vorbis.webm", "tone_mp3.mkv", "tone_mp3_tsjump.mkv"]
+    "name",
+    [
+        "tone_aac.mp4",
+        "tone_vorbis.webm",
+        "tone_mp3.mkv",
+        "tone_mp3_tsjump.mkv",
+        "tone_mp3_tsrewind.mkv",
+    ],
 )
 def test_non_opus_tracks_are_decoded_by_the_audio_cli(audio_cli, name):
     result = _cli_load(name, max_duration_s=600)
@@ -516,12 +523,17 @@ def test_audio_cli_rejects_truncated_tracks_instead_of_dropping_narration(
         _cli_load(data[: int(len(data) * 0.8)])
 
 
-def test_audio_cli_rejects_a_track_without_a_codec_id(audio_cli):
+@pytest.mark.parametrize(
+    ("container", "codec"),
+    [("matroska", "unknown"), ("matroska", "v_mpeg4"), ("mp4", "????"), ("mp4", "ac3")],
+)
+def test_audio_cli_rejects_tracks_it_cannot_decode(audio_cli, container, codec):
+    """Missing or non-audio codec ids would make FFmpeg pick a later track."""
     from vllm.multimodal.media.video_audio import _AudioTrack
     from vllm.multimodal.media.video_audio_cli import decode_with_cli
 
-    track = _AudioTrack(container="matroska", codec="unknown", number=2)
-    with pytest.raises(UnsupportedVideoAudioError, match="does not declare"):
+    track = _AudioTrack(container=container, codec=codec, number=2)
+    with pytest.raises(UnsupportedVideoAudioError, match="cannot decode"):
         decode_with_cli("/bin/false", _read("tone_mp3.mkv"), track, 600)
     assert audio_cli == []
 
