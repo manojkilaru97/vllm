@@ -99,7 +99,8 @@ def request_stop_token_ids(params: SamplingParams) -> set[int]:
     stop_ids.update(params.stop_token_ids or ())
     if params.eos_token_id is not None:
         stop_ids.add(params.eos_token_id)
-    return stop_ids
+    # SamplingParams accepts bool stop ids (an int subclass); normalize to int.
+    return {int(i) for i in stop_ids}
 
 
 def normalize_no_eos_in_reasoning(

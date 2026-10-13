@@ -124,6 +124,13 @@ def test_request_stop_ids_bounds():
         _normalize(_params({KEY: True}, stop_token_ids=list(range(200, 400))))
 
 
+def test_bool_stop_ids_are_normalized_to_int():
+    normalized = _normalize(_params({KEY: True}, stop_token_ids=[True]))
+    blocked = normalized[KEY][BLOCKED_IDS]
+    assert blocked == [1, 2, 11] and all(type(i) is int for i in blocked)
+    assert get_normalized_token_ids(normalized, VOCAB) is not None
+
+
 def test_unsupported_engine_ignores_the_flag():
     assert _normalize(_params({KEY: True, "other": 1}), v2=False) == {"other": 1}
     # Before any request-specific validation or tokenizer resolution.
