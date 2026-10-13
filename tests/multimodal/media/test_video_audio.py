@@ -343,5 +343,7 @@ def test_every_rejection_names_the_visual_only_remedy():
         _check_block_padding(_OpusBlocks(packets=[b"x"]), -1, first_block=False)
     with pytest.raises(UnsupportedVideoAudioError) as aac:
         load_video_audio_without_pyav(_read("tone_aac.mp4"))
-    for error in (padding, aac):
+    with pytest.raises(ValueError) as duration:
+        load_video_audio_without_pyav(_read("tone_opus.webm"), max_duration_s=0.1)
+    for error in (padding, aac, duration):
         assert str(error.value).count('{"use_audio_in_video": false}') == 1
