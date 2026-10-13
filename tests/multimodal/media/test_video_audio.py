@@ -249,9 +249,41 @@ def test_duration_limit_stops_packet_extraction_early(monkeypatch):
     import vllm.multimodal.media.video_audio as video_audio
 
     muxed = []
+    monkeypatch.setattr(video_audio, "_COLLECTION_SLACK_S", 0.0)
     monkeypatch.setattr(
         video_audio, "_ogg_opus_from_packets", lambda *a: muxed.append(a) or b""
     )
     with pytest.raises(ValueError, match="maximum allowed duration"):
         load_video_audio_without_pyav(_read("tone_opus.webm"), max_duration_s=0.1)
     assert muxed == []
+
+
+def test_truncated_mp4_metadata_is_rejected_not_dropped():
+    data = _read("tone_aac.mp4")
+    moov = next(
+        body - 8
+        for box_type, body, _ in _iter_mp4_boxes(data, 0, len(data))
+        if box_type == b"moov"
+    )
+    with pytest.raises(UnsupportedVideoAudioError):
+        load_video_audio_without_pyav(data[: moov + 64])
+
+
+def test_duration_limit_allows_audio_exactly_at_the_limit():
+    pytest.importorskip("soundfile")
+    audio, sample_rate = load_video_audio_without_pyav(
+        _read("tone_opus.webm"), max_duration_s=1
+    )
+    assert len(audio) / sample_rate <= 1.0
+
+
+def test_interior_discard_padding_is_rejected():
+    from vllm.multimodal.media.video_audio import _check_block_padding, _OpusBlocks
+
+    _check_block_padding(_OpusBlocks(packets=[]), -5_000_000, first_block=True)
+    _check_block_padding(_OpusBlocks(packets=[b"x"]), 0, first_block=False)
+    with pytest.raises(UnsupportedVideoAudioError, match="DiscardPadding"):
+        _check_block_padding(_OpusBlocks(packets=[b"x"]), -1, first_block=False)
+    earlier_trailing = _OpusBlocks(packets=[b"x"], trailing_discard_ns=10)
+    with pytest.raises(UnsupportedVideoAudioError, match="DiscardPadding"):
+        _check_block_padding(earlier_trailing, 0, first_block=False)

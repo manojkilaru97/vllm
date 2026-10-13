@@ -27,6 +27,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _MAX_BOX_DEPTH = 8
+_COLLECTION_SLACK_S = 1.0
 
 
 class UnsupportedVideoAudioError(ValueError):
@@ -58,19 +59,24 @@ class _AudioTrack:
 _MP4_CONTAINER_BOXES = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
 
 
-def _iter_mp4_boxes(data: bytes, start: int, end: int):
+def _iter_mp4_boxes(data: bytes, start: int, end: int, strict: bool = False):
+    """Yield ``(type, body, end)`` boxes; ``strict`` raises on truncation."""
     offset = start
     while offset + 8 <= end:
         size, box_type = struct.unpack_from(">I4s", data, offset)
         header = 8
         if size == 1:
             if offset + 16 > end:
+                if strict:
+                    raise ValueError("truncated MP4 box header")
                 return
             size = struct.unpack_from(">Q", data, offset + 8)[0]
             header = 16
         elif size == 0:
             size = end - offset
         if size < header or offset + size > end:
+            if strict:
+                raise ValueError("truncated or malformed MP4 box")
             return
         yield box_type, offset + header, offset + size
         offset += size
@@ -80,7 +86,7 @@ def _mp4_audio_track(data: bytes) -> _AudioTrack | None:
     def walk(start: int, end: int, track: dict[str, bytes], depth: int = 0):
         if depth > _MAX_BOX_DEPTH:
             raise ValueError("MP4 boxes are nested too deeply")
-        for box_type, body, box_end in _iter_mp4_boxes(data, start, end):
+        for box_type, body, box_end in _iter_mp4_boxes(data, start, end, strict=True):
             if box_type == b"trak":
                 inner: dict[str, bytes] = {}
                 walk(body, box_end, inner, depth + 1)
@@ -317,6 +323,15 @@ class _OpusBlocks:
     trailing_block_samples: int = 0
 
 
+def _check_block_padding(blocks: _OpusBlocks, discard_ns: int, first_block: bool):
+    """Ogg can trim only the stream edges; reject padding anywhere else."""
+    if blocks.trailing_discard_ns or (discard_ns < 0 and not first_block):
+        raise UnsupportedVideoAudioError(
+            "The video's Opus track uses DiscardPadding inside the stream, "
+            "which this server cannot apply."
+        )
+
+
 def _matroska_track_packets(
     data: bytes,
     segment: tuple[int, int],
@@ -333,7 +348,13 @@ def _matroska_track_packets(
     blocks = _OpusBlocks(packets=[])
     first_block = True
     total_samples = 0
-    max_samples = None if max_duration_s is None else max_duration_s * 48000
+    # Packets include pre-skip and edge padding that decoding trims; allow some
+    # slack here and enforce the exact limit on the decoded audio.
+    max_samples = (
+        None
+        if max_duration_s is None
+        else (max_duration_s + _COLLECTION_SLACK_S) * 48000
+    )
 
     def block_packets(body: int, end: int, discard_ns: int) -> None:
         nonlocal first_block, total_samples
@@ -347,6 +368,7 @@ def _matroska_track_packets(
         total_samples += block_samples
         if max_samples is not None and total_samples > max_samples:
             raise _DurationExceeded(max_duration_s)
+        _check_block_padding(blocks, discard_ns, first_block)
         blocks.packets.extend(frames)
         if first_block and discard_ns < 0:
             blocks.leading_discard_ns = -discard_ns
@@ -577,7 +599,7 @@ def load_video_audio_without_pyav(
             blocks = _matroska_track_packets(
                 data, segment, track.number, max_duration_s
             )
-        except _DurationExceeded:
+        except (_DurationExceeded, UnsupportedVideoAudioError):
             raise
         except Exception as exc:
             raise UnsupportedVideoAudioError(
@@ -599,6 +621,6 @@ def load_video_audio_without_pyav(
         f"The video's audio track uses codec '{track.codec}' in a {track.container} "
         "container, which this server cannot decode. Use a WebM/Opus video, or set "
         'mm_processor_kwargs {"use_audio_in_video": false} for a visual-only answer '
-        "(optionally sending the audio as audio_url/input_audio in WAV, MP3, FLAC "
-        "or Ogg in that same request)."
+        "(optionally sending the audio in that same request as input_audio in WAV "
+        "or MP3, or as audio_url in WAV, MP3, FLAC or Ogg)."
     )
