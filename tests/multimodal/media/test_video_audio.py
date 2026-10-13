@@ -3,9 +3,13 @@
 """PyAV-free audio-in-video extraction (Nemotron Omni ``use_audio_in_video``).
 
 Fixtures are 1 s, 32x32 clips: a 440 Hz tone muxed as Opus in WebM (seekable
-and live/unknown-size), as AAC in MP4, and silent MP4/WebM.
+and live/unknown-size), as AAC in MP4, as Vorbis in WebM, as MP3 in Matroska,
+and silent MP4/WebM. Tests use no audio-decoder CLI unless they request the
+``audio_cli`` fixture (``VLLM_TEST_VIDEO_AUDIO_FFMPEG``).
 """
 
+import os
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +33,28 @@ ASSETS = Path(__file__).parent.parent / "assets" / "audio_in_video"
 
 def _read(name: str) -> bytes:
     return (ASSETS / name).read_bytes()
+
+
+@pytest.fixture(autouse=True)
+def _no_audio_cli(monkeypatch):
+    monkeypatch.setenv("VLLM_VIDEO_AUDIO_FFMPEG", "")
+
+
+@pytest.fixture
+def audio_cli(monkeypatch):
+    cli = os.environ.get("VLLM_TEST_VIDEO_AUDIO_FFMPEG", "")
+    if not os.access(cli, os.X_OK):
+        pytest.skip("VLLM_TEST_VIDEO_AUDIO_FFMPEG does not name an FFmpeg CLI")
+    monkeypatch.setenv("VLLM_VIDEO_AUDIO_FFMPEG", cli)
+    calls = []
+    real_run = subprocess.run
+
+    def run(command, *args, **kwargs):
+        calls.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
 
 
 def _dominant_hz(audio: np.ndarray, sample_rate: float) -> float:
@@ -359,3 +385,42 @@ def test_declared_opus_track_without_packets_is_rejected_not_dropped():
         offset = end
     with pytest.raises(UnsupportedVideoAudioError, match="no audio data"):
         load_video_audio_without_pyav(data[:seg_start] + b"".join(kept))
+
+
+@pytest.mark.parametrize("name", ["tone_aac.mp4", "tone_vorbis.webm", "tone_mp3.mkv"])
+def test_non_opus_tracks_are_decoded_by_the_audio_cli(audio_cli, name):
+    result = load_video_audio_without_pyav(_read(name), max_duration_s=600)
+
+    assert result is not None
+    audio, sample_rate = result
+    assert sample_rate == 48000 and audio.dtype == np.float32 and audio.ndim == 1
+    assert abs(len(audio) / sample_rate - 1.0) < 0.1
+    assert abs(_dominant_hz(audio, sample_rate) - 440) < 10
+    assert len(audio_cli) == 1 and "-protocol_whitelist" in audio_cli[0]
+
+
+@pytest.mark.parametrize("name", ["silent.mp4", "silent.webm", "tone_opus.webm"])
+def test_audio_cli_is_not_used_for_silent_or_opus_videos(audio_cli, name):
+    pytest.importorskip("soundfile")
+    result = load_video_audio_without_pyav(_read(name), max_duration_s=600)
+
+    assert (result is None) == name.startswith("silent")
+    assert audio_cli == []
+
+
+def test_audio_cli_failures_are_client_errors_without_paths(audio_cli):
+    # AudioSpecificConfig with audio object type 0: the AAC decoder cannot open.
+    config = bytes.fromhex("0580808005140856e5")
+    data = _read("tone_aac.mp4").replace(config, config[:5] + b"\0\0" + config[7:])
+    with pytest.raises(UnsupportedVideoAudioError, match="opening decoder") as raised:
+        load_video_audio_without_pyav(data)
+    message = str(raised.value)
+    assert "vllm-video-audio-" not in message
+    assert '{"use_audio_in_video": false}' in message
+    assert len(audio_cli) == 1
+
+
+def test_audio_cli_output_obeys_the_duration_limit(audio_cli):
+    with pytest.raises(ValueError, match="maximum allowed duration"):
+        load_video_audio_without_pyav(_read("tone_aac.mp4"), max_duration_s=0.25)
+    assert any("-t" in command for command in audio_cli)

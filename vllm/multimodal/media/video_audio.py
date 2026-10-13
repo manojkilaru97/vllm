@@ -3,10 +3,12 @@
 """Extract the audio track of an encoded video without PyAV.
 
 PyAV is the default decoder for ``use_audio_in_video``. Images that ship no
-PyAV (and no software AAC/Opus decoder) can still decode Opus through
-libsndfile, which reads Ogg Opus. This module finds the audio track of an
-ISO-BMFF (MP4/MOV) or Matroska (WebM/MKV) container, remuxes a Matroska Opus
-track into an in-memory Ogg Opus stream, and decodes it with ``soundfile``.
+PyAV can still decode a video's audio track: a Matroska Opus track is remuxed
+into an in-memory Ogg Opus stream and decoded with ``soundfile``; any other
+track (AAC, MP3, Vorbis, FLAC, AC-3, PCM, ...) is decoded by an audio-only
+FFmpeg CLI when one is installed (``VLLM_VIDEO_AUDIO_FFMPEG``, default
+``/opt/nvidia/omni-audio/bin/ffmpeg``). The CLI runs as a subprocess, so no
+decoder library is ever loaded into the serving process.
 
 ``load_video_audio_without_pyav`` returns ``None`` only when an MP4/MOV or
 Matroska/WebM container has no audio track, and raises
@@ -15,6 +17,7 @@ cannot decode or the container cannot be inspected, so callers never silently
 drop narration.
 """
 
+import os
 import struct
 from dataclasses import dataclass
 from io import BytesIO
@@ -28,6 +31,10 @@ logger = init_logger(__name__)
 
 _MAX_BOX_DEPTH = 8
 _COLLECTION_SLACK_S = 1.0
+_FFMPEG_ENV = "VLLM_VIDEO_AUDIO_FFMPEG"
+_DEFAULT_FFMPEG = "/opt/nvidia/omni-audio/bin/ffmpeg"
+_FFMPEG_SAMPLE_RATE = 48000
+_FFMPEG_TIMEOUT_S = 120.0
 
 
 _VISUAL_ONLY_REMEDY = (
@@ -569,6 +576,62 @@ def _decode_with_soundfile(
     return np.ascontiguousarray(audio, dtype=np.float32), float(native_sr)
 
 
+def _audio_decoder_cli() -> str | None:
+    path = os.environ.get(_FFMPEG_ENV, _DEFAULT_FFMPEG)
+    return path if path and os.access(path, os.X_OK) else None
+
+
+def _decode_with_ffmpeg(
+    cli: str, data: bytes, track: _AudioTrack, max_duration_s: float | None
+) -> tuple[npt.NDArray, float]:
+    """Decode the first audio stream to 48 kHz mono float32 with the FFmpeg CLI."""
+    import re
+    import subprocess
+    import tempfile
+
+    limit = []
+    if max_duration_s is not None:
+        limit = ["-t", f"{max_duration_s + _COLLECTION_SLACK_S:g}"]
+    # MP4 demuxing needs a seekable input (the moov box may follow mdat).
+    with tempfile.NamedTemporaryFile(prefix="vllm-video-audio-") as source:
+        source.write(data)
+        source.flush()
+        command = [
+            cli, "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-protocol_whitelist", "file", "-i", source.name,
+            "-map", "0:a:0", "-vn", "-sn", "-dn", *limit,
+            "-ac", "1", "-ar", str(_FFMPEG_SAMPLE_RATE),
+            "-f", "f32le", "-c:a", "pcm_f32le", "pipe:1",
+        ]  # fmt: skip
+        try:
+            result = subprocess.run(
+                command, capture_output=True, timeout=_FFMPEG_TIMEOUT_S, check=False
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise UnsupportedVideoAudioError(
+                f"Decoding the video's {track.codec} audio track timed out."
+            ) from exc
+        detail = result.stderr.decode("utf-8", "replace").replace(source.name, "video")
+    if result.returncode != 0:
+        lines = [
+            re.sub(r"\[[^\]]* @ 0x[0-9a-f]+\]\s*", "", line).strip()
+            for line in detail.splitlines()
+        ]
+        lines = [line for line in lines if line]
+        decoder_lines = [line for line in lines if "decoder" in line.lower()]
+        reason = (decoder_lines or lines or [f"exit status {result.returncode}"])[-1]
+        reason = reason[:200]
+        raise UnsupportedVideoAudioError(
+            f"Cannot decode the video's {track.codec} audio track: {reason}"
+        )
+    audio = np.frombuffer(result.stdout, dtype="<f4")
+    if audio.size == 0:
+        raise UnsupportedVideoAudioError("The video's decoded audio track is empty.")
+    if max_duration_s is not None and audio.size / _FFMPEG_SAMPLE_RATE > max_duration_s:
+        raise _DurationExceeded(max_duration_s)
+    return audio.astype(np.float32), float(_FFMPEG_SAMPLE_RATE)
+
+
 def _is_iso_bmff(data: bytes) -> bool:
     return any(
         box_type in (b"ftyp", b"moov")
@@ -597,15 +660,15 @@ def find_video_audio_track(data: bytes) -> _AudioTrack | None:
 def load_video_audio_without_pyav(
     data: bytes, *, max_duration_s: float | None = None
 ) -> tuple[npt.NDArray, float] | None:
-    """Decode the first audio track of ``data`` with libsndfile.
+    """Decode the first audio track of ``data`` without PyAV.
 
     Returns:
         ``(waveform, sample_rate)``, or ``None`` when the video has no audio
         track.
 
     Raises:
-        UnsupportedVideoAudioError: the video has an audio track whose codec
-            cannot be decoded without PyAV (e.g. AAC).
+        UnsupportedVideoAudioError: the video has an audio track that cannot be
+            decoded here (e.g. AAC without the audio-only FFmpeg CLI).
     """
     try:
         track = find_video_audio_track(data)
@@ -652,6 +715,9 @@ def load_video_audio_without_pyav(
             raise UnsupportedVideoAudioError(
                 f"Cannot decode the Opus audio track of the video: {exc}"
             ) from exc
+    cli = _audio_decoder_cli()
+    if cli is not None:
+        return _decode_with_ffmpeg(cli, data, track, max_duration_s)
     raise UnsupportedVideoAudioError(
         f"The video's audio track uses codec '{track.codec}' in a {track.container} "
         "container, which this server cannot decode. Use a WebM/Opus video, or set "
