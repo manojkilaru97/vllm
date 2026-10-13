@@ -34,7 +34,6 @@ from vllm.multimodal.media.video_audio import (
     _DurationExceeded,
     _ebml_uint,
     _iter_ebml,
-    _iter_mp4_boxes,
     _matroska_segment,
     _segment_children,
     load_video_audio_without_pyav,
@@ -124,49 +123,6 @@ def _matroska_audio_entry_problem(data: bytes) -> str | None:
                 return "uses Matroska content encoding (compression or encryption)"
             return None
         return None
-    return None
-
-
-def _mp4_audio_presentation_s(data: bytes) -> float | None:
-    """The first sound track's edited duration (tkhd, in mvhd timescale)."""
-    import struct
-
-    def children(start: int, end: int):
-        return _iter_mp4_boxes(data, start, end)
-
-    moov = next(((b, e) for t, b, e in children(0, len(data)) if t == b"moov"), None)
-    if moov is None:
-        return None
-    timescale = None
-    for box, body, end in children(*moov):
-        if box == b"mvhd" and end - body >= 32:
-            version = data[body]
-            timescale = struct.unpack_from(">I", data, body + (20 if version else 12))[
-                0
-            ]
-        elif box == b"trak" and timescale:
-            tkhd = mdia = None
-            for sub, sbody, send in children(body, end):
-                tkhd = (sbody, send) if sub == b"tkhd" else tkhd
-                mdia = (sbody, send) if sub == b"mdia" else mdia
-            if tkhd is None or mdia is None:
-                continue
-            handler = next(
-                (
-                    data[hb + 8 : hb + 12]
-                    for t, hb, _ in children(*mdia)
-                    if t == b"hdlr"
-                ),
-                None,
-            )
-            if handler != b"soun":
-                continue
-            version = data[tkhd[0]]
-            fmt, offset = (">Q", 28) if version else (">I", 20)
-            if tkhd[1] - tkhd[0] < offset + struct.calcsize(fmt):
-                return None
-            duration = struct.unpack_from(fmt, data, tkhd[0] + offset)[0]
-            return duration / timescale if duration else None
     return None
 
 
@@ -313,12 +269,4 @@ def decode_with_cli(
     decoded_s = audio.size / _SAMPLE_RATE
     if decoded_s > limit_s + _DURATION_TOLERANCE_S:
         raise _DurationExceeded(limit_s)
-    # Edit lists are honoured (trims stay trimmed); a decode far shorter than the
-    # track's edited duration means the sample table was inconsistent.
-    expected_s = _mp4_audio_presentation_s(data) if track.container == "mp4" else None
-    if expected_s is not None and decoded_s < min(expected_s, limit_s) * 0.9 - 0.1:
-        raise UnsupportedVideoAudioError(
-            f"The video's {track.codec} audio track decoded to {decoded_s:.2f} s of "
-            f"its declared {expected_s:.2f} s."
-        )
     return audio.astype(np.float32), float(_SAMPLE_RATE)
