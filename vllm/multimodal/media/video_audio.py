@@ -47,8 +47,9 @@ class UnsupportedVideoAudioError(ValueError):
 class _DurationExceeded(ValueError):
     def __init__(self, max_duration_s: float | None) -> None:
         super().__init__(
-            f"Audio exceeds maximum allowed duration of {max_duration_s}s. "
-            "Set VLLM_MAX_AUDIO_DECODE_DURATION_S to increase this limit."
+            f"Audio exceeds maximum allowed duration of {max_duration_s}s "
+            "(server limit VLLM_MAX_AUDIO_DECODE_DURATION_S). "
+            f"{_VISUAL_ONLY_REMEDY}"
         )
 
 
@@ -559,10 +560,7 @@ def _decode_with_soundfile(
     with soundfile.SoundFile(BytesIO(encoded)) as stream:
         native_sr = stream.samplerate
         if max_duration_s is not None and stream.frames / native_sr > max_duration_s:
-            raise ValueError(
-                f"Audio exceeds maximum allowed duration of {max_duration_s}s. "
-                "Set VLLM_MAX_AUDIO_DECODE_DURATION_S to increase this limit."
-            )
+            raise _DurationExceeded(max_duration_s)
         audio = stream.read(dtype="float32", always_2d=False)
     if audio.ndim > 1:
         audio = np.mean(audio, axis=-1)
