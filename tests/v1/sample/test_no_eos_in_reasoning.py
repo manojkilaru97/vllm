@@ -32,7 +32,7 @@ def _normalize(params, *, v2=True, defaults=DEFAULTS):
         params,
         resolve_default_token_ids=(lambda: defaults) if defaults else None,
         vocab_size=VOCAB,
-        use_v2_model_runner=v2,
+        unsupported_reason=None if v2 else "unsupported",
     )
     return params.extra_args
 
@@ -124,7 +124,7 @@ def test_request_stop_ids_bounds():
         _normalize(_params({KEY: True}, stop_token_ids=list(range(200, 400))))
 
 
-def test_v1_model_runner_ignores_the_flag():
+def test_unsupported_engine_ignores_the_flag():
     assert _normalize(_params({KEY: True, "other": 1}), v2=False) == {"other": 1}
     # Before any request-specific validation or tokenizer resolution.
     assert _normalize(_params({KEY: "bad"}), v2=False, defaults=None) == {}
