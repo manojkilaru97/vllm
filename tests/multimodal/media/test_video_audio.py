@@ -334,3 +334,14 @@ def test_compressed_quicktime_metadata_is_rejected_not_dropped():
     ftyp = (16).to_bytes(4, "big") + b"ftypqt  " + bytes(4)
     with pytest.raises(UnsupportedVideoAudioError, match="cmov"):
         load_video_audio_without_pyav(ftyp + moov)
+
+
+def test_every_rejection_names_the_visual_only_remedy():
+    from vllm.multimodal.media.video_audio import _check_block_padding, _OpusBlocks
+
+    with pytest.raises(UnsupportedVideoAudioError) as padding:
+        _check_block_padding(_OpusBlocks(packets=[b"x"]), -1, first_block=False)
+    with pytest.raises(UnsupportedVideoAudioError) as aac:
+        load_video_audio_without_pyav(_read("tone_aac.mp4"))
+    for error in (padding, aac):
+        assert str(error.value).count('{"use_audio_in_video": false}') == 1

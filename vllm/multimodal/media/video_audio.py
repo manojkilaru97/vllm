@@ -30,8 +30,18 @@ _MAX_BOX_DEPTH = 8
 _COLLECTION_SLACK_S = 1.0
 
 
+_VISUAL_ONLY_REMEDY = (
+    'Set mm_processor_kwargs {"use_audio_in_video": false} for a visual-only answer.'
+)
+
+
 class UnsupportedVideoAudioError(ValueError):
     """The video has an audio track that cannot be decoded here."""
+
+    def __init__(self, message: str) -> None:
+        if "use_audio_in_video" not in message:
+            message = f"{message} {_VISUAL_ONLY_REMEDY}"
+        super().__init__(message)
 
 
 class _DurationExceeded(ValueError):
@@ -557,7 +567,7 @@ def _decode_with_soundfile(
     if audio.ndim > 1:
         audio = np.mean(audio, axis=-1)
     if audio.size == 0:
-        raise ValueError("decoded audio track is empty")
+        raise UnsupportedVideoAudioError("The video's decoded audio track is empty.")
     return np.ascontiguousarray(audio, dtype=np.float32), float(native_sr)
 
 
@@ -610,9 +620,7 @@ def load_video_audio_without_pyav(
         ) from None
     except Exception as exc:
         raise UnsupportedVideoAudioError(
-            f"Cannot parse the video container to find its audio track: {exc}. "
-            'Set mm_processor_kwargs {"use_audio_in_video": false} for a '
-            "visual-only answer."
+            f"Cannot parse the video container to find its audio track: {exc}."
         ) from exc
     if track is None:
         return None
