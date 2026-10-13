@@ -103,12 +103,15 @@ def _pyav_available() -> bool:
     return importlib.util.find_spec("av") is not None
 
 
-def _load_audio_from_video_bytes(video_bytes: bytes, idx: int) -> AudioItem | None:
+def _load_audio_from_video_bytes(
+    video_bytes: bytes, idx: int, decoder_cli: bool = False
+) -> AudioItem | None:
     """Decode a video's audio track; ``None`` when it has no audio stream.
 
     With PyAV installed this is the original ``load_audio_pyav`` path. Without
     it (codec-restricted images), the track is located and decoded through
-    libsndfile; an audio track that cannot be decoded raises instead of being
+    libsndfile, or the audio-only FFmpeg CLI when ``decoder_cli`` (audio-capable
+    models only); an audio track that cannot be decoded raises instead of being
     silently dropped.
     """
     if _pyav_available():
@@ -126,7 +129,9 @@ def _load_audio_from_video_bytes(video_bytes: bytes, idx: int) -> AudioItem | No
     from vllm.multimodal.media.video_audio import load_video_audio_without_pyav
 
     return load_video_audio_without_pyav(
-        video_bytes, max_duration_s=envs.VLLM_MAX_AUDIO_DECODE_DURATION_S
+        video_bytes,
+        max_duration_s=envs.VLLM_MAX_AUDIO_DECODE_DURATION_S,
+        decoder_cli=decoder_cli,
     )
 
 
@@ -740,7 +745,9 @@ class NanoNemotronVLMultiModalProcessor(
                     "video must be loaded with keep_video_bytes=True (e.g. via "
                     "the chat API with a model that sets use_audio_in_video)."
                 )
-            audio = _load_audio_from_video_bytes(video_bytes, idx)
+            audio = _load_audio_from_video_bytes(
+                video_bytes, idx, decoder_cli=self.info.sound_config is not None
+            )
             if audio is None:
                 has_audio.append(False)
             else:
