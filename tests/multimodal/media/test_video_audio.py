@@ -538,6 +538,48 @@ def test_audio_cli_rejects_tracks_it_cannot_decode(audio_cli, container, codec):
     assert audio_cli == []
 
 
+def _ebml(element_id: int, body: bytes) -> bytes:
+    raw_id = element_id.to_bytes((element_id.bit_length() + 7) // 8, "big")
+    return raw_id + bytes([0x01]) + len(body).to_bytes(7, "big") + body
+
+
+def _with_zlib_subtitle_track(data: bytes) -> bytes:
+    """Add an S_VOBSUB track with zlib ContentEncoding (mkvmerge's default)."""
+    from vllm.multimodal.media.video_audio import _read_vint
+
+    uint = lambda element_id, value: _ebml(element_id, bytes([value]))  # noqa: E731
+    compression = _ebml(0x5034, uint(0x4254, 0))
+    encoding = _ebml(
+        0x6240, uint(0x5031, 0) + uint(0x5032, 1) + uint(0x5033, 0) + compression
+    )
+    entry = _ebml(
+        0xAE,
+        uint(0xD7, 3)
+        + uint(0x73C5, 3)
+        + uint(0x83, 0x11)
+        + _ebml(0x86, b"S_VOBSUB")
+        + _ebml(0x6D80, encoding),
+    )
+    seg_start, seg_end = _matroska_segment(data)
+    children, offset = [], seg_start
+    while offset < seg_end:
+        element_id, id_len, _ = _read_vint(data, offset, keep_marker=True)
+        size, size_len, _ = _read_vint(data, offset + id_len, keep_marker=False)
+        body = offset + id_len + size_len
+        end = min(body + size, seg_end)
+        if element_id == 0x1654AE6B:  # Tracks
+            children.append(_ebml(element_id, data[body:end] + entry))
+        elif element_id not in (0x114D9B74, 0x1C53BB6B):  # drop SeekHead, Cues
+            children.append(data[offset:end])
+        offset = end
+    return data[: seg_start - 12] + _ebml(0x18538067, b"".join(children))
+
+
+def test_audio_cli_tolerates_zlib_encoded_side_tracks(audio_cli):
+    audio, sample_rate = _cli_load(_with_zlib_subtitle_track(_read("tone_mp3.mkv")))
+    assert abs(_dominant_hz(audio, sample_rate) - 440) < 10
+
+
 def test_encoder_priming_does_not_fail_a_clip_at_the_limit(audio_cli):
     audio, sample_rate = _cli_load("tone_aac.mp4", max_duration_s=1)
     assert len(audio) / sample_rate > 1.0  # AAC priming samples
