@@ -69,6 +69,9 @@ class _Harness:
         self.sampler.add_request(idx, len(PROMPT), params)
         self.req_states.apply_staged_writes()
         self.sampler.apply_staged_writes()
+        # The model runner applies staged writes once per step; its rotating
+        # UVA staging buffers assume that cadence, so do not queue several.
+        torch.cuda.synchronize()
         return idx
 
     def remove(self, req_id: str) -> None:
