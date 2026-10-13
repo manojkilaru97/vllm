@@ -25,9 +25,16 @@ import numpy.typing as npt
 from vllm.logger import init_logger
 from vllm.multimodal.media.video_audio import (
     _COLLECTION_SLACK_S,
+    _TRACK_ENTRY,
+    _TRACK_TYPE,
+    _TRACKS,
     UnsupportedVideoAudioError,
     _AudioTrack,
     _DurationExceeded,
+    _ebml_uint,
+    _iter_ebml,
+    _matroska_segment,
+    _segment_children,
     load_video_audio_without_pyav,
 )
 
@@ -39,6 +46,9 @@ _TIMEOUT_S = 120.0
 _MEMORY_BYTES = 1 << 30
 _MAX_INPUT_BYTES = 512 << 20
 _MAX_STDERR_BYTES = 64 << 10
+# Output ceiling when the caller passes no duration limit.
+_DEFAULT_MAX_DURATION_S = 3600.0
+_CONTENT_ENCODINGS = 0x6D80
 # Encoder priming/padding (e.g. 1024 AAC samples) lengthens decoded output.
 _DURATION_TOLERANCE_S = 0.25
 _SLOTS = threading.BoundedSemaphore(4)
@@ -46,7 +56,7 @@ _SLOTS = threading.BoundedSemaphore(4)
 _DECODABLE = {
     "mp4": frozenset(
         {"aac", "opus", "flac", ".mp3", "lpcm", "sowt", "twos", "in24", "in32",
-         "fl32", "fl64", "raw", "ulaw", "alaw"}
+         "fl32", "fl64", "raw", "ulaw", "alaw", "ipcm", "fpcm"}
     ),
     "matroska": frozenset({"aac", "mpeg", "opus", "vorbis", "flac", "pcm"}),
 }  # fmt: skip
@@ -86,6 +96,26 @@ def decode_with_cli_fallback(
     return result
 
 
+def _matroska_audio_track_is_encoded(data: bytes) -> bool:
+    """Whether the probed (first) Matroska audio TrackEntry has ContentEncodings."""
+    segment = _matroska_segment(data)
+    if segment is None:
+        return False
+    for element_id, body, end in _segment_children(data, *segment):
+        if element_id != _TRACKS:
+            continue
+        for entry_id, entry, entry_end, _ in _iter_ebml(data, body, end):
+            if entry_id != _TRACK_ENTRY:
+                continue
+            fields = {
+                fid: (fb, fe) for fid, fb, fe, _ in _iter_ebml(data, entry, entry_end)
+            }
+            if _TRACK_TYPE in fields and _ebml_uint(data, *fields[_TRACK_TYPE]) == 2:
+                return _CONTENT_ENCODINGS in fields
+        return False
+    return False
+
+
 def _reason(stderr: bytes, returncode: int) -> str:
     lines = [
         re.sub(r"\[[^\]]* @ 0x[0-9a-f]+\]\s*", "", line).strip()
@@ -102,9 +132,7 @@ class _OutputLimit(Exception):
     pass
 
 
-def _run_bounded(
-    command: list[str], max_stdout: int | None
-) -> tuple[int, bytes, bytes]:
+def _run_bounded(command: list[str], max_stdout: int) -> tuple[int, bytes, bytes]:
     """Run ``command`` with bounded stdout/stderr and a deadline; always reap it."""
     process = subprocess.Popen(
         command,
@@ -170,19 +198,30 @@ def decode_with_cli(
             f"{track.container} container, which this server cannot decode. Use "
             "AAC, MP3, Opus, Vorbis, FLAC or PCM audio."
         )
+    # FFmpeg drops audio packets that fail zlib decompression without an error,
+    # so compressed or encrypted audio tracks are refused rather than truncated.
+    if track.container == "matroska" and _matroska_audio_track_is_encoded(data):
+        raise UnsupportedVideoAudioError(
+            "The video's audio track uses Matroska content encoding (compression "
+            "or encryption), which this server does not decode."
+        )
     if len(data) > _MAX_INPUT_BYTES:
         raise UnsupportedVideoAudioError(
             f"The video is larger than {_MAX_INPUT_BYTES >> 20} MiB, the limit for "
             "extracting its audio track."
         )
     # Bound the output by sample count, not timestamps (which the client controls).
-    max_samples = None
-    filters = f"aresample={_SAMPLE_RATE},aformat=sample_fmts=flt:channel_layouts=mono"
-    if max_duration_s is not None:
-        max_samples = int((max_duration_s + _COLLECTION_SLACK_S) * _SAMPLE_RATE)
-        filters += f",atrim=end_sample={max_samples}"
+    limit_s = _DEFAULT_MAX_DURATION_S if max_duration_s is None else max_duration_s
+    max_samples = int((limit_s + _COLLECTION_SLACK_S) * _SAMPLE_RATE)
+    filters = (
+        f"aresample={_SAMPLE_RATE},aformat=sample_fmts=flt:channel_layouts=mono"
+        f",atrim=end_sample={max_samples}"
+    )
     # Restamp from the sample count so client timestamps never reach the muxer.
     filters += ",asetpts=N/SR/TB"
+    # mov demuxer: the advanced edit-list index can emit only a prefix of a
+    # track with crafted sample deltas; plain edit lists are still applied.
+    demuxer_options = ["-advanced_editlist", "0"] if track.container == "mp4" else []
     if not _SLOTS.acquire(timeout=_TIMEOUT_S):
         raise RuntimeError("All audio decoder slots are busy.")
     try:
@@ -200,15 +239,15 @@ def decode_with_cli(
                 _PRLIMIT, f"--as={_MEMORY_BYTES}", "--",
                 cli, "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
                 "-threads", "1", "-filter_threads", "1",
-                "-protocol_whitelist", "file", "-i", source,
+                "-protocol_whitelist", "file", *demuxer_options,
+                "-i", source,
                 "-map", "0:a:0", "-vn", "-sn", "-dn", "-af", filters,
                 "-f", "f32le", "-c:a", "pcm_f32le", "pipe:1",
             ]  # fmt: skip
-            max_bytes = None if max_samples is None else max_samples * 4
             try:
-                returncode, stdout, stderr = _run_bounded(command, max_bytes)
+                returncode, stdout, stderr = _run_bounded(command, max_samples * 4)
             except _OutputLimit:
-                raise _DurationExceeded(max_duration_s) from None
+                raise _DurationExceeded(limit_s) from None
     finally:
         _SLOTS.release()
     # At -loglevel error any diagnostic (e.g. "File ended prematurely") means the
@@ -221,9 +260,6 @@ def decode_with_cli(
     audio = np.frombuffer(stdout, dtype="<f4")
     if audio.size == 0:
         raise UnsupportedVideoAudioError("The video's decoded audio track is empty.")
-    if (
-        max_duration_s is not None
-        and audio.size / _SAMPLE_RATE > max_duration_s + _DURATION_TOLERANCE_S
-    ):
-        raise _DurationExceeded(max_duration_s)
+    if audio.size / _SAMPLE_RATE > limit_s + _DURATION_TOLERANCE_S:
+        raise _DurationExceeded(limit_s)
     return audio.astype(np.float32), float(_SAMPLE_RATE)
