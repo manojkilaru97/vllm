@@ -164,8 +164,16 @@ class InputProcessor:
                 else None
             ),
             vocab_size=self.model_config.get_vocab_size(),
-            use_v2_model_runner=self.use_v2_model_runner,
+            unsupported_reason=self._no_eos_unsupported_reason(),
         )
+
+    def _no_eos_unsupported_reason(self) -> str | None:
+        if not self.use_v2_model_runner:
+            return "it requires the V2 model runner (VLLM_USE_V2_MODEL_RUNNER=1)"
+        spec = self.speculative_config
+        if spec is not None and spec.rejection_sample_method == "synthetic":
+            return "synthetic speculative acceptance ignores target probabilities"
+        return None
 
     def _resolve_no_eos_default_token_ids(self) -> tuple[list[int], list[int]]:
         if self._no_eos_default_token_ids is None:

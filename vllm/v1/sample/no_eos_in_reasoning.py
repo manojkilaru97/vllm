@@ -24,11 +24,12 @@ The engine normalizes the value into ``{"reasoning_end_token_ids": [...],
 "blocked_token_ids": [...]}`` (also accepted, and re-validated, as input);
 the Model Runner V2 sampler reads only that form.
 
-The flag is ignored (with a warning) by engines without the V2 model runner and
-for requests whose ``allowed_token_ids`` (minus single-token bad words) are all
-stop tokens. Client constraints that leave only stop tokens at some step (a
-structured-output grammar, or a multi-token bad word that bans the last allowed
-non-stop token) win at runtime: the stop tokens are then kept.
+The flag is ignored (with a warning) by engines that cannot apply it (no V2
+model runner, or synthetic speculative acceptance, which ignores target
+probabilities) and for requests whose ``allowed_token_ids`` (minus single-token
+bad words) are all stop tokens. Client constraints that leave only stop tokens
+at some step (a structured-output grammar, or a multi-token bad word that bans
+the last allowed non-stop token) win at runtime: the stop tokens are then kept.
 """
 
 from collections.abc import Callable
@@ -106,7 +107,7 @@ def normalize_no_eos_in_reasoning(
     *,
     resolve_default_token_ids: Callable[[], tuple[list[int], list[int]]] | None,
     vocab_size: int,
-    use_v2_model_runner: bool,
+    unsupported_reason: str | None,
 ) -> None:
     """Validate the request flag and store its normalized form in extra_args.
 
@@ -126,14 +127,13 @@ def normalize_no_eos_in_reasoning(
     if value is None or value is False:
         params.extra_args = rest
         return
-    if not use_v2_model_runner:
+    if unsupported_reason is not None:
         logger.warning_once(
-            "%s is ignored: it requires the V2 model runner "
-            "(VLLM_USE_V2_MODEL_RUNNER=1).",
-            NO_EOS_IN_REASONING_KEY,
+            "%s is ignored: %s.", NO_EOS_IN_REASONING_KEY, unsupported_reason
         )
         params.extra_args = rest
         return
+
     extra_blocked: list[int] = []
     if value is True:
         if resolve_default_token_ids is None:
