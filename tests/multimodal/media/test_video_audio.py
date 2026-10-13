@@ -316,3 +316,21 @@ def test_quicktime_data_handler_in_minf_does_not_hide_the_audio_track():
     reordered = rebuild(data, 0, len(data))
     with pytest.raises(UnsupportedVideoAudioError, match="'aac'"):
         load_video_audio_without_pyav(reordered)
+
+
+@pytest.mark.parametrize(
+    "tail", [b"", bytes(16), (1 << 20).to_bytes(4, "big") + b"mdat"]
+)
+def test_silent_mp4_tail_damage_after_moov_stays_visual_only(tail):
+    data = _read("silent.mp4")
+    boxes = {k: data[b - 8 : e] for k, b, e in _iter_mp4_boxes(data, 0, len(data))}
+    faststart = boxes[b"ftyp"] + boxes[b"moov"] + boxes[b"mdat"][:-50] + tail
+    assert load_video_audio_without_pyav(faststart) is None
+
+
+def test_compressed_quicktime_metadata_is_rejected_not_dropped():
+    cmov = (16).to_bytes(4, "big") + b"cmov" + bytes(8)
+    moov = (8 + len(cmov)).to_bytes(4, "big") + b"moov" + cmov
+    ftyp = (16).to_bytes(4, "big") + b"ftypqt  " + bytes(4)
+    with pytest.raises(UnsupportedVideoAudioError, match="cmov"):
+        load_video_audio_without_pyav(ftyp + moov)

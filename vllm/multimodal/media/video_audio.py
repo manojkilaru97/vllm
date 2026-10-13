@@ -108,10 +108,27 @@ def _mp4_audio_track(data: bytes) -> _AudioTrack | None:
                 track["handler"] = data[body + 8 : body + 12]
             elif box_type == b"stsd" and body + 16 <= box_end:
                 track["codec"] = data[body + 12 : body + 16]
+            elif box_type == b"cmov":
+                raise ValueError("compressed QuickTime movie metadata (cmov)")
         return None
 
-    codec = walk(0, len(data), {})
+    codec = None
+    moov_walked = False
+    try:
+        for box_type, body, box_end in _iter_mp4_boxes(data, 0, len(data), strict=True):
+            if box_type == b"moov":
+                codec = walk(body, box_end, {}, 1, box_type)
+                if codec is not None:
+                    break
+                moov_walked = True
+    except ValueError:
+        # A cut or padded tail after a complete `moov` (e.g. a truncated
+        # `mdat`) does not change the track list; without one, re-raise.
+        if not moov_walked:
+            raise
     if codec is None:
+        if not moov_walked:
+            raise ValueError("MP4 container has no moov box")
         return None
     name = {b"mp4a": "aac", b"Opus": "opus", b"fLaC": "flac", b"ac-3": "ac3"}.get(
         codec, codec.decode("latin-1").strip()
@@ -593,7 +610,9 @@ def load_video_audio_without_pyav(
         ) from None
     except Exception as exc:
         raise UnsupportedVideoAudioError(
-            f"Cannot parse the video container to find its audio track: {exc}"
+            f"Cannot parse the video container to find its audio track: {exc}. "
+            'Set mm_processor_kwargs {"use_audio_in_video": false} for a '
+            "visual-only answer."
         ) from exc
     if track is None:
         return None
