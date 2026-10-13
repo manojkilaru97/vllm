@@ -22,6 +22,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
     LogprobTokenIdsState,
     compute_topk_scores,
 )
+from vllm.v1.worker.gpu.sample.no_eos_in_reasoning import NoEosInReasoningState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
@@ -52,6 +53,7 @@ class Sampler:
         self.bad_words_state = BadWordsState(req_states)
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
+        self.no_eos_in_reasoning_state = NoEosInReasoningState(req_states)
         self.num_speculative_tokens = num_speculative_tokens
         self.use_flashinfer = flashinfer_sampler_supported()
 
@@ -64,6 +66,7 @@ class Sampler:
         self.bad_words_state.add_request(req_idx, sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         self.thinking_budget_state.add_request(req_idx, sampling_params)
+        self.no_eos_in_reasoning_state.add_request(req_idx, prompt_len, sampling_params)
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -72,6 +75,7 @@ class Sampler:
         self.bad_words_state.apply_staged_writes()
         self.logprob_token_ids_state.apply_staged_writes()
         self.thinking_budget_state.apply_staged_writes()
+        self.no_eos_in_reasoning_state.apply_staged_writes()
 
     def __call__(
         self,
@@ -190,6 +194,17 @@ class Sampler:
             expanded_local_pos,
         )
 
+        # Mask stop tokens while an opted-in request's reasoning is open. This
+        # also masks the target logits for spec-decode verification.
+        self.no_eos_in_reasoning_state.apply(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping,
+            idx_mapping_np,
+            input_ids,
+            expanded_local_pos,
+        )
+
         # Force the reasoning end marker once a request's thinking budget is
         # reached; applied before temperature so the forced token is always kept.
         self.thinking_budget_state.apply(
@@ -227,6 +242,8 @@ class Sampler:
         if np.any(self.penalties_state.use_penalty[idx_mapping_np]):
             return True
         if np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] > 0):
+            return True
+        if self.no_eos_in_reasoning_state.any_active(idx_mapping_np):
             return True
 
         states = self.sampling_states
