@@ -24,13 +24,13 @@ The engine normalizes the value into ``{"reasoning_end_token_ids": [...],
 "blocked_token_ids": [...]}`` (also accepted, and re-validated, as input);
 the Model Runner V2 sampler reads only that form.
 
-A request whose own constraints leave only stop tokens (e.g. an
-``allowed_token_ids`` list of stop tokens) is rejected. If a structured-output
-grammar permits only a stop token while reasoning is open, the grammar wins and
-the stop token is kept. Engines without the V2 model runner ignore the flag
-with a warning.
+The flag is ignored (with a warning) for requests with ``allowed_token_ids`` or
+bad words, whose token constraints take precedence, and by engines without the
+V2 model runner. If a structured-output grammar permits only a stop token while
+reasoning is open, the grammar wins and the stop token is kept.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 from vllm.exceptions import VLLMValidationError
@@ -103,7 +103,7 @@ def request_stop_token_ids(params: SamplingParams) -> set[int]:
 def normalize_no_eos_in_reasoning(
     params: SamplingParams,
     *,
-    default_token_ids: tuple[list[int], list[int]] | None,
+    resolve_default_token_ids: Callable[[], tuple[list[int], list[int]]] | None,
     vocab_size: int,
     use_v2_model_runner: bool,
 ) -> None:
@@ -112,8 +112,7 @@ def normalize_no_eos_in_reasoning(
     The caller's extra_args dict is never mutated; a new dict is assigned.
 
     Raises:
-        VLLMValidationError: if the value is malformed or the constraint cannot
-            be applied to this request or by this engine.
+        VLLMValidationError: if the value is malformed.
     """
     extra_args = params.extra_args
     if not extra_args or NO_EOS_IN_REASONING_KEY not in extra_args:
@@ -126,12 +125,29 @@ def normalize_no_eos_in_reasoning(
     if value is None or value is False:
         params.extra_args = rest
         return
+    if not use_v2_model_runner:
+        logger.warning_once(
+            "%s is ignored: it requires the V2 model runner "
+            "(VLLM_USE_V2_MODEL_RUNNER=1).",
+            NO_EOS_IN_REASONING_KEY,
+        )
+        params.extra_args = rest
+        return
+    if params.allowed_token_ids is not None or params.bad_words_token_ids:
+        # Client token constraints take precedence: combined with them the mask
+        # could leave only stop tokens.
+        logger.warning_once(
+            "%s is ignored for requests with allowed_token_ids or bad words.",
+            NO_EOS_IN_REASONING_KEY,
+        )
+        params.extra_args = rest
+        return
 
     extra_blocked: list[int] = []
     if value is True:
-        if default_token_ids is None:
+        if resolve_default_token_ids is None:
             raise _invalid("a tokenizer is required to resolve the default tokens")
-        end_ids, extra_blocked = default_token_ids
+        end_ids, extra_blocked = resolve_default_token_ids()
     elif isinstance(value, dict):
         if set(value) - {END_IDS, BLOCKED_IDS}:
             raise _invalid(f"unexpected keys {sorted(set(value))}", value)
@@ -154,18 +170,6 @@ def normalize_no_eos_in_reasoning(
         raise _invalid(f"at most {MAX_BLOCKED_TOKEN_IDS} stop token ids")
     if any(i < 0 or i >= vocab_size for i in (*end_ids, *blocked)):
         raise _invalid(f"token ids must be in [0, {vocab_size})", value)
-    if params.allowed_token_ids is not None:
-        banned = {w[0] for w in params.bad_words_token_ids or () if len(w) == 1}
-        if set(params.allowed_token_ids) - banned <= set(blocked):
-            raise _invalid("allowed_token_ids leaves only stop tokens")
-    if not use_v2_model_runner:
-        logger.warning_once(
-            "%s is ignored: it requires the V2 model runner "
-            "(VLLM_USE_V2_MODEL_RUNNER=1).",
-            NO_EOS_IN_REASONING_KEY,
-        )
-        params.extra_args = rest
-        return
     params.extra_args = {
         **rest,
         NO_EOS_IN_REASONING_KEY: {END_IDS: end_ids, BLOCKED_IDS: blocked},

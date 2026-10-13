@@ -30,7 +30,7 @@ def _params(extra_args, **kwargs) -> SamplingParams:
 def _normalize(params, *, v2=True, defaults=DEFAULTS):
     normalize_no_eos_in_reasoning(
         params,
-        default_token_ids=defaults,
+        resolve_default_token_ids=(lambda: defaults) if defaults else None,
         vocab_size=VOCAB,
         use_v2_model_runner=v2,
     )
@@ -104,18 +104,17 @@ def test_vllm_xargs_integer_booleans(value, enabled):
     assert (KEY in (normalized or {})) is enabled
 
 
-def test_allowed_tokens_must_leave_a_non_stop_token():
-    with pytest.raises(VLLMValidationError, match="allowed_token_ids"):
-        _normalize(_params({KEY: True}, allowed_token_ids=[2, 11]))
-    assert _normalize(_params({KEY: True}, allowed_token_ids=[2, 11, 99]))
-    params = _params({KEY: True}, allowed_token_ids=[2, 11, 99])
-    params._bad_words_token_ids = [[99], [98, 99]]
-    with pytest.raises(VLLMValidationError, match="allowed_token_ids"):
-        _normalize(params)
+def test_client_token_constraints_disable_the_flag():
+    assert _normalize(_params({KEY: True}, allowed_token_ids=[2, 11, 99])) == {}
+    params = _params({KEY: True})
+    params._bad_words_token_ids = [[99, 99]]
+    assert _normalize(params) == {}
 
 
 def test_v1_model_runner_ignores_the_flag():
     assert _normalize(_params({KEY: True, "other": 1}), v2=False) == {"other": 1}
+    # Before any request-specific validation or tokenizer resolution.
+    assert _normalize(_params({KEY: "bad"}), v2=False, defaults=None) == {}
 
 
 def test_true_without_tokenizer_is_rejected():

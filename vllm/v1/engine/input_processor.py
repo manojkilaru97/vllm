@@ -156,19 +156,22 @@ class InputProcessor:
         extra_args = params.extra_args
         if not extra_args or NO_EOS_IN_REASONING_KEY not in extra_args:
             return
-        default_token_ids = None
-        if extra_args[NO_EOS_IN_REASONING_KEY] is True and self.tokenizer is not None:
-            if self._no_eos_default_token_ids is None:
-                self._no_eos_default_token_ids = resolve_default_token_ids(
-                    self.tokenizer
-                )
-            default_token_ids = self._no_eos_default_token_ids
         normalize_no_eos_in_reasoning(
             params,
-            default_token_ids=default_token_ids,
+            resolve_default_token_ids=(
+                self._resolve_no_eos_default_token_ids
+                if self.tokenizer is not None
+                else None
+            ),
             vocab_size=self.model_config.get_vocab_size(),
             use_v2_model_runner=self.use_v2_model_runner,
         )
+
+    def _resolve_no_eos_default_token_ids(self) -> tuple[list[int], list[int]]:
+        if self._no_eos_default_token_ids is None:
+            assert self.tokenizer is not None
+            self._no_eos_default_token_ids = resolve_default_token_ids(self.tokenizer)
+        return self._no_eos_default_token_ids
 
     def _validate_lora(self, lora_request: LoRARequest | None) -> None:
         if lora_request is None:
