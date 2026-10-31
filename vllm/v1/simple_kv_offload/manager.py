@@ -292,6 +292,11 @@ class SimpleCPUOffloadScheduler:
         if request.skip_reading_prefix_cache:
             return 0, False
 
+        # The CPU tier moves whole blocks; a local hit ending mid-block (finer
+        # prefix_match_unit) cannot be continued from CPU, so recompute that tail.
+        if num_computed_tokens % self.block_size:
+            return 0, False
+
         num_skipped_hashes = num_computed_tokens // self.hash_block_size
         remaining_hashes = request.block_hashes[num_skipped_hashes:]
 
@@ -305,6 +310,16 @@ class SimpleCPUOffloadScheduler:
         cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
+        # A CPU hit may also end mid-block; load only its block-aligned prefix.
+        if hit_length % self.block_size:
+            aligned = hit_length - hit_length % self.block_size
+            if aligned <= 0:
+                return 0, False
+            cpu_hit_blocks, hit_length, _ = (
+                self.cpu_coordinator.find_longest_cache_hit(remaining_hashes, aligned)
+            )
+            if hit_length % self.block_size:
+                return 0, False
 
         if hit_length > 0:
             pin_blocks = [

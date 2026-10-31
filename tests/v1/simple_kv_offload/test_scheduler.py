@@ -2158,3 +2158,30 @@ def test_cp_lazy_target_blocks_scaling(cp_world_size: int) -> None:
             f"cp_world_size={cp_world_size}: target_cp={target_cp} should be "
             f"less than target_base={target_base}"
         )
+
+
+def test_sub_block_hits_are_block_aligned_or_skipped() -> None:
+    """prefix_match_unit < block size: CPU hits must be whole blocks."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+    req = make_request(num_blocks=3)
+
+    # A local hit ending mid-block cannot be continued from the CPU tier.
+    assert sched.get_num_new_matched_tokens(req, num_computed_tokens=5) == (0, False)
+
+    calls: list[int] = []
+
+    def fake_hit(hashes, max_len):
+        calls.append(max_len)
+        hit = 2 * BLOCK_SIZE + 3 if len(calls) == 1 else max_len
+        return ([[]], hit, None)
+
+    sched.cpu_coordinator.find_longest_cache_hit = fake_hit
+    hit, is_async = sched.get_num_new_matched_tokens(req, num_computed_tokens=0)
+    assert (hit, is_async) == (2 * BLOCK_SIZE, True)
+    assert calls[-1] == 2 * BLOCK_SIZE
+    sched._pending_cpu_hits.pop(req.request_id, None)
+
+    calls.clear()
+    sched.cpu_coordinator.find_longest_cache_hit = lambda h, m: ([[]], BLOCK_SIZE - 1, None)
+    assert sched.get_num_new_matched_tokens(req, num_computed_tokens=0) == (0, False)
