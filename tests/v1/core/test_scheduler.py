@@ -8092,6 +8092,7 @@ def _create_hybrid_mamba_connector_scheduler(
     block_size: int = 16,
     num_blocks: int = 100,
     supports_divergent_hits: bool = True,
+    hash_block_size: int | None = None,
 ) -> Scheduler:
     """FA + Mamba ("align" cache mode) scheduler with a MockKVConnector."""
     model_config = ModelConfig(
@@ -8157,7 +8158,7 @@ def _create_hybrid_mamba_connector_scheduler(
         kv_cache_config=kv_cache_config,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=block_size,
-        hash_block_size=block_size,
+        hash_block_size=hash_block_size or block_size,
         log_stats=True,
     )
 
@@ -8980,3 +8981,51 @@ def test_cpu_encoder_input_updates_preserve_shm_handles(use_v2_model_runner):
         {request.request_id: {1: None}} if use_v2_model_runner else {}
     )
     assert request.mm_features[0].data is handle
+
+
+def test_hybrid_fa_deeper_partial_tail_hit_with_lagging_mamba():
+    """FA hit ends mid-block past a lagging Mamba hit and the connector beats
+    the sub-block tail: truncating to the aligned local hit must not assert."""
+    block_size, hash_block_size = 16, 4
+    scheduler = _create_hybrid_mamba_connector_scheduler(
+        matched_tokens=block_size,
+        hash_block_size=hash_block_size,
+    )
+    manager = scheduler.kv_cache_manager
+
+    [fill] = create_requests(
+        num_requests=1,
+        num_tokens=4 * block_size + 2 * hash_block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=hash_block_size,
+        req_ids=["fill"],
+    )
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(fill)
+    blocks = manager.allocate_slots(
+        fill, fill.num_tokens, num_computed, computed_blocks
+    )
+    mamba_ids = {b.block_id for b in blocks.blocks[1] if not b.is_null}
+    manager.free(fill)
+    manager.block_pool.evict_blocks(mamba_ids)
+
+    [replay] = create_requests(
+        num_requests=1,
+        num_tokens=6 * block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=hash_block_size,
+        req_ids=["replay"],
+    )
+    _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
+        replay.block_hashes, replay.num_tokens - 1
+    )
+    # FA ends mid-block past the evicted (lagging) Mamba hit.
+    fa_hit, mamba_hit = per_group_hits
+    assert 4 * block_size < fa_hit < 5 * block_size and mamba_hit == 0
+
+    scheduler.add_request(replay)
+    output = scheduler.schedule()
+    num_scheduled = output.num_scheduled_tokens[replay.request_id]
+    # v0.33 keeps the divergent FA hit; the connector adds one block on top.
+    assert replay.num_tokens - num_scheduled == fa_hit + block_size
