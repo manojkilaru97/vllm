@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from itertools import islice
 from unittest.mock import Mock
 
 import pytest
@@ -28,9 +29,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector i
     SimpleCPUOffloadConnector,
 )
 from vllm.utils.hashing import sha256
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     get_request_block_hasher,
     init_none_hash,
     make_block_hash_with_group_id,
@@ -3521,3 +3524,76 @@ def test_eager_store_matches_gpu_cacheable_prefix(
         scheduler.cpu_block_pool.blocks[bid].block_hash
         for bid in load_meta.load_cpu_blocks
     ] == target_hashes + draft_hashes
+
+
+def _make_mamba_align_config(num_blocks: int, num_mamba_groups: int) -> KVCacheConfig:
+    """Attention + Mamba (align mode) groups, like Nemotron-H hybrids."""
+    attn = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    mamba = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((NUM_KV_HEADS, HEAD_SIZE),),
+        dtypes=(DTYPE,),
+        mamba_cache_mode="align",
+    )
+    groups = [KVCacheGroupSpec(["attn"], attn)] + [
+        KVCacheGroupSpec([f"mamba_{g}"], mamba) for g in range(num_mamba_groups)
+    ]
+    tensors = [
+        KVCacheTensor(
+            size=_BYTES_PER_BLOCK * num_blocks,
+            layers=[g.layer_names[0] for g in groups],
+            layer_stride=0,
+            block_stride=_BYTES_PER_BLOCK,
+        )
+    ]
+    return KVCacheConfig(
+        num_blocks=num_blocks, kv_cache_tensors=tensors, kv_cache_groups=groups
+    )
+
+
+@pytest.mark.parametrize("num_mamba_groups", [1, 4])
+def test_lazy_target_covers_full_mamba_align_steps(num_mamba_groups: int) -> None:
+    """Full steps allocate a block per group per filled slot in align mode; lazy
+    offload must copy hashed blocks before such steps evict them, with the
+    previous step's copy still in flight (async scheduling)."""
+    max_batched = 64  # _make_vllm_config
+    num_gpu_blocks = 256
+    fix = make_scheduler(num_cpu_blocks=4096, num_gpu_blocks=num_gpu_blocks, lazy=True)
+    sched, gpu_pool = fix.scheduler, fix.gpu_block_pool
+    sched._target_free = SimpleCPUOffloadScheduler._estimate_lazy_target_blocks(
+        _make_mamba_align_config(num_gpu_blocks, num_mamba_groups), max_batched
+    )
+
+    num_groups = 1 + num_mamba_groups
+    per_step = cdiv(max_batched, BLOCK_SIZE) * num_groups
+    copied: set = set()
+    live: list = []
+    pending_event = -1
+    evicted = lost = 0
+    for step in range(64):
+        gpu_pool.free_blocks(live)
+        for blk in islice(gpu_pool.free_block_queue.iter_blocks_after(None), per_step):
+            if blk.block_hash is not None:
+                evicted += 1
+                lost += blk.block_hash not in copied
+        live = gpu_pool.get_new_blocks(per_step)
+        for i, blk in enumerate(live):
+            key = BlockHash(f"{step}-{i}".encode())
+            gpu_pool._insert_block_hash(
+                make_block_hash_with_group_id(key, i % num_groups),
+                blk,
+                num_tokens=BLOCK_SIZE,
+            )
+        if pending_event >= 0:
+            simulate_store_completion(sched, pending_event)
+        meta = sched.build_connector_meta(make_scheduler_output({}))
+        copied.update(gpu_pool.blocks[b].block_hash for b in meta.store_gpu_blocks)
+        pending_event = meta.store_event
+
+    assert evicted > 0
+    assert lost == 0, f"{lost}/{evicted} hashed blocks evicted before offload"

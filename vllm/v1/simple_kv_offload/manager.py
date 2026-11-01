@@ -346,6 +346,10 @@ class SimpleCPUOffloadScheduler:
             spec = g.kv_cache_spec
             block_size = resolve_dcp_kv_block_size(spec, cp_world_size)
             if isinstance(spec, MambaSpec):
+                # Align mode takes a state block per request crossing a block
+                # boundary, so a full step can allocate as many as attention.
+                if spec.mamba_cache_mode == "align":
+                    target += cdiv(max_num_batched_tokens, spec.block_size)
                 target += 2
             elif isinstance(spec, SlidingWindowSpec):
                 target += cdiv(spec.sliding_window, block_size) + 1
