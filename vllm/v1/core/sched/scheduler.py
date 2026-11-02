@@ -38,7 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.sched import priority_trace
+from vllm.v1.core.sched import priority_trace, priority_yield
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -188,6 +188,18 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        # Opt-in: low-priority prefill chunks yield budget to waiting higher-priority ones.
+        self.prefill_reserve_frac = (
+            priority_yield.reserve_frac_from_env()
+            if self.policy == SchedulingPolicy.PRIORITY
+            else 0.0
+        )
+        self.priority_yield_stats = (
+            priority_yield.YieldStats() if self.prefill_reserve_frac > 0 else None
+        )
+        if self.priority_yield_stats is not None:
+            logger.info("Priority prefill yield enabled (reserve_frac=%.2f)",
+                        self.prefill_reserve_frac)
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         # requests skipped in waiting flow due async deps or constraints.
@@ -493,6 +505,10 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        prefill_reserve = None
+        if self.priority_yield_stats is not None:
+            prefill_reserve = self._build_prefill_reserve(token_budget)
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -534,6 +550,16 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+
+            if prefill_reserve is not None and request.is_prefill_chunk:
+                allowed = token_budget - prefill_reserve.for_priority(request.priority)
+                if allowed < num_new_tokens:
+                    assert self.priority_yield_stats is not None
+                    self.priority_yield_stats.record_cap(num_new_tokens, allowed)
+                    if allowed <= 0:
+                        req_index += 1
+                        continue
+                    num_new_tokens = allowed
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -1071,6 +1097,13 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+                if (
+                    self.priority_yield_stats is not None
+                    and request.num_preemptions == 0
+                ):
+                    self.priority_yield_stats.record_admit(
+                        request.priority, time.time() - request.arrival_time
+                    )
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -2095,6 +2128,44 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+
+    def _build_prefill_reserve(
+        self, token_budget: int
+    ) -> priority_yield.PrefillReserve | None:
+        stats = self.priority_yield_stats
+        assert stats is not None
+        stats.maybe_log()
+        if self.running and min(r.priority for r in self.running) != max(
+            r.priority for r in self.running
+        ):
+            # Stable: higher-priority running prefills take budget first.
+            self.running.sort(key=lambda r: r.priority)
+        free_slots = (
+            self.max_num_running_reqs
+            - len(self.running)
+            - self.num_waiting_for_streaming_input
+        )
+        if free_slots <= 0 or not self.running or not (
+            self.waiting or self.skipped_waiting
+        ):
+            return None
+        waiting = sorted(
+            r
+            for queue in (self.waiting, self.skipped_waiting)
+            for r in queue.peek_requests(free_slots)
+            if not self._is_blocked_waiting_status(r.status)
+        )
+        reserve = priority_yield.build_reserve(
+            self.running,
+            waiting,
+            free_slots,
+            self.scheduler_config.long_prefill_token_threshold,
+            token_budget,
+            self.prefill_reserve_frac,
+        )
+        if reserve is not None:
+            stats.reserve_steps += 1
+        return reserve
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
