@@ -143,3 +143,77 @@ def test_equal_priorities_unchanged(monkeypatch, frac):
     assert outputs[0] == {"0": 512, "1": 512}
     assert outputs[1] == {"0": 512, "1": 512}
     assert outputs[2] == {"0": 512, "1": 512}
+
+
+def test_low_prefill_cap_unit():
+    cap = priority_yield.LowPrefillCap(256, top_priority=0)
+    assert cap.allow(0, 900) == 900
+    assert cap.allow(100, 200) == 200
+    assert cap.allow(100, 200) == 56
+    assert cap.allow(100, 200) == 0
+
+
+def _low_with_high(monkeypatch, cap):
+    monkeypatch.delenv(priority_yield.ENV_RESERVE_FRAC, raising=False)
+    if cap is None:
+        monkeypatch.delenv(priority_yield.ENV_LOW_PREFILL_MAX, raising=False)
+    else:
+        monkeypatch.setenv(priority_yield.ENV_LOW_PREFILL_MAX, cap)
+    scheduler = create_scheduler_with_priority(
+        max_num_batched_tokens=1024,
+        long_prefill_token_threshold=512,
+        max_model_len=8192,
+    )
+    reqs = create_requests_with_priority(
+        num_requests=2,
+        priorities=[100, 0],
+        arrival_times=[1.0, 2.0],
+        num_tokens=4000,
+        req_ids=["low", "high"],
+        max_tokens=64,
+    )
+    reqs[1] = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=10,
+        req_ids=["high"],
+        starting_idx=9,
+        max_tokens=64,
+    )[0]
+    for request in reqs:
+        scheduler.add_request(request)
+    return scheduler
+
+
+def test_low_prefill_capped_while_higher_priority_runs(monkeypatch):
+    scheduler = _low_with_high(monkeypatch, "256")
+    first = scheduler.schedule().num_scheduled_tokens
+    assert first == {"high": 10, "low": 256}
+    assert scheduler.priority_yield_stats.low_capped_chunks == 1
+
+
+def test_low_prefill_uncapped_without_flag(monkeypatch):
+    scheduler = _low_with_high(monkeypatch, None)
+    assert scheduler.schedule().num_scheduled_tokens == {"high": 10, "low": 512}
+
+
+def test_low_prefill_full_speed_when_alone(monkeypatch):
+    monkeypatch.setenv(priority_yield.ENV_LOW_PREFILL_MAX, "256")
+    scheduler = create_scheduler_with_priority(
+        max_num_batched_tokens=1024,
+        long_prefill_token_threshold=512,
+        max_model_len=8192,
+    )
+    for request in create_requests_with_priority(
+        num_requests=1,
+        priorities=[100],
+        arrival_times=[1.0],
+        num_tokens=4000,
+        req_ids=["low"],
+    ):
+        scheduler.add_request(request)
+    # Alone, v0.33 also lifts long_prefill_token_threshold; never the 256 cap.
+    for _ in range(2):
+        assert scheduler.schedule().num_scheduled_tokens["low"] > 512
+    assert scheduler.priority_yield_stats.low_capped_chunks == 0
