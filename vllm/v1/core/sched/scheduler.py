@@ -189,17 +189,25 @@ class Scheduler(SchedulerInterface):
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
         # Opt-in: low-priority prefill chunks yield budget to waiting higher-priority ones.
+        is_priority = self.policy == SchedulingPolicy.PRIORITY
         self.prefill_reserve_frac = (
-            priority_yield.reserve_frac_from_env()
-            if self.policy == SchedulingPolicy.PRIORITY
-            else 0.0
+            priority_yield.reserve_frac_from_env() if is_priority else 0.0
+        )
+        self.low_prefill_max_tokens = (
+            priority_yield.low_prefill_max_from_env() if is_priority else 0
         )
         self.priority_yield_stats = (
-            priority_yield.YieldStats() if self.prefill_reserve_frac > 0 else None
+            priority_yield.YieldStats()
+            if self.prefill_reserve_frac > 0 or self.low_prefill_max_tokens > 0
+            else None
         )
         if self.priority_yield_stats is not None:
-            logger.info("Priority prefill yield enabled (reserve_frac=%.2f)",
-                        self.prefill_reserve_frac)
+            logger.info(
+                "Priority prefill yield enabled (reserve_frac=%.2f, "
+                "low_prefill_max_tokens=%d)",
+                self.prefill_reserve_frac,
+                self.low_prefill_max_tokens,
+            )
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         # requests skipped in waiting flow due async deps or constraints.
@@ -505,9 +513,11 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
-        prefill_reserve = None
+        prefill_reserve = low_prefill_cap = None
         if self.priority_yield_stats is not None:
-            prefill_reserve = self._build_prefill_reserve(token_budget)
+            prefill_reserve, low_prefill_cap = self._build_prefill_reserve(
+                token_budget
+            )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -551,15 +561,29 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
-            if prefill_reserve is not None and request.is_prefill_chunk:
-                allowed = token_budget - prefill_reserve.for_priority(request.priority)
-                if allowed < num_new_tokens:
-                    assert self.priority_yield_stats is not None
-                    self.priority_yield_stats.record_cap(num_new_tokens, allowed)
-                    if allowed <= 0:
-                        req_index += 1
-                        continue
-                    num_new_tokens = allowed
+            if request.is_prefill_chunk and (
+                prefill_reserve is not None or low_prefill_cap is not None
+            ):
+                allowed = num_new_tokens
+                if prefill_reserve is not None:
+                    allowed = token_budget - prefill_reserve.for_priority(
+                        request.priority
+                    )
+                    if allowed < num_new_tokens:
+                        assert self.priority_yield_stats is not None
+                        self.priority_yield_stats.record_cap(num_new_tokens, allowed)
+                if low_prefill_cap is not None and allowed > 0:
+                    capped = low_prefill_cap.allow(
+                        request.priority, min(allowed, num_new_tokens)
+                    )
+                    if capped < min(allowed, num_new_tokens):
+                        assert self.priority_yield_stats is not None
+                        self.priority_yield_stats.low_capped_chunks += 1
+                    allowed = capped
+                if allowed <= 0:
+                    req_index += 1
+                    continue
+                num_new_tokens = min(num_new_tokens, allowed)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -953,6 +977,15 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    if low_prefill_cap is not None:
+                        capped = low_prefill_cap.allow(request.priority, num_new_tokens)
+                        if capped < num_new_tokens:
+                            assert self.priority_yield_stats is not None
+                            self.priority_yield_stats.low_capped_chunks += 1
+                        if capped <= 0:
+                            # Queue is priority-ordered: the rest is capped too.
+                            break
+                        num_new_tokens = capped
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -2131,7 +2164,7 @@ class Scheduler(SchedulerInterface):
 
     def _build_prefill_reserve(
         self, token_budget: int
-    ) -> priority_yield.PrefillReserve | None:
+    ) -> tuple[priority_yield.PrefillReserve | None, priority_yield.LowPrefillCap | None]:
         stats = self.priority_yield_stats
         assert stats is not None
         stats.maybe_log()
@@ -2140,6 +2173,14 @@ class Scheduler(SchedulerInterface):
         ):
             # Stable: higher-priority running prefills take budget first.
             self.running.sort(key=lambda r: r.priority)
+        low_cap = None
+        heads = [q.peek_request() for q in (self.waiting, self.skipped_waiting) if q]
+        if self.low_prefill_max_tokens > 0 and (self.running or heads):
+            # Requests at the top priority are never capped (pass-through).
+            top = min(r.priority for r in self.running[:1] + heads)
+            low_cap = priority_yield.LowPrefillCap(self.low_prefill_max_tokens, top)
+        if self.prefill_reserve_frac <= 0:
+            return None, low_cap
         free_slots = (
             self.max_num_running_reqs
             - len(self.running)
@@ -2148,7 +2189,7 @@ class Scheduler(SchedulerInterface):
         if free_slots <= 0 or not self.running or not (
             self.waiting or self.skipped_waiting
         ):
-            return None
+            return None, low_cap
         waiting = sorted(
             r
             for queue in (self.waiting, self.skipped_waiting)
@@ -2165,7 +2206,7 @@ class Scheduler(SchedulerInterface):
         )
         if reserve is not None:
             stats.reserve_steps += 1
-        return reserve
+        return reserve, low_cap
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:

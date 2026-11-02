@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Priority policy: low-priority prefill chunks yield step budget to pending
-higher-priority prefills. Opt-in via VLLM_PRIORITY_PREFILL_RESERVE_FRAC > 0."""
+"""Priority policy: low-priority prefill chunks yield step budget to higher-priority
+work. Opt-in via VLLM_PRIORITY_PREFILL_RESERVE_FRAC / _LOW_PREFILL_MAX_TOKENS."""
 
 import os
 import time
@@ -13,6 +13,7 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 ENV_RESERVE_FRAC = "VLLM_PRIORITY_PREFILL_RESERVE_FRAC"
+ENV_LOW_PREFILL_MAX = "VLLM_PRIORITY_LOW_PREFILL_MAX_TOKENS"
 LOG_INTERVAL_S = 60.0
 
 
@@ -26,6 +27,32 @@ def reserve_frac_from_env() -> float:
         logger.warning("Ignoring invalid %s=%r", ENV_RESERVE_FRAC, raw)
         return 0.0
     return min(max(value, 0.0), 1.0)
+
+
+def low_prefill_max_from_env() -> int:
+    raw = os.environ.get(ENV_LOW_PREFILL_MAX, "").strip()
+    try:
+        return max(int(raw), 0) if raw else 0
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r", ENV_LOW_PREFILL_MAX, raw)
+        return 0
+
+
+class LowPrefillCap:
+    """Per-step token cap shared by prefill chunks ranked below `top_priority`,
+    so higher-priority decodes keep short steps."""
+
+    def __init__(self, cap: int, top_priority: int):
+        self.cap = cap
+        self.top_priority = top_priority
+        self.used = 0
+
+    def allow(self, priority: int, num_tokens: int) -> int:
+        if priority <= self.top_priority:
+            return num_tokens
+        allowed = max(min(num_tokens, self.cap - self.used), 0)
+        self.used += allowed
+        return allowed
 
 
 class PrefillReserve:
@@ -80,6 +107,7 @@ class YieldStats:
 
     def _reset(self) -> None:
         self.reserve_steps = 0
+        self.low_capped_chunks = 0
         self.capped_chunks = 0
         self.skipped_chunks = 0
         self.deferred_tokens = 0
@@ -105,14 +133,14 @@ class YieldStats:
         now = time.monotonic() if now is None else now
         if now - self._window_start < LOG_INTERVAL_S:
             return False
-        if self.reserve_steps or self.admitted["low"]:
+        if self.reserve_steps or self.admitted["low"] or self.low_capped_chunks:
 
             def mean(tier: str) -> float:
                 return self.wait_sum[tier] / max(self.admitted[tier], 1)
 
             logger.info(
                 "Priority prefill yield (%.0fs): reserve_steps=%d capped_chunks=%d "
-                "skipped_chunks=%d deferred_tokens=%d | admitted normal=%d "
+                "skipped_chunks=%d deferred_tokens=%d low_capped_chunks=%d | admitted normal=%d "
                 "wait_mean=%.2fs wait_max=%.2fs | low=%d wait_mean=%.2fs "
                 "wait_max=%.2fs",
                 now - self._window_start,
@@ -120,6 +148,7 @@ class YieldStats:
                 self.capped_chunks,
                 self.skipped_chunks,
                 self.deferred_tokens,
+                self.low_capped_chunks,
                 self.admitted["normal"],
                 mean("normal"),
                 self.wait_max["normal"],
