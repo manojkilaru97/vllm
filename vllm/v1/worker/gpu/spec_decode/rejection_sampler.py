@@ -1,3 +1,4 @@
+# SynthID native Threefry extension v1
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Iterator
@@ -271,6 +272,9 @@ class RejectionSampler:
             expanded_local_pos,
             seq_lens_upper_bound_np,
         )
+        if getattr(getattr(self.sampler, "watermarker", None), "is_synthid_threefry", False):
+            from synthid_text_native.runtime import validate_verification_inputs
+            validate_verification_inputs(processed_logits, draft_logits)
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -293,6 +297,13 @@ class RejectionSampler:
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),
         )
+        if getattr(getattr(self.sampler, "watermarker", None), "is_synthid_threefry", False):
+            from synthid_text_native.runtime import repair_recovery
+            sampled, num_sampled = repair_recovery(
+                self, processed_logits, draft_logits, draft_sampled, pos,
+                cu_num_logits, expanded_idx_mapping, expanded_local_pos,
+                verify_draft_sampled, sampled, num_sampled,
+            )
         return processed_logits, sampled, num_sampled
 
     def _verify_in_chunks(

@@ -1,3 +1,4 @@
+# SynthID native Threefry extension v1
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -129,6 +130,11 @@ class DraftWatermarker:
         assert logits_cache_col is not None
         num_rows = logits.shape[0]
         request_temperatures = temperature[idx_mapping]
+        if getattr(self.watermarker, "is_synthid_threefry", False):
+            logits = self.watermarker.prepare_draft_logits(
+                logits, self.state.enabled[:num_rows], request_temperatures
+            )
+            logits_cache_source = logits
         contexts = self.state.contexts[:num_rows]
         steps, enabled = self._sampling_state(
             logits, idx_mapping, request_temperatures, logits_cache_col, contexts
@@ -284,6 +290,9 @@ def speculative_target_watermark_key(
 ) -> int | None:
     """Resolve the resample kernel's Philox key from configuration."""
     if watermark_config is None:
+        return None
+    if watermark_config.algorithm == "synthid_text_threefry":
+        # Threefry recovery is supplied by the native RejectionSampler hook.
         return None
 
     return _resolve_watermark_key(

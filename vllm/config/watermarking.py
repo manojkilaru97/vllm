@@ -1,3 +1,4 @@
+# SynthID native Threefry extension v1
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -11,8 +12,8 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-WatermarkingAlgorithm = Literal["gumbel", "dual_key_gumbel"]
-WatermarkPRFName = Literal["philox"]
+WatermarkingAlgorithm = Literal["gumbel", "dual_key_gumbel", "synthid_text_threefry"]
+WatermarkPRFName = Literal["philox", "threefry"]
 WatermarkContextScope = Literal["none", "single_turn", "all"]
 
 _MIN_RECOMMENDED_DEDUP_HISTORY = 1024
@@ -48,15 +49,22 @@ class WatermarkConfig:
     `none`."""
     prf: WatermarkPRFName = "philox"
     """Pseudorandom function used by the watermarking algorithm."""
+    synthid_draft_top_k: int = Field(default=40, ge=2, strict=True)
+    """Top-k support of SynthID draft proposals, before watermarking."""
     allow_target_only_watermarking: bool = False
     """Allow speculative decoding without watermarking draft tokens."""
 
     @property
     def supports_speculative_decoding(self) -> bool:
-        return self.algorithm == "dual_key_gumbel"
+        return self.algorithm in ("dual_key_gumbel", "synthid_text_threefry")
 
     @model_validator(mode="after")
     def validate_watermark_settings(self) -> Self:
+        if self.algorithm == "synthid_text_threefry":
+            from synthid_text_native.configuration import validate_watermark_config
+            validate_watermark_config(self)
+        elif self.prf != "philox":
+            raise ValueError("Gumbel watermarking requires the philox PRF")
         if self.key > 2**64 - 1:
             raise ValueError("philox keys must fit in 64 bits")
         history_is_too_short = (

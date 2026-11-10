@@ -1,3 +1,4 @@
+# SynthID native Threefry extension v1
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -1355,6 +1356,9 @@ class VllmConfig:
                     scope="global",
                 )
             return False
+        if watermark_config.algorithm == "synthid_text_threefry":
+            from synthid_text_native.configuration import validate_engine_config
+            validate_engine_config(self, config, custom_sampler=custom_sampler)
         if self.speculative_config is not None:
             speculative_config = self.speculative_config
             if speculative_config.draft_sample_method != "probabilistic":
