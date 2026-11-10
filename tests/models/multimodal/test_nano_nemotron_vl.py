@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -296,6 +297,7 @@ def test_extract_audio_from_videos_passes_max_duration():
     mm_items = _make_mm_items_with_video_bytes(b"\x00" * 64)
 
     processor = object.__new__(NanoNemotronVLMultiModalProcessor)
+    processor.info = SimpleNamespace(sound_config=None)
     processor.data_parser = MultiModalDataParser(
         target_sr=dummy_audio[1], target_channels=1
     )
@@ -319,6 +321,7 @@ def test_extract_audio_from_videos_rejects_oversized_audio():
     mm_items = _make_mm_items_with_video_bytes(b"\x00" * 64)
 
     processor = object.__new__(NanoNemotronVLMultiModalProcessor)
+    processor.info = SimpleNamespace(sound_config=None)
 
     target = "vllm.model_executor.models.nano_nemotron_vl.load_audio_pyav"
     pyav = "vllm.model_executor.models.nano_nemotron_vl._pyav_available"
