@@ -1,0 +1,40 @@
+{
+ "tokenizer_class": "PreTrainedTokenizerFast",
+ "eos_token": "<eos>",
+ "clean_up_tokenization_spaces": false,
+ "added_tokens_decoder": {
+  "1": {
+   "content": "<eos>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "2": {
+   "content": "<bos>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "50": {
+   "content": "<|tool_response>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "106": {
+   "content": "<turn|>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  }
+ },
+ "bos_token": "<bos>"
+}

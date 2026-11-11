@@ -1,0 +1,64 @@
+{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [
+  {
+   "id": 1,
+   "content": "<s>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 2,
+   "content": "</s>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 11,
+   "content": "<|im_end|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  }
+ ],
+ "normalizer": null,
+ "pre_tokenizer": null,
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+  "type": "BPE",
+  "dropout": null,
+  "unk_token": null,
+  "continuing_subword_prefix": null,
+  "end_of_word_suffix": null,
+  "fuse_unk": false,
+  "byte_fallback": false,
+  "ignore_merges": false,
+  "vocab": {
+   " ": 1000,
+   "\"": 1001,
+   ":": 1002,
+   "P": 1003,
+   "a": 1004,
+   "c": 1005,
+   "i": 1006,
+   "r": 1007,
+   "s": 1008,
+   "t": 1009,
+   "y": 1010,
+   "{": 1011,
+   "}": 1012
+  },
+  "merges": []
+ }
+}

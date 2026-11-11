@@ -12,6 +12,7 @@ past a request stop must not fail the request.
 import json
 import logging
 import os
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -22,6 +23,7 @@ from vllm.config import StructuredOutputsConfig, VllmConfig
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
@@ -227,24 +229,49 @@ def test_scheduler_named_tool_with_mtp_and_request_stop(ignore_eos):
     assert list(request.output_token_ids) == expected
 
 
-# Real prod tokenizer + generation_config dirs (tokenizer*.json, config.json,
-# generation_config.json), one subdirectory per model.
+# Checked-in fixtures keep each prod model's real stop ids, special flags and
+# generation_config; the vocab is reduced to the characters these tests need.
+FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "prod_stop_tokens")
+# Optional full prod tokenizer dirs (same layout), one subdirectory per model.
 PROD_TOKENIZERS = os.environ.get("VLLM_TEST_PROD_TOKENIZERS")
 PROD_MODELS = [
-    pytest.param("ultra", [2], id="ultra3-</s>"),
-    pytest.param("bolt-e4b", [106, 50], id="bolt-e4b-<turn|>"),
-    pytest.param("laguna", [24], id="laguna-</assistant>"),
+    ("ultra", [2], "ultra3-</s>"),
+    ("bolt-e4b", [106, 50], "bolt-e4b-<turn|>"),
+    ("laguna", [24], "laguna-</assistant>"),
+]
+PROD_CASES = [
+    pytest.param(os.path.join(root, model), stops, id=f"{kind}-{name}")
+    for kind, root in [("fixture", FIXTURES), ("prod", PROD_TOKENIZERS)]
+    if root
+    for model, stops, name in PROD_MODELS
 ]
 
 
-@pytest.mark.skipif(not PROD_TOKENIZERS, reason="needs VLLM_TEST_PROD_TOKENIZERS")
-@pytest.mark.parametrize("model, stops", PROD_MODELS)
-def test_prod_generation_config_stops_end_json(model, stops):
-    path = os.path.join(PROD_TOKENIZERS, model)
+def _vocab_size(config: dict) -> int:
+    # Multimodal checkpoints nest the LM config (text_config / llm_config).
+    for key in ("text_config", "llm_config"):
+        if config.get("vocab_size") is None and isinstance(config.get(key), dict):
+            config = config[key]
+    return config["vocab_size"]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"vocab_size": 7},
+        {"text_config": {"vocab_size": 7}},
+        {"llm_config": {"vocab_size": 7}, "vision_config": {}},
+    ],
+)
+def test_vocab_size_from_nested_configs(config):
+    assert _vocab_size(config) == 7
+
+
+@pytest.mark.parametrize("path, stops", PROD_CASES)
+def test_prod_generation_config_stops_end_json(path, stops):
     tokenizer = AutoTokenizer.from_pretrained(path)
     with open(os.path.join(path, "config.json")) as f:
-        config = json.load(f)
-    vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
+        vocab_size = _vocab_size(json.load(f))
     with open(os.path.join(path, "generation_config.json")) as f:
         generation_config = json.load(f)
     params = SamplingParams()
@@ -280,3 +307,71 @@ def test_prod_generation_config_stops_end_json(model, stops):
         assert _allowed(bitmask, 0, stop), stop
     assert grammar.accept_tokens("req", stops[:1])
     assert grammar.is_terminated()
+
+
+def _dynamo_sampling_params(stop_conditions: dict, skip_clone: bool) -> SamplingParams:
+    """Build params like Dynamo's vLLM worker (handlers.build_sampling_params):
+    construct first, then assign stop conditions as attributes."""
+    params = SamplingParams(temperature=0.6, top_p=0.95, skip_clone=skip_clone)
+    params.structured_outputs = StructuredOutputsParams(json=NAMED_TOOL_SCHEMA)
+    params.structured_outputs._backend = "xgrammar"
+    for key, value in stop_conditions.items():
+        if value is not None and hasattr(params, key) and key != "stop":
+            setattr(params, key, value)
+        if key in ("stop_token_ids_hidden", "stop_token_ids_visible") and value:
+            existing = params.stop_token_ids or []
+            params.stop_token_ids = list(set(existing).union(value))
+    return params
+
+
+# skip_clone=False re-runs __post_init__ in deepcopy; a shallow clone must not
+# lose stop ids assigned after construction either.
+@pytest.mark.parametrize("skip_clone", [False, True])
+def test_stop_token_ids_set_after_init_reach_the_grammar(skip_clone):
+    manager = StructuredOutputManager(
+        VllmConfig(
+            model_config=ModelConfig(tokenizer=TOKENIZER),
+            structured_outputs_config=StructuredOutputsConfig(backend="xgrammar"),
+        )
+    )
+    params = _dynamo_sampling_params(
+        {
+            "max_tokens": 64,
+            "stop": None,
+            "stop_token_ids_hidden": [EOS, LETTER],
+            "stop_token_ids_visible": None,
+            "min_tokens": None,
+            "ignore_eos": None,
+        },
+        skip_clone,
+    )
+    # Dynamo hands the params to AsyncLLM.generate -> InputProcessor.
+    processor = Mock(spec=InputProcessor)
+    processor.tokenizer = None
+    processor.generation_config_fields = {}
+    processor.renderer = Mock()
+    processor.renderer.get_eos_token_id.return_value = EOS
+    processor.vllm_config = Mock()
+    processor.model_config = Mock(max_model_len=1024)
+    core_request = InputProcessor.process_inputs(
+        processor,
+        "dynamo",
+        {"type": "token", "prompt_token_ids": [0, 1]},
+        params,
+        ("generate",),
+    )
+    assert LETTER in core_request.sampling_params.all_stop_token_ids
+
+    request = Request.from_engine_core_request(core_request, block_hasher=None)
+    grammar = _wait_for_grammar(manager, request)
+    assert grammar.extra_stop_token_ids == (LETTER,)
+    bitmask = torch.from_numpy(
+        manager.grammar_bitmask({"dynamo": request}, ["dynamo"], {})
+    )
+    assert not _allowed(bitmask, 0, LETTER)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    assert grammar.accept_tokens("dynamo", tokenizer.encode('{"city": "Paris"}'))
+    bitmask = torch.from_numpy(
+        manager.grammar_bitmask({"dynamo": request}, ["dynamo"], {})
+    )
+    assert _allowed(bitmask, 0, LETTER)

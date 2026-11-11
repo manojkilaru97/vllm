@@ -778,6 +778,9 @@ class SamplingParams(
         eos_token_id: int | None = None,
     ) -> None:
         """Update if there are non-default values from generation_config."""
+        # Callers such as Dynamo set stop_token_ids after __init__; resync so
+        # grammar, min_tokens and logit_bias see every request stop.
+        self._all_stop_token_ids.update(self.stop_token_ids or ())
         if not self.ignore_eos:
             self._eos_token_id = eos_token_id
 
