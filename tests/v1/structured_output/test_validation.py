@@ -442,6 +442,129 @@ def test_auto_backend_routes_key_patterns_to_guidance(
         validate()
 
 
+def _string_field(pattern: str) -> dict:
+    return {
+        "type": "object",
+        "properties": {"s": {"type": "string", "pattern": pattern}},
+        "required": ["s"],
+    }
+
+
+def _required_tool_call(params: dict) -> dict:
+    """The schema vLLM builds for tool_choice="required"."""
+    tool = {
+        "properties": {
+            "name": {"type": "string", "enum": ["get_weather"]},
+            "parameters": params,
+        },
+        "required": ["name", "parameters"],
+    }
+    return {
+        "type": "array",
+        "minItems": 1,
+        "items": {"type": "object", "anyOf": [tool]},
+    }
+
+
+_LONG_REPEAT = "^.{0,500}$"
+_LONG_REPEAT_SCHEMAS = [
+    _string_field("^.{0,129}$"),
+    _string_field(_LONG_REPEAT),
+    _string_field("^.{0,5000}$"),
+    _string_field("^.{0,500}X.{0,500}$"),
+    _string_field("^x[0-9]{129}$"),
+    _string_field("^.{129,}$"),
+    _string_field("^[a-z]{200,300}$"),
+    _string_field("^(ab){0,129}$"),
+    _string_field("^[\\]{]{0,500}$"),
+    _required_tool_call(_string_field(_LONG_REPEAT)),
+    {"type": "array", "items": _string_field(_LONG_REPEAT)},
+    {"$defs": {"n": {"type": "string", "pattern": _LONG_REPEAT}}, "$ref": "#/$defs/n"},
+    {"anyOf": [{"type": "null"}, {"type": "string", "pattern": _LONG_REPEAT}]},
+]
+_SHORT_REPEAT_SCHEMAS = [
+    _string_field("^.{0,128}$"),
+    _string_field("^.{128}$"),
+    _string_field("^.{100,128}$"),
+    _string_field("^.{0,64}X.{0,128}$"),
+    _required_tool_call(_string_field("^[A-Z]{3}-[0-9]{4}$")),
+    {"type": "object", "properties": {"s": {"type": "string", "maxLength": 5000}}},
+    # Escaped or bracketed braces are literals, not quantifiers.
+    _string_field("^a\\{0,500\\}$"),
+    _string_field("^[{0,500}]+$"),
+    # Repeat syntax in names or instance data is not a pattern.
+    {
+        "type": "object",
+        "properties": {".{0,500}": {"type": "string"}, "pattern": {"type": "string"}},
+        "required": [".{0,500}"],
+    },
+    {"type": "string", "enum": [_LONG_REPEAT], "default": _LONG_REPEAT},
+    {"type": "object", "const": {"pattern": _LONG_REPEAT}},
+    {"type": "string", "examples": [{"pattern": _LONG_REPEAT}]},
+    {"type": "string", "description": f"matches {_LONG_REPEAT}"},
+]
+
+
+def _validate_auto(params, tokenizer=None, backend="auto"):
+    params._validate_structured_outputs(
+        _StubModelConfig(is_diffusion=False),
+        StructuredOutputsConfig(backend=backend),
+        tokenizer=tokenizer or object.__new__(TokenizersBackend),
+    )
+    return params.structured_outputs._backend
+
+
+@pytest.mark.parametrize("as_str", [True, False])
+@pytest.mark.parametrize("schema", _LONG_REPEAT_SCHEMAS)
+def test_auto_backend_routes_long_repeats_to_guidance(schema, as_str):
+    """Guidance serves these; xgrammar takes ~35 ms per mask inside them."""
+    spec = json.dumps(schema) if as_str else schema
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=spec))
+    assert _validate_auto(params) == "guidance"
+    assert params.structured_outputs._backend_was_auto
+
+
+@pytest.mark.parametrize("schema", _SHORT_REPEAT_SCHEMAS)
+def test_auto_backend_keeps_xgrammar_for_short_repeats(schema):
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+    assert _validate_auto(params) == "xgrammar"
+
+
+def test_explicit_xgrammar_keeps_long_repeats():
+    schema = _string_field(_LONG_REPEAT)
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+    assert _validate_auto(params, backend="xgrammar") == "xgrammar"
+
+
+@pytest.mark.parametrize("route", ["slow", "non_tekken_mistral"])
+def test_auto_backend_keeps_xgrammar_for_long_repeats_without_guidance(
+    monkeypatch, route
+):
+    """Without guidance, xgrammar still serves it; outlines is not a fallback."""
+    import vllm.sampling_params as sampling_params_module
+
+    monkeypatch.setattr(
+        sampling_params_module,
+        "_is_non_tekken_mistral",
+        lambda _: route == "non_tekken_mistral",
+    )
+    tokenizer = object() if route == "slow" else None
+    schema = _string_field(_LONG_REPEAT)
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+    assert _validate_auto(params, tokenizer=tokenizer) == "xgrammar"
+
+
+def test_auto_backend_keeps_xgrammar_when_guidance_rejects_long_repeats():
+    # guidance rejects if/then/else; xgrammar accepts the schema.
+    schema = {
+        **_string_field(_LONG_REPEAT),
+        "if": {"required": ["s"]},
+        "then": {"required": ["s"]},
+    }
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+    assert _validate_auto(params) == "xgrammar"
+
+
 # ================================================
 # Test validate_structured_outputs functionality
 # ================================================

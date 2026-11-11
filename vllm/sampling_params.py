@@ -268,6 +268,35 @@ def _get_llg_tokenizer(tokenizer: TokenizerLike) -> Any:
     return tokenizer.llg_tokenizer if is_mistral_tokenizer(tokenizer) else None
 
 
+def _auto_prefers_guidance(params: "SamplingParams", tokenizer: TokenizerLike) -> bool:
+    """Whether `auto` should send a JSON schema xgrammar runs slowly to guidance."""
+    from vllm.v1.structured_output.backend_guidance import (
+        GuidanceBackend,
+        validate_guidance_grammar,
+    )
+    from vllm.v1.structured_output.backend_xgrammar import (
+        has_xgrammar_slow_json_features,
+    )
+
+    spec = params.structured_outputs.json if params.structured_outputs else None
+    if (
+        not spec
+        or _is_non_tekken_mistral(tokenizer)
+        or not GuidanceBackend.is_tokenizer_supported(tokenizer)
+    ):
+        return False
+    try:
+        check_json_nesting(spec)
+        schema = json_mod.loads(spec) if isinstance(spec, str) else spec
+        if not has_xgrammar_slow_json_features(schema):
+            return False
+        validate_guidance_grammar(params, tokenizer=_get_llg_tokenizer(tokenizer))
+    except (VLLMValidationError, json_mod.JSONDecodeError):
+        # Leave it to the xgrammar-first path, which reports or serves it.
+        return False
+    return True
+
+
 class SamplingParams(
     PydanticMsgspecMixin,
     msgspec.Struct,
@@ -1390,6 +1419,9 @@ class SamplingParams(
             # tokens for Mistral tokenizers, so a regex like `.` can match
             # `[TOOL_CALLS]` or `[INST]` as plain text.
             validate_guidance_grammar(self, tokenizer=_get_llg_tokenizer(tokenizer))
+            self.structured_outputs._backend = "guidance"
+            self.structured_outputs._backend_was_auto = True
+        elif backend == "auto" and _auto_prefers_guidance(self, tokenizer):
             self.structured_outputs._backend = "guidance"
             self.structured_outputs._backend_was_auto = True
         else:

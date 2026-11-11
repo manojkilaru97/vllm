@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 
 import vllm.envs
@@ -417,6 +418,48 @@ def has_key_pattern_keywords(schema: dict[str, Any]) -> bool:
     if any(key in schema for key in _KEY_PATTERN_KEYWORDS):
         return True
     return any(has_key_pattern_keywords(sub) for sub in _subschemas(schema))
+
+
+# xgrammar >= 0.2.8 fills each mask in ~35 ms inside counted repeats above this
+# (xgrammar#1054), and validating {0,5000} takes ~10 s.
+_XGRAMMAR_FAST_REPEAT_MAX = 128
+_REPEAT_QUANTIFIER = re.compile(r"\{(\d+)(?:,(\d*))?\}")
+
+
+def _max_repeat_count(pattern: str) -> int:
+    """Return the largest count in a {n}, {n,} or {n,m} quantifier."""
+    largest, i, in_class = 0, 0, False
+    while i < len(pattern):
+        char = pattern[i]
+        if char == "\\":
+            i += 2
+            continue
+        if in_class:
+            in_class = char != "]"
+        elif char == "[":
+            in_class = True
+            i += 1 + pattern.startswith("^", i + 1)
+            # "]" right after "[" or "[^" is a literal.
+            i += pattern.startswith("]", i)
+            continue
+        elif char == "{" and (match := _REPEAT_QUANTIFIER.match(pattern, i)):
+            largest = max(largest, *(int(n) for n in match.groups() if n))
+            i = match.end()
+            continue
+        i += 1
+    return largest
+
+
+def has_xgrammar_slow_json_features(schema: Any) -> bool:
+    """Check if any subschema's pattern repeats more than 128 times."""
+    if not isinstance(schema, dict):
+        return False
+    pattern = schema.get("pattern")
+    if isinstance(pattern, str) and (
+        _max_repeat_count(pattern) > _XGRAMMAR_FAST_REPEAT_MAX
+    ):
+        return True
+    return any(has_xgrammar_slow_json_features(sub) for sub in _subschemas(schema))
 
 
 def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
