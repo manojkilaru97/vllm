@@ -337,14 +337,9 @@ def test_unhandled_spec_is_a_validation_error(validate):
             },
             "guidance",
         ),
-        # patternProperties + properties is also unsupported by guidance.
         (
-            {
-                "type": "object",
-                "properties": {"a": {"type": "string"}},
-                "patternProperties": {"^a$": {"type": "string"}},
-            },
-            "outlines",
+            {"type": "object", "patternProperties": {"^a": {"type": "string"}}},
+            "xgrammar",
         ),
     ],
 )
@@ -360,6 +355,79 @@ def test_auto_backend_falls_back_on_unsupported_schema(schema, expected_backend)
     )
     assert params.structured_outputs is not None
     assert params.structured_outputs._backend == expected_backend
+
+
+@pytest.mark.parametrize(
+    ("schema", "reason"),
+    [
+        (
+            {
+                "type": "object",
+                "patternProperties": {"^a": {"type": "string"}},
+                "required": ["alpha"],
+            },
+            "patternProperties with required",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "patternProperties": {"^a$": {"type": "string"}},
+            },
+            "patternProperties with properties",
+        ),
+        (
+            {"patternProperties": {"^a": {"type": "string"}}},
+            'patternProperties without "type": "object"',
+        ),
+        (
+            {
+                "type": "object",
+                "patternProperties": {"^a": {"type": "integer", "multipleOf": 2}},
+            },
+            "multipleOf",
+        ),
+    ],
+)
+@pytest.mark.parametrize("non_tekken_mistral", [False, True])
+def test_auto_backend_rejects_unenforced_pattern_properties(
+    monkeypatch, schema, reason, non_tekken_mistral
+):
+    """Guidance and outlines cannot enforce patternProperties, so `auto` must
+    reject what xgrammar rejects instead of compiling it unconstrained."""
+    import vllm.sampling_params as sampling_params_module
+
+    monkeypatch.setattr(
+        sampling_params_module, "_is_non_tekken_mistral", lambda _: non_tekken_mistral
+    )
+    params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(json=json.dumps(schema))
+    )
+    with pytest.raises(VLLMValidationError) as exc_info:
+        params._validate_structured_outputs(
+            _StubModelConfig(is_diffusion=False),
+            StructuredOutputsConfig(backend="auto", disable_any_whitespace=True),
+            tokenizer=object.__new__(TokenizersBackend),
+        )
+    assert reason in str(exc_info.value)
+    assert "do not support patternProperties" in str(exc_info.value)
+
+
+def test_auto_backend_rejects_property_names_with_required():
+    """Xgrammar drops `required` next to propertyNames and guidance rejects
+    propertyNames, so the request fails instead of running unconstrained."""
+    schema = {
+        "type": "object",
+        "propertyNames": {"pattern": "^[a-z]+$"},
+        "required": ["alpha"],
+    }
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+    with pytest.raises(VLLMValidationError, match="propertyNames"):
+        params._validate_structured_outputs(
+            _StubModelConfig(is_diffusion=False),
+            StructuredOutputsConfig(backend="auto"),
+            tokenizer=object.__new__(TokenizersBackend),
+        )
 
 
 # ================================================
@@ -512,17 +580,22 @@ def test_disable_any_whitespace_rejected_for_other_backends(backend):
         StructuredOutputsConfig(backend=backend, disable_any_whitespace=True)
 
 
-def test_disable_any_whitespace_keeps_outlines_fallback():
+def test_disable_any_whitespace_keeps_outlines_fallback(monkeypatch):
     """outlines-core JSON regexes allow at most one space between tokens, so the
     outlines fallback stays bounded under disable_any_whitespace."""
     import re
 
     from outlines_core import json_schema
 
-    # multipleOf: xgrammar rejects; patternProperties: guidance rejects.
+    import vllm.sampling_params as sampling_params_module
+
+    # multipleOf: xgrammar rejects; non-Tekken Mistral skips guidance.
+    monkeypatch.setattr(
+        sampling_params_module, "_is_non_tekken_mistral", lambda _: True
+    )
     schema = {
         "type": "object",
-        "patternProperties": {"^a": {"type": "integer", "multipleOf": 2}},
+        "properties": {"ab": {"type": "integer", "multipleOf": 2}},
     }
     params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
     params._validate_structured_outputs(

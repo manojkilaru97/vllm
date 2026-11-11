@@ -1400,7 +1400,7 @@ class SamplingParams(
             try:
                 validate_xgrammar_grammar(self)
                 self.structured_outputs._backend = "xgrammar"
-            except VLLMValidationError:
+            except VLLMValidationError as xgrammar_error:
                 # The request either failed validation
                 # or includes some jsonschema feature(s) that
                 # are not supported in xgrammar.
@@ -1409,7 +1409,8 @@ class SamplingParams(
 
                 # Check if schema has features unsupported by guidance
                 so_params = self.structured_outputs
-                if not skip_guidance and so_params.json:
+                has_pattern_properties = False
+                if so_params.json:
                     if isinstance(so_params.json, str):
                         try:
                             schema = json_mod.loads(so_params.json)
@@ -1419,8 +1420,17 @@ class SamplingParams(
                             ) from e
                     else:
                         schema = so_params.json
-                    skip_guidance = has_guidance_unsupported_json_features(schema)
+                    has_pattern_properties = has_guidance_unsupported_json_features(
+                        schema
+                    )
+                    skip_guidance = skip_guidance or has_pattern_properties
 
+                if has_pattern_properties:
+                    # outlines ignores patternProperties, so it would not enforce them.
+                    raise VLLMValidationError(
+                        f"{xgrammar_error} The guidance and outlines backends "
+                        "do not support patternProperties either."
+                    ) from None
                 if skip_guidance:
                     # Fall back to outlines for non-Tekken Mistral tokenizers or
                     # schemas containing features unsupported by guidance.
