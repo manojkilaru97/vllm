@@ -12,7 +12,7 @@ from openai_harmony import (
     RenderConversationConfig,
     Role,
 )
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GenerationConfig
 
 from vllm.config import StructuredOutputsConfig, VllmConfig
 from vllm.entrypoints.generate.base.protocol import FunctionCall
@@ -33,6 +33,14 @@ REASONING_MODEL_NAME = "openai/gpt-oss-20b"
 @pytest.fixture(scope="module")
 def gpt_oss_tokenizer():
     return AutoTokenizer.from_pretrained(REASONING_MODEL_NAME)
+
+
+@pytest.fixture(scope="module")
+def gpt_oss_stop_token_ids() -> set[int]:
+    eos_token_id = GenerationConfig.from_pretrained(REASONING_MODEL_NAME).eos_token_id
+    if isinstance(eos_token_id, int):
+        return {eos_token_id}
+    return set(eos_token_id)
 
 
 @pytest.fixture(scope="module")
@@ -1148,6 +1156,7 @@ class TestAdjustRequest:
         adjusted_request: ChatCompletionRequest | ResponsesRequest,
         expected_admission: Sequence[str],
         xgrammar_backend: XgrammarBackend,
+        stop_token_ids: set[int],
     ) -> None:
         structured_outputs = adjusted_request.structured_outputs
         assert structured_outputs is not None
@@ -1157,6 +1166,7 @@ class TestAdjustRequest:
         grammar = xgrammar_backend.compile_grammar(
             StructuredOutputOptions.STRUCTURAL_TAG,
             structured_outputs.structural_tag,
+            stop_token_ids=stop_token_ids,
         )
         expected_admission_set = set(expected_admission)
 
@@ -1325,6 +1335,7 @@ class TestAdjustRequest:
         self,
         harmony_parser,
         xgrammar_backend,
+        gpt_oss_stop_token_ids,
         request_kind,
         request_kwargs,
         expected_admission,
@@ -1336,4 +1347,5 @@ class TestAdjustRequest:
             adjusted_request,
             expected_admission,
             xgrammar_backend,
+            gpt_oss_stop_token_ids,
         )

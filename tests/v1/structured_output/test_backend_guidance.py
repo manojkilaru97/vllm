@@ -410,7 +410,7 @@ def test_manager_falls_back_for_incompatible_backends(monkeypatch):
         def allocate_token_bitmask(self, n):
             return torch.zeros((n, self.width), dtype=torch.int32)
 
-        def compile_grammar(self, request_type, grammar_spec):
+        def compile_grammar(self, request_type, grammar_spec, stop_token_ids=None):
             raise RuntimeError(f"compiled by {self.name}")
 
     def create(name):

@@ -431,8 +431,9 @@ class SamplingReference:
             compiled = _compiler(tokenizer, vocab_size).compile_json_schema(
                 schema, any_whitespace=True
             )
-            # vLLM passes no request stop tokens to xgrammar (#49227 reverted).
-            self.matcher = xgr.GrammarMatcher(compiled)
+            self.matcher = xgr.GrammarMatcher(
+                compiled, override_stop_tokens=sorted(self.stop_ids) or None
+            )
             self.bitmask = xgr.allocate_token_bitmask(1, vocab_size)
 
     def accept_history(self, generated_ids: list[int]) -> bool:

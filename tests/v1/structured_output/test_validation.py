@@ -482,6 +482,7 @@ class TestValidateStructuredOutputs:
                     request_id=f"req-{backend}",
                     sampling_params=SimpleNamespace(
                         structured_outputs=SimpleNamespace(_backend=backend),
+                        all_stop_token_ids=None,
                     ),
                     structured_output_request=SimpleNamespace(
                         structured_output_key=(StructuredOutputOptions.JSON, "{}"),

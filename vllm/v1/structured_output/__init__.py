@@ -240,7 +240,10 @@ class StructuredOutputManager:
             backend = self._get_backend(
                 request.sampling_params.structured_outputs._backend
             )
-            return backend.compile_grammar(request_type, grammar_spec)
+            stop_token_ids = request.sampling_params.all_stop_token_ids
+            return backend.compile_grammar(
+                request_type, grammar_spec, stop_token_ids=stop_token_ids
+            )
         except Exception:
             logger.exception(
                 "Failed to compile grammar for request %s", request.request_id
