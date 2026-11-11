@@ -75,6 +75,9 @@ Caveats to keep in mind when interpreting them:
 - `used_blocks` counts blocks pinned by in-flight transfers or cache hits;
   warm cached blocks that are evictable are not counted. Use the
   `capacity_blocks` label of `simple_kv_offload_info` as the denominator.
+- `unused_hits_total` counts offload hits the scheduler declined, usually
+  because a local GPU hit was at least as long. Each one only releases a
+  temporary pin; no blocks are transferred or evicted.
 - Counters and gauges are quantized to engine steps. They are reported by the
   scheduler process and reflect engine-wide logical block counts, not values
   pooled from individual tensor-parallel workers.

@@ -276,6 +276,7 @@ class SimpleCPUOffloadScheduler:
         # Interval stats state drained by get_stats()
         self._boundary_stats_snapshot = BoundaryStoreStats()
         self._interval_load_blocks_completed = 0
+        self._interval_unused_hits = 0
 
         # For TP/PP: track partial store completions across steps.
         # Events must be reported by all world_size workers before considered complete.
@@ -457,13 +458,15 @@ class SimpleCPUOffloadScheduler:
 
         if num_external_tokens == 0:
             if pending is not None:
-                logger.warning(
-                    "SimpleCPUOffloadScheduler: update_state_after_alloc "
-                    "called for req_id=%s with no external tokens but "
-                    "get_num_new_matched_tokens() unexpectedly recorded "
-                    "a pending CPU hit; releasing the stale pin.",
+                # The scheduler declined the hit (e.g. it kept an equal or longer
+                # local tail), so nothing loads and only the pin is dropped.
+                logger.debug(
+                    "SimpleCPUOffloadScheduler: req_id=%s did not use its "
+                    "%d-token CPU hit; releasing the pin.",
                     req_id,
+                    pending[1],
                 )
+                self._interval_unused_hits += 1
                 self._free_pending_cpu_hit(pending)
             return
 
@@ -1026,6 +1029,9 @@ class SimpleCPUOffloadScheduler:
                 self._interval_load_blocks_completed,
             )
             self._interval_load_blocks_completed = 0
+        if self._interval_unused_hits:
+            stats.increase_counter(MetricName.UNUSED_HITS, self._interval_unused_hits)
+            self._interval_unused_hits = 0
 
         stats.set_gauge(
             MetricName.USED_BLOCKS,

@@ -63,6 +63,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadWorkerMetadata
+from vllm.v1.simple_kv_offload.metrics import MetricName
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -3071,6 +3072,132 @@ def test_lazy_store_serves_sub_block_mamba_boundary_hit() -> None:
         *(block.block_id for block in load_blocks.blocks[0]),
         load_blocks.blocks[1][1].block_id,
     ]
+
+
+def test_declined_lazy_cpu_hit_releases_pin_without_leak(caplog_vllm) -> None:
+    """A CPU hit no longer than the local sub-block tail is declined cleanly.
+
+    The scheduler keeps the equal local GPU hit and reports zero external
+    tokens. The CPU pin must be released without a load, GPU ref counts must
+    not change, and blocks still held by another request's load stay pinned.
+    """
+    hash_block_size = BLOCK_SIZE
+    mamba_block_size = 4 * BLOCK_SIZE
+    boundary_tokens = 5 * BLOCK_SIZE
+    num_gpu_blocks = 16
+    fix = _make_hybrid_attention_mamba_scheduler(
+        num_cpu_blocks=16,
+        num_gpu_blocks=num_gpu_blocks,
+        block_size=mamba_block_size,
+        hash_block_size=hash_block_size,
+        dcp_world_size=1,
+        lazy=True,
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    cpu_pool = sched.cpu_block_pool
+    sched._target_free = num_gpu_blocks
+
+    producer = _make_cp_request(num_blocks=5, virtual_block_size=hash_block_size)
+    attention_blocks = _allocate_cp_gpu_blocks(
+        gpu_pool, producer, 5, virtual_block_size=hash_block_size, group_id=0
+    )
+    mamba_blocks = gpu_pool.get_new_blocks(2)
+    gpu_pool.cache_partial_block(
+        request=producer,
+        block=mamba_blocks[1],
+        num_tokens=boundary_tokens,
+        kv_cache_group_id=1,
+        block_size=mamba_block_size,
+    )
+    gpu_pool.free_blocks(attention_blocks + mamba_blocks)
+    store_meta = sched.build_connector_meta(make_scheduler_output({}))
+    simulate_store_completion(sched, store_meta.store_event)
+
+    def same_prompt(request_id: str) -> Request:
+        return Request(
+            request_id=request_id,
+            prompt_token_ids=producer.prompt_token_ids,
+            sampling_params=producer.sampling_params,
+            pooling_params=None,
+            mm_features=None,
+            block_hasher=producer._block_hasher,
+        )
+
+    loader = same_prompt("req-declined-hit-loader")
+    consumer = same_prompt("req-declined-hit-consumer")
+    cpu_refs_baseline = [blk.ref_cnt for blk in cpu_pool.blocks]
+    cpu_free_baseline = cpu_pool.get_num_free_blocks()
+
+    # Both adopt their local GPU prefix before new allocations can evict it.
+    loader_local = attention_blocks[:4]
+    consumer_local = (attention_blocks, [gpu_pool.null_block, mamba_blocks[1]])
+    gpu_pool.touch(loader_local + consumer_local[0] + consumer_local[1])
+    assert all(blk.block_hash is not None for blk in consumer_local[0])
+    assert mamba_blocks[1].block_hash is not None
+
+    block_aligned_local = boundary_tokens - boundary_tokens % sched.block_size
+    partial_tail = boundary_tokens - block_aligned_local
+    assert partial_tail == hash_block_size
+
+    # The loader has no local tail and takes the CPU hit as an async load.
+    loader_hit, _ = sched.get_num_new_matched_tokens(loader, block_aligned_local)
+    assert loader_hit == partial_tail
+    loader_blocks = KVCacheBlocks(
+        blocks=(
+            loader_local + gpu_pool.get_new_blocks(2),
+            [gpu_pool.null_block] + gpu_pool.get_new_blocks(1),
+        )
+    )
+    sched.update_state_after_alloc(
+        loader, loader_blocks, num_external_tokens=loader_hit
+    )
+    loader_meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert loader_meta.load_event >= 0
+
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(
+        consumer, block_aligned_local
+    )
+    assert (hit_tokens, is_async) == (partial_tail, True)
+    pinned = [
+        blk
+        for grp in sched._pending_cpu_hits[consumer.request_id][0]
+        for blk in grp
+        if not blk.is_null
+    ]
+    assert len(pinned) == 2
+    assert set(loader_meta.load_cpu_blocks) == {blk.block_id for blk in pinned}
+    assert [blk.ref_cnt for blk in pinned] == [2, 2]
+
+    # scheduler.py loads only a remote hit strictly longer than the local tail.
+    assert not hit_tokens > partial_tail
+    consumer_blocks = KVCacheBlocks(
+        blocks=(consumer_local[0] + gpu_pool.get_new_blocks(1), consumer_local[1])
+    )
+    gpu_refs_before = [blk.ref_cnt for blk in gpu_pool.blocks]
+    caplog_vllm.clear()
+    sched.update_state_after_alloc(consumer, consumer_blocks, num_external_tokens=0)
+    assert not [r for r in caplog_vllm.records if r.levelno >= logging.WARNING]
+
+    assert consumer.request_id not in sched._pending_cpu_hits
+    assert consumer.request_id not in sched._reqs_to_load
+    assert [blk.ref_cnt for blk in gpu_pool.blocks] == gpu_refs_before
+    # The loader's in-flight load still holds the same CPU blocks.
+    assert [blk.ref_cnt for blk in pinned] == [1, 1]
+    assert all(blk.block_hash is not None for blk in pinned)
+    no_load_meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert no_load_meta.load_event == -1
+    assert consumer.request_id not in no_load_meta.load_event_to_reqs.get(
+        loader_meta.load_event, []
+    )
+
+    simulate_load_completion(sched, {loader.request_id})
+    assert [blk.ref_cnt for blk in cpu_pool.blocks] == cpu_refs_baseline
+    assert cpu_pool.get_num_free_blocks() == cpu_free_baseline
+    assert all(blk.block_hash is not None for blk in pinned)
+
+    assert sched.get_stats().reduce()[MetricName.UNUSED_HITS] == 1
+    assert MetricName.UNUSED_HITS not in sched.get_stats().reduce()
 
 
 def test_eager_store_does_not_scan_mamba_blocks_positionally() -> None:

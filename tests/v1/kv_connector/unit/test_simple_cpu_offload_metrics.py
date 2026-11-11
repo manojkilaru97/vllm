@@ -39,6 +39,7 @@ from vllm.v1.simple_kv_offload.metrics import (
 
 SAVE_OUTCOMES = MetricName.SAVE_OUTCOMES
 LOAD_BLOCKS = MetricName.LOAD_BLOCKS
+UNUSED_HITS = MetricName.UNUSED_HITS
 USED_BLOCKS = MetricName.USED_BLOCKS
 PENDING_STORE_BLOCKS = MetricName.PENDING_STORE_BLOCKS
 INFO = MetricName.INFO
@@ -188,6 +189,7 @@ def test_prom_metrics_registers_tier1_metrics() -> None:
     assert set(defs) == {
         SAVE_OUTCOMES,
         LOAD_BLOCKS,
+        UNUSED_HITS,
         USED_BLOCKS,
         PENDING_STORE_BLOCKS,
         INFO,
@@ -197,6 +199,7 @@ def test_prom_metrics_registers_tier1_metrics() -> None:
     assert {m.kwargs["name"] for m in defs.values()} == {
         SAVE_OUTCOMES,
         LOAD_BLOCKS,
+        UNUSED_HITS,
         USED_BLOCKS,
         PENDING_STORE_BLOCKS,
         INFO,
@@ -211,6 +214,7 @@ def test_prom_metrics_registers_tier1_metrics() -> None:
         "outcome",
     ]
     assert defs[LOAD_BLOCKS].kwargs["labelnames"] == ["model_name", "engine"]
+    assert defs[UNUSED_HITS].kwargs["labelnames"] == ["model_name", "engine"]
     assert defs[INFO].kwargs["labelnames"] == [
         "model_name",
         "engine",
@@ -231,6 +235,7 @@ def test_prom_metrics_observe_routes_each_series() -> None:
             types={
                 SAVE_OUTCOMES: _MetricType.COUNTER,
                 LOAD_BLOCKS: _MetricType.COUNTER,
+                UNUSED_HITS: _MetricType.COUNTER,
                 USED_BLOCKS: _MetricType.GAUGE,
                 PENDING_STORE_BLOCKS: _MetricType.GAUGE,
                 INFO: _MetricType.GAUGE,
@@ -238,6 +243,7 @@ def test_prom_metrics_observe_routes_each_series() -> None:
             data={
                 SAVE_OUTCOMES: {("stored",): 3},
                 LOAD_BLOCKS: {(): 4},
+                UNUSED_HITS: {(): 2},
                 USED_BLOCKS: {(): 5},
                 PENDING_STORE_BLOCKS: {(): 1},
                 INFO: {("cpu", "false", "false", "64"): 1},
@@ -247,6 +253,7 @@ def test_prom_metrics_observe_routes_each_series() -> None:
 
     assert prom._metrics[(0, SAVE_OUTCOMES, ("stored",))].increments == [3]
     assert prom._metrics[(0, LOAD_BLOCKS, ())].increments == [4]
+    assert prom._metrics[(0, UNUSED_HITS, ())].increments == [2]
     assert prom._metrics[(0, USED_BLOCKS, ())].set_values == [5]
     assert prom._metrics[(0, PENDING_STORE_BLOCKS, ())].set_values == [1]
     assert prom._metrics[(0, INFO, ("cpu", "false", "false", "64"))].set_values == [1]
