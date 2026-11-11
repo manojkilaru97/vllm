@@ -371,26 +371,45 @@ _KEY_PATTERN_OBJECT = {
 }
 
 
+_PROPERTY_NAMES_ERROR = "Grammar error: .*propertyNames"
+
+
 @pytest.mark.parametrize(
-    "schema",
+    ("schema", "with_fast_tokenizer"),
     [
-        {**_KEY_PATTERN_OBJECT, "required": ["a"]},
-        {**_KEY_PATTERN_OBJECT, "properties": {"a": {"type": "string"}}},
-        {**_KEY_PATTERN_OBJECT, "allOf": [{"required": ["a"]}]},
-        {"$defs": {"o": _KEY_PATTERN_OBJECT}, "$ref": "#/$defs/o"},
-        {"type": "object", "propertyNames": {"pattern": "^[a-z]+$"}},
-        {
-            "type": "object",
-            "propertyNames": {"pattern": "^[a-z]+$"},
-            "required": ["alpha"],
-        },
+        ({**_KEY_PATTERN_OBJECT, "required": ["a"]}, "guidance"),
+        ({**_KEY_PATTERN_OBJECT, "properties": {"a": {"type": "string"}}}, "guidance"),
+        ({**_KEY_PATTERN_OBJECT, "allOf": [{"required": ["a"]}]}, "guidance"),
+        ({"$defs": {"o": _KEY_PATTERN_OBJECT}, "$ref": "#/$defs/o"}, "guidance"),
         # Untyped keyword next to an xgrammar-rejected feature.
-        {"patternProperties": {"^a$": {"type": "integer", "multipleOf": 2}}},
+        (
+            {"patternProperties": {"^a$": {"type": "integer", "multipleOf": 2}}},
+            "guidance",
+        ),
+        # guidance cannot build these, so they stay 400.
+        (
+            {"type": "object", "propertyNames": {"pattern": "^[a-z]+$"}},
+            _PROPERTY_NAMES_ERROR,
+        ),
+        (
+            {
+                "type": "object",
+                "propertyNames": {"pattern": "^[a-z]+$"},
+                "required": ["alpha"],
+            },
+            _PROPERTY_NAMES_ERROR,
+        ),
+        (
+            {**_KEY_PATTERN_OBJECT, "dependentRequired": {"a": ["b"]}},
+            "Grammar error: .*dependentRequired",
+        ),
     ],
 )
 @pytest.mark.parametrize("route", ["fast", "slow", "non_tekken_mistral"])
-def test_auto_backend_rejects_key_patterns(monkeypatch, schema, route):
-    """No `auto` route may run these schemas: outlines ignores the keywords."""
+def test_auto_backend_routes_key_patterns_to_guidance(
+    monkeypatch, schema, with_fast_tokenizer, route
+):
+    """`auto` must never send these to outlines, which ignores the keywords."""
     import vllm.sampling_params as sampling_params_module
 
     monkeypatch.setattr(
@@ -402,15 +421,25 @@ def test_auto_backend_rejects_key_patterns(monkeypatch, schema, route):
     params = SamplingParams(
         structured_outputs=StructuredOutputsParams(json=json.dumps(schema))
     )
-    with pytest.raises(
-        VLLMValidationError,
-        match="patternProperties/propertyNames, which structured output cannot",
-    ):
+
+    def validate():
         params._validate_structured_outputs(
             _StubModelConfig(is_diffusion=False),
             StructuredOutputsConfig(backend="auto"),
             tokenizer=tokenizer,
         )
+
+    if route == "fast" and with_fast_tokenizer == "guidance":
+        validate()
+        assert params.structured_outputs._backend == "guidance"
+        return
+    match = {
+        "fast": with_fast_tokenizer,
+        "slow": "No compatible structured output backend",
+        "non_tekken_mistral": "patternProperties/propertyNames, which structured",
+    }[route]
+    with pytest.raises(VLLMValidationError, match=match):
+        validate()
 
 
 # ================================================

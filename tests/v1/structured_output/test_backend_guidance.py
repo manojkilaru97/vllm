@@ -52,6 +52,77 @@ def test_backend_guidance_rejects_grammar_matcher_cannot_build():
         )
 
 
+_PATTERN_A = {"type": "object", "patternProperties": {"^a$": {"type": "string"}}}
+
+
+@pytest.mark.parametrize(
+    ("schema", "valid", "invalid"),
+    [
+        (
+            {
+                "type": "object",
+                "patternProperties": {"^a": {"type": "string"}},
+                "required": ["alpha"],
+            },
+            ['{"alpha": "x"}', '{"alpha": "x", "a": "y"}'],
+            ["{}", '{"a": "5"}', '{"alpha": 5}'],
+        ),
+        (
+            {"$defs": {"o": _PATTERN_A}, "$ref": "#/$defs/o", "required": ["a"]},
+            ['{"a": "x"}'],
+            ["{}", '{"a": 1}'],
+        ),
+        ({**_PATTERN_A, "allOf": [{"required": ["a"]}]}, ['{"a": "x"}'], ["{}"]),
+        (
+            {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "patternProperties": {"^x$": {"type": "integer"}},
+            },
+            ["{}"],
+            ['{"x": "s"}', '{"x": 1}'],
+        ),
+    ],
+)
+def test_backend_guidance_enforces_pattern_properties(schema, valid, invalid):
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    backend = GuidanceBackend(
+        VllmConfig(
+            structured_outputs_config=StructuredOutputsConfig(backend="guidance")
+        ),
+        tokenizer=tokenizer,
+        vocab_size=50257,
+    )
+
+    def accepts(text: str) -> bool:
+        grammar = backend.compile_grammar(
+            StructuredOutputOptions.JSON, json.dumps(schema)
+        )
+        tokens = tokenizer.encode(text)
+        if grammar.validate_tokens(tokens) != tokens:
+            return False
+        assert grammar.accept_tokens("", tokens)
+        return grammar.ll_matcher.is_accepting()
+
+    for text in valid:
+        assert accepts(text), text
+    for text in invalid:
+        assert not accepts(text), text
+
+
+def test_backend_guidance_rejects_property_names():
+    backend = GuidanceBackend(
+        VllmConfig(
+            structured_outputs_config=StructuredOutputsConfig(backend="guidance")
+        ),
+        tokenizer=AutoTokenizer.from_pretrained(TOKENIZER),
+        vocab_size=50257,
+    )
+    schema = {"type": "object", "propertyNames": {"pattern": "^[a-z]+$"}}
+    with pytest.raises(ValueError, match="Grammar error: .*propertyNames"):
+        backend.compile_grammar(StructuredOutputOptions.JSON, json.dumps(schema))
+
+
 def test_backend_guidance_rollback_terminated():
     # Test that the backend guidance successfully rollbacks from a
     # terminated state. This can happen with speculative decoding,

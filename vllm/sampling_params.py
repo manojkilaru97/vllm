@@ -1420,8 +1420,9 @@ class SamplingParams(
                             ) from e
                     else:
                         schema = so_params.json
-                    # outlines ignores these keywords; guidance is not verified.
-                    if has_key_pattern_keywords(schema):
+                    # outlines ignores these keywords; guidance enforces or rejects
+                    # them, so only the no-guidance route has to fail here.
+                    if skip_guidance and has_key_pattern_keywords(schema):
                         raise VLLMValidationError(
                             "The JSON schema uses patternProperties/propertyNames, "
                             "which structured output cannot enforce."
