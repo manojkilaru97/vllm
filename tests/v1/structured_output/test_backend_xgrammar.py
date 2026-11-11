@@ -10,7 +10,6 @@ from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
 from vllm.config import StructuredOutputsConfig, VllmConfig
-from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 from vllm.v1.structured_output.backend_xgrammar import (
@@ -178,95 +177,57 @@ def unsupported_patternProperties_combinations():
 
 @pytest.fixture
 def unenforced_key_pattern_schemas():
-    """Shapes xgrammar 0.2.8 does not enforce: it drops `required` next to
-    patternProperties/propertyNames and ignores both without an object type."""
-    pattern = {"^a": {"type": "string"}}
+    """Shapes from the rc1 reviews that xgrammar 0.2.8 under-enforces: it drops
+    `required` and composed or referenced constraints next to the keywords."""
+    pattern = {"^a$": {"type": "string"}}
     names = {"pattern": "^[a-z]+$"}
+    obj = {"type": "object", "patternProperties": pattern}
     return [
-        {"type": "object", "patternProperties": pattern, "required": ["alpha"]},
-        {"type": "object", "patternProperties": pattern, "required": ["beta"]},
-        {
-            "type": "object",
-            "patternProperties": {"^alpha$": {"type": "string"}},
-            "required": ["alpha"],
-        },
-        {
-            "type": "object",
-            "patternProperties": pattern,
-            "additionalProperties": False,
-            "required": ["alpha"],
-        },
-        {
-            "type": "object",
-            "patternProperties": pattern,
-            "additionalProperties": {"type": "integer"},
-            "required": ["beta"],
-        },
-        {"type": "object", "patternProperties": {}, "required": ["beta"]},
-        {"type": ["object", "null"], "patternProperties": pattern, "required": ["a"]},
+        {**obj, "required": ["a"]},
         {"type": "object", "propertyNames": names, "required": ["alpha"]},
+        {**obj, "allOf": [{"required": ["a"]}]},
+        {**obj, "anyOf": [{"type": "object"}]},
+        {**obj, "dependentRequired": {"a": ["b"]}},
+        {"type": "object", "propertyNames": {"not": {"const": "a"}}},
+        {"type": "object", "propertyNames": names, "additionalProperties": False},
+        {"oneOf": [obj, {"type": "object"}]},
+        {"$defs": {"o": obj}, "$ref": "#/$defs/o", "required": ["a"]},
         {
             "type": "object",
-            "propertyNames": names,
-            "additionalProperties": {"type": "integer"},
-            "required": ["alpha"],
+            "required": ["a"],
+            "if": {"required": ["z"]},
+            "then": {"type": "object"},
+            "else": obj,
         },
-        {"patternProperties": pattern},
-        {"patternProperties": pattern, "required": ["alpha"]},
-        {"propertyNames": names},
-        {
-            "type": "object",
-            "properties": {
-                "m": {"type": "object", "patternProperties": pattern, "required": ["a"]}
-            },
-        },
-        {
-            "anyOf": [
-                {"type": "object", "patternProperties": pattern, "required": ["a"]},
-                {"type": "null"},
-            ]
-        },
-        {
-            "$defs": {
-                "m": {"type": "object", "patternProperties": pattern, "required": ["a"]}
-            },
-            "$ref": "#/$defs/m",
-        },
+        {"type": "array", "items": {**obj, "required": ["a"]}},
+        {"type": "object", "properties": {"m": {**obj, "required": ["a"]}}},
     ]
 
 
 @pytest.fixture
-def supported_pattern_properties_shapes():
-    """Shapes with patternProperties that xgrammar 0.2.8 fully enforces. It
-    matches the whole key against each pattern: narrower, but still valid."""
-    pattern = {"^a": {"type": "string"}}
+def key_pattern_names_and_data():
+    """`patternProperties`/`propertyNames` used as names or instance data, not
+    as keywords."""
+    names = ("patternProperties", "propertyNames")
     return [
-        {"type": "object", "patternProperties": pattern},
-        {"type": "object", "patternProperties": pattern, "required": []},
-        {"type": "object", "patternProperties": pattern, "additionalProperties": True},
-        {"type": "object", "patternProperties": pattern, "additionalProperties": False},
         {
             "type": "object",
-            "patternProperties": pattern,
-            "additionalProperties": {"type": "integer"},
+            "properties": {name: {"type": "string"} for name in names},
+            "required": list(names),
         },
-        {"type": "object", "patternProperties": pattern, "minProperties": 1},
-        {"type": "object", "patternProperties": pattern, "maxProperties": 1},
-        {"type": ["object", "null"], "patternProperties": pattern},
+        *(
+            {"$defs": {name: {"type": "string"}}, "$ref": f"#/$defs/{name}"}
+            for name in names
+        ),
+        {"definitions": {"propertyNames": {"type": "integer"}}},
+        {"type": "object", "const": {"patternProperties": {"type": "object"}}},
+        {"type": "object", "enum": [{"type": "object", "propertyNames": {}}]},
+        {"type": "object", "default": {"propertyNames": "hello"}},
+        {"type": "object", "examples": [{"patternProperties": {}}]},
         {
             "type": "object",
-            "properties": {"m": {"type": "object", "patternProperties": pattern}},
-            "required": ["m"],
-        },
-        # Property names that are also keyword names are not keywords.
-        {
-            "type": "object",
-            "properties": {
-                "patternProperties": {"type": "object"},
-                "propertyNames": {"type": "string"},
-                "required": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["patternProperties", "propertyNames"],
+            "properties": {"x": {"type": "string"}},
+            "dependentSchemas": {"patternProperties": {"required": ["x"]}},
         },
     ]
 
@@ -478,6 +439,9 @@ class TestHasXGrammarUnsupportedJsonFeatures:
             "unsupported_propertyNames_combinations",
             "unsupported_patternProperties_combinations",
             "unenforced_key_pattern_schemas",
+            "pattern_properties_schema",
+            "property_names_schema",
+            "property_names_with_additional_properties_schema",
             # vLLM issue #56556
             "unsupported_multibranch_allof",
             "unsupported_vllm_issue_56556_schema",
@@ -485,6 +449,8 @@ class TestHasXGrammarUnsupportedJsonFeatures:
     )
     def test_unsupported_json_features(self, schema_type, request):
         schemas = request.getfixturevalue(schema_type)
+        if not isinstance(schemas, list):
+            schemas = [schemas]
         for schema in schemas:
             assert has_xgrammar_unsupported_json_features(schema), (
                 f"Schema should be unsupported: {schema}"
@@ -494,10 +460,7 @@ class TestHasXGrammarUnsupportedJsonFeatures:
         "schema_type",
         [
             "supported_frankenstein_schema",
-            "pattern_properties_schema",
-            "supported_pattern_properties_shapes",
-            "property_names_schema",
-            "property_names_with_additional_properties_schema",
+            "key_pattern_names_and_data",
             # Additional test cases implemented during work on
             # vLLM issue #56556
             "supported_allof_anyof_and_oneof",
@@ -510,6 +473,14 @@ class TestHasXGrammarUnsupportedJsonFeatures:
         for schema in schemas:
             assert not has_xgrammar_unsupported_json_features(schema), (
                 f"Schema should be supported: {schema}"
+            )
+
+    def test_key_pattern_names_and_data_stay_on_xgrammar(
+        self, key_pattern_names_and_data
+    ):
+        for schema in key_pattern_names_and_data:
+            validate_xgrammar_grammar(
+                SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
             )
 
     class TestPR48416Regressions:
@@ -534,8 +505,11 @@ class TestHasXGrammarUnsupportedJsonFeatures:
                 },
                 {
                     "type": ["object", "null"],
+                    "propertyNames": {"pattern": "^[a-z_]+$"},
+                },
+                {
+                    "type": ["object", "null"],
                     "patternProperties": {"^S": {"type": "string"}},
-                    "required": ["S"],
                 },
             ],
         )
@@ -548,14 +522,6 @@ class TestHasXGrammarUnsupportedJsonFeatures:
                 {"type": ["string", "null"]},
                 {"type": ["integer", "string"]},
                 {"type": ["array", "null"], "items": {"type": "string"}},
-                {
-                    "type": ["object", "null"],
-                    "propertyNames": {"pattern": "^[a-z_]+$"},
-                },
-                {
-                    "type": ["object", "null"],
-                    "patternProperties": {"^S": {"type": "string"}},
-                },
             ],
         )
         def test_supported_list_type_json_features(self, schema):
@@ -584,53 +550,6 @@ class TestIsGrammarAcceptString:
             assert grammar_accepts(pattern_properties_schema, '{"grade_1": 5}')
             assert not grammar_accepts(pattern_properties_schema, '{"other": 5}')
             assert not grammar_accepts(pattern_properties_schema, '{"grade_1": "five"}')
-
-        @pytest.mark.parametrize(
-            "schema",
-            [
-                {
-                    "type": "object",
-                    "patternProperties": {"^a": {"type": "string"}},
-                    "required": ["alpha"],
-                },
-                {
-                    "type": "object",
-                    "propertyNames": {"pattern": "^[a-z]+$"},
-                    "required": ["alpha"],
-                },
-            ],
-        )
-        def test_required_next_to_key_patterns_is_dropped(self, schema):
-            # If this fails, xgrammar enforces it now: relax the vLLM check.
-            assert grammar_accepts(schema, "{}")
-
-        def test_untyped_pattern_properties_is_ignored(self):
-            schema = {"patternProperties": {"^a": {"type": "string"}}}
-            assert grammar_accepts(schema, '{"a": 5}')
-
-        def test_supported_pattern_properties_shapes_are_enforced(
-            self, supported_pattern_properties_shapes
-        ):
-            for schema in supported_pattern_properties_shapes:
-                if "patternProperties" not in schema:
-                    continue
-                assert grammar_accepts(schema, '{"a": "x"}'), schema
-                assert not grammar_accepts(schema, '{"a": 5}'), schema
-
-    class TestUnenforcedKeyPatternRejection:
-        def test_validate_xgrammar_names_the_unenforced_feature(self):
-            schema = {
-                "type": "object",
-                "patternProperties": {"^a": {"type": "string"}},
-                "required": ["alpha"],
-            }
-            params = SamplingParams(
-                structured_outputs=StructuredOutputsParams(json=schema)
-            )
-            with pytest.raises(
-                VLLMValidationError, match="patternProperties with required"
-            ):
-                validate_xgrammar_grammar(params)
 
     class TestPR48115Regressions:
         @pytest.mark.parametrize("codepoint", [*range(0x20), 0x7F])

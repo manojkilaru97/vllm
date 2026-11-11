@@ -1324,7 +1324,6 @@ class SamplingParams(
 
         from vllm.v1.structured_output.backend_guidance import (
             GuidanceBackend,
-            has_guidance_unsupported_json_features,
             validate_guidance_grammar,
         )
         from vllm.v1.structured_output.backend_lm_format_enforcer import (
@@ -1333,7 +1332,10 @@ class SamplingParams(
         from vllm.v1.structured_output.backend_outlines import (
             validate_structured_output_request_outlines,
         )
-        from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
+        from vllm.v1.structured_output.backend_xgrammar import (
+            has_key_pattern_keywords,
+            validate_xgrammar_grammar,
+        )
         from vllm.v1.structured_output.utils import grammar_is_likely_lark
 
         if backend.startswith("xgrammar"):
@@ -1400,16 +1402,14 @@ class SamplingParams(
             try:
                 validate_xgrammar_grammar(self)
                 self.structured_outputs._backend = "xgrammar"
-            except VLLMValidationError as xgrammar_error:
+            except VLLMValidationError:
                 # The request either failed validation
                 # or includes some jsonschema feature(s) that
                 # are not supported in xgrammar.
 
                 skip_guidance = _is_non_tekken_mistral(tokenizer)
 
-                # Check if schema has features unsupported by guidance
                 so_params = self.structured_outputs
-                has_pattern_properties = False
                 if so_params.json:
                     if isinstance(so_params.json, str):
                         try:
@@ -1420,20 +1420,15 @@ class SamplingParams(
                             ) from e
                     else:
                         schema = so_params.json
-                    has_pattern_properties = has_guidance_unsupported_json_features(
-                        schema
-                    )
-                    skip_guidance = skip_guidance or has_pattern_properties
+                    # outlines ignores these keywords; guidance is not verified.
+                    if has_key_pattern_keywords(schema):
+                        raise VLLMValidationError(
+                            "The JSON schema uses patternProperties/propertyNames, "
+                            "which structured output cannot enforce."
+                        ) from None
 
-                if has_pattern_properties:
-                    # outlines ignores patternProperties, so it would not enforce them.
-                    raise VLLMValidationError(
-                        f"{xgrammar_error} The guidance and outlines backends "
-                        "do not support patternProperties either."
-                    ) from None
                 if skip_guidance:
-                    # Fall back to outlines for non-Tekken Mistral tokenizers or
-                    # schemas containing features unsupported by guidance.
+                    # Fall back to outlines for non-Tekken Mistral tokenizers.
                     validate_structured_output_request_outlines(self)
                     self.structured_outputs._backend = "outlines"
                 else:

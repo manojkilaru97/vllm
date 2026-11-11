@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -380,17 +381,50 @@ def _schema_types(schema: dict[str, Any]) -> set[str]:
     return set()
 
 
+# Keywords whose dict value maps arbitrary names to subschemas.
+_SCHEMA_MAP_KEYWORDS = frozenset(
+    (
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "dependencies",
+    )
+)
+# Keywords whose value is instance data, never a schema.
+_SCHEMA_DATA_KEYWORDS = frozenset(("const", "enum", "default", "examples"))
+_KEY_PATTERN_KEYWORDS = ("patternProperties", "propertyNames")
+
+
+def _subschemas(obj: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Yield the dicts nested in schema positions of ``obj``."""
+    for key, value in obj.items():
+        if key in _SCHEMA_DATA_KEYWORDS:
+            continue
+        if key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+            value = list(value.values())
+        if isinstance(value, dict):
+            yield value
+        elif isinstance(value, list):
+            yield from (item for item in value if isinstance(item, dict))
+
+
+def has_key_pattern_keywords(schema: dict[str, Any]) -> bool:
+    """Check if any subschema uses patternProperties or propertyNames."""
+    if not isinstance(schema, dict):
+        return False
+    if any(key in schema for key in _KEY_PATTERN_KEYWORDS):
+        return True
+    return any(has_key_pattern_keywords(sub) for sub in _subschemas(schema))
+
+
 def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
     """Check if JSON schema contains features unsupported by xgrammar."""
-    return xgrammar_unsupported_json_feature(schema) is not None
 
-
-def xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> str | None:
-    """Describe the first JSON schema feature xgrammar cannot enforce, if any."""
-
-    def check_object(obj: dict[str, Any]) -> str | None:
+    def check_object(obj: dict[str, Any]) -> bool:
         if not isinstance(obj, dict):
-            return None
+            return False
 
         schema_types = _schema_types(obj)
 
@@ -402,13 +436,15 @@ def xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> str | None:
         # https://github.com/mlc-ai/xgrammar/pull/670
         # So, no need to track progress on this
         if (schema_types & {"integer", "number"}) and ("multipleOf" in obj):
-            return "multipleOf"
+            return True
 
         # array + some constraints is unsupported by xgrammar
         # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/968
-        for key in ("uniqueItems", "contains", "minContains", "maxContains"):
-            if "array" in schema_types and key in obj:
-                return f"array {key}"
+        if "array" in schema_types and any(
+            key in obj
+            for key in ("uniqueItems", "contains", "minContains", "maxContains")
+        ):
+            return True
 
         # string + format with unsupported keywords
         # is unsupported by xgrammar
@@ -420,63 +456,21 @@ def xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> str | None:
             and "format" in obj
             and obj["format"] not in STRING_SUPPORTED_FORMATS
         ):
-            return f"string format {obj['format']!r}"
+            return True
 
         # string + format/pattern + length constraint is unsupported by xgrammar
         # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/966
         # See tests on this in test_backend_xgrammar.py
         # unsupported_string_schemas
         if "string" in schema_types and _has_pattern_and_length_bounds(obj):
-            return "string pattern or format with minLength/maxLength"
+            return True
 
-        # xgrammar ignores these keywords without an object type and drops
-        # `required` next to them: https://github.com/mlc-ai/xgrammar/pull/1031
-        for key in ("patternProperties", "propertyNames"):
-            if key not in obj:
-                continue
-            if not schema_types:
-                return f'{key} without "type": "object"'
-            if "object" in schema_types and obj.get("required"):
-                return f"{key} with required"
-
-        # propertyNames is not supported in pair with some constraints
-        # in xgrammar
-        # See tests on this in test_backend_xgrammar.py
-        # unsupported_propertyNames_combinations
-        if "object" in schema_types and "propertyNames" in obj:
-            # propertyNames + maxLength is unsupported by xgrammar
-            # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/960
-            property_names = obj.get("propertyNames")
-            if isinstance(property_names, dict) and _has_pattern_and_length_bounds(
-                property_names
-            ):
-                return "propertyNames pattern with minLength/maxLength"
-            # propertyNames + patternProperties is unsupported by xgrammar
-            # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/959
-            if "patternProperties" in obj:
-                return "propertyNames with patternProperties"
-            # propertyNames + properties is unsupported by xgrammar
-            # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/958
-            if "properties" in obj:
-                return "propertyNames with properties"
-            # propertyNames + unevaluatedProperties is unsupported by xgrammar
-            # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/961
-            if obj.get("unevaluatedProperties", True) is not True:
-                return "propertyNames with unevaluatedProperties"
-
-        # patternProperties is not supported in pair with some constraints
-        # in xgrammar
-        # See tests on this in test_backend_xgrammar.py
-        # unsupported_patternProperties_combinations
-        if "object" in schema_types and isinstance(obj.get("patternProperties"), dict):
-            # patternProperties + properties is unsupported by xgrammar
-            # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/964
-            if "properties" in obj:
-                return "patternProperties with properties"
-            # patternProperties + patternProperties is unsupported by xgrammar
-            # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/965
-            if len(obj["patternProperties"]) > 1:
-                return "more than one patternProperties pattern"
+        # xgrammar drops `required` and composed or referenced constraints next
+        # to these keywords, so no shape of them is safe to accept.
+        if "object" in schema_types and any(
+            key in obj for key in _KEY_PATTERN_KEYWORDS
+        ):
+            return True
 
         # Note(arpera):
         # Xgrammar lacks support of multi-branch allOf
@@ -493,23 +487,9 @@ def xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> str | None:
         # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/937
         allof = obj.get("allOf")
         if isinstance(allof, list) and len(allof) >= 2:
-            return "allOf with more than one branch"
+            return True
 
-        # Recursively check all nested objects and arrays
-        for key, value in obj.items():
-            # Check the property schemas, not the name map, so property names
-            # are never read as keywords.
-            if key == "properties" and isinstance(value, dict):
-                value = list(value.values())
-            if isinstance(value, dict):
-                if reason := check_object(value):
-                    return reason
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict) and (reason := check_object(item)):
-                        return reason
-
-        return None
+        return any(check_object(sub) for sub in _subschemas(obj))
 
     return check_object(schema)
 
@@ -567,10 +547,10 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
             schema = so_params.json
 
         try:
-            if reason := xgrammar_unsupported_json_feature(schema):
+            if has_xgrammar_unsupported_json_features(schema):
                 raise VLLMValidationError(
                     "The provided JSON schema contains features not supported "
-                    f"by xgrammar: {reason}."
+                    "by xgrammar."
                 )
             xgr.Grammar.from_json_schema(schema)
         except VLLMValidationError:

@@ -337,9 +337,17 @@ def test_unhandled_spec_is_a_validation_error(validate):
             },
             "guidance",
         ),
+        # A property named patternProperties is not the keyword.
         (
-            {"type": "object", "patternProperties": {"^a": {"type": "string"}}},
-            "xgrammar",
+            {
+                "type": "object",
+                "properties": {
+                    "patternProperties": {"type": "string"},
+                    "even": {"type": "integer", "multipleOf": 2},
+                },
+                "required": ["patternProperties", "even"],
+            },
+            "guidance",
         ),
     ],
 )
@@ -357,76 +365,51 @@ def test_auto_backend_falls_back_on_unsupported_schema(schema, expected_backend)
     assert params.structured_outputs._backend == expected_backend
 
 
+_KEY_PATTERN_OBJECT = {
+    "type": "object",
+    "patternProperties": {"^a$": {"type": "string"}},
+}
+
+
 @pytest.mark.parametrize(
-    ("schema", "reason"),
+    "schema",
     [
-        (
-            {
-                "type": "object",
-                "patternProperties": {"^a": {"type": "string"}},
-                "required": ["alpha"],
-            },
-            "patternProperties with required",
-        ),
-        (
-            {
-                "type": "object",
-                "properties": {"a": {"type": "string"}},
-                "patternProperties": {"^a$": {"type": "string"}},
-            },
-            "patternProperties with properties",
-        ),
-        (
-            {"patternProperties": {"^a": {"type": "string"}}},
-            'patternProperties without "type": "object"',
-        ),
-        (
-            {
-                "type": "object",
-                "patternProperties": {"^a": {"type": "integer", "multipleOf": 2}},
-            },
-            "multipleOf",
-        ),
+        {**_KEY_PATTERN_OBJECT, "required": ["a"]},
+        {**_KEY_PATTERN_OBJECT, "properties": {"a": {"type": "string"}}},
+        {**_KEY_PATTERN_OBJECT, "allOf": [{"required": ["a"]}]},
+        {"$defs": {"o": _KEY_PATTERN_OBJECT}, "$ref": "#/$defs/o"},
+        {"type": "object", "propertyNames": {"pattern": "^[a-z]+$"}},
+        {
+            "type": "object",
+            "propertyNames": {"pattern": "^[a-z]+$"},
+            "required": ["alpha"],
+        },
+        # Untyped keyword next to an xgrammar-rejected feature.
+        {"patternProperties": {"^a$": {"type": "integer", "multipleOf": 2}}},
     ],
 )
-@pytest.mark.parametrize("non_tekken_mistral", [False, True])
-def test_auto_backend_rejects_unenforced_pattern_properties(
-    monkeypatch, schema, reason, non_tekken_mistral
-):
-    """Guidance and outlines cannot enforce patternProperties, so `auto` must
-    reject what xgrammar rejects instead of compiling it unconstrained."""
+@pytest.mark.parametrize("route", ["fast", "slow", "non_tekken_mistral"])
+def test_auto_backend_rejects_key_patterns(monkeypatch, schema, route):
+    """No `auto` route may run these schemas: outlines ignores the keywords."""
     import vllm.sampling_params as sampling_params_module
 
     monkeypatch.setattr(
-        sampling_params_module, "_is_non_tekken_mistral", lambda _: non_tekken_mistral
+        sampling_params_module,
+        "_is_non_tekken_mistral",
+        lambda _: route == "non_tekken_mistral",
     )
+    tokenizer = object() if route == "slow" else object.__new__(TokenizersBackend)
     params = SamplingParams(
         structured_outputs=StructuredOutputsParams(json=json.dumps(schema))
     )
-    with pytest.raises(VLLMValidationError) as exc_info:
-        params._validate_structured_outputs(
-            _StubModelConfig(is_diffusion=False),
-            StructuredOutputsConfig(backend="auto", disable_any_whitespace=True),
-            tokenizer=object.__new__(TokenizersBackend),
-        )
-    assert reason in str(exc_info.value)
-    assert "do not support patternProperties" in str(exc_info.value)
-
-
-def test_auto_backend_rejects_property_names_with_required():
-    """Xgrammar drops `required` next to propertyNames and guidance rejects
-    propertyNames, so the request fails instead of running unconstrained."""
-    schema = {
-        "type": "object",
-        "propertyNames": {"pattern": "^[a-z]+$"},
-        "required": ["alpha"],
-    }
-    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
-    with pytest.raises(VLLMValidationError, match="propertyNames"):
+    with pytest.raises(
+        VLLMValidationError,
+        match="patternProperties/propertyNames, which structured output cannot",
+    ):
         params._validate_structured_outputs(
             _StubModelConfig(is_diffusion=False),
             StructuredOutputsConfig(backend="auto"),
-            tokenizer=object.__new__(TokenizersBackend),
+            tokenizer=tokenizer,
         )
 
 
