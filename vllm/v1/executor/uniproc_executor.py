@@ -24,6 +24,7 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.serial_utils import run_method
+from vllm.v1.worker.gpu.deferred_sample import join_pending
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -100,12 +101,14 @@ class UniProcExecutor(Executor):
             kwargs = {}
 
         if not non_block:
+            join_pending()
             result = run_method(self.driver_worker, method, args, kwargs)
             if isinstance(result, AsyncModelRunnerOutput):
                 result = result.get_output()
             return result if single_value else [result]
 
         try:
+            join_pending()
             result = run_method(self.driver_worker, method, args, kwargs)
             if isinstance(result, AsyncModelRunnerOutput):
                 return AsyncOutputFuture(result, single_value)

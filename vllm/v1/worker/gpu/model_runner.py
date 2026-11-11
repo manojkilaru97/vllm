@@ -78,6 +78,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
     DraftTokenIds,
     ECConnectorOutput,
     ModelRunnerOutput,
@@ -115,6 +116,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
 )
+from vllm.v1.worker.gpu.deferred_sample import DeferredSampleRunner
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -293,6 +295,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_prefill_lookahead=num_prefill_lookahead,
             use_dense_all_token_ids=use_dense_all_token_ids,
         )
+
+        self.deferred_sample: DeferredSampleRunner | None = None
 
         # Speculative decoding.
         self.speculator = None
@@ -531,6 +535,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 device=self.device,
                 mask_stride=self.decode_query_len,
             )
+            if self.deferred_sample is None and self._can_defer_sample():
+                self.deferred_sample = DeferredSampleRunner(self.device)
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
@@ -598,6 +604,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.reset_lora_state()
         self.reset_encoder_cache()
         self.reset_mm_cache()
+
+    def _can_defer_sample(self) -> bool:
+        # Only the single-process executor runs engine-core work on this thread.
+        parallel_config = self.vllm_config.parallel_config
+        return (
+            isinstance(self.sampler, GPUWatermarkSampler)
+            and getattr(self.sampler.watermarker, "parks_at_host_sync", False)
+            and bool(self.vllm_config.scheduler_config.async_scheduling)
+            and parallel_config.distributed_executor_backend == "uni"
+            and parallel_config.world_size_across_dp == 1
+            and self.pp_handler is None
+            and self.vllm_config.kv_transfer_config is None
+            and not self.vllm_config.aux_output_config.enabled
+        )
 
     @functools.cached_property
     def main_stream(self) -> torch.cuda.Stream:
@@ -1772,6 +1792,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if self.deferred_sample is not None:
+            self.deferred_sample.join()
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -2144,9 +2166,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         return None
 
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> AsyncModelRunnerOutput | ModelRunnerOutput | None:
+        if self.deferred_sample is not None:
+            return self.deferred_sample.run(self._sample_tokens, grammar_output)
+        return self._sample_tokens(grammar_output)
+
     @torch.inference_mode()
     @step_eplb_after()
-    def sample_tokens(
+    def _sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
         if self.execute_model_state is None:
@@ -2347,6 +2376,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if self.deferred_sample is not None:
+            self.deferred_sample.join()
         return self.draft_tokens_handler.get_draft_tokens()
 
     @torch.inference_mode()
@@ -2404,6 +2435,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if self.deferred_sample is not None:
+            self.deferred_sample.shutdown()
+            self.deferred_sample = None
         torch.accelerator.synchronize()
         if current_platform.is_rocm():
             # RCCL's ncclCommAbort waits for live graphs that captured the comm:
