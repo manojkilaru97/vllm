@@ -5,6 +5,7 @@ import json
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -55,6 +56,8 @@ from vllm.logprobs import Logprob
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import HarmonyParser
+from vllm.parser.abstract_parser import DelegatingParser
+from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 from vllm.reasoning.token_counter import ReasoningTokenCounter
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.mistral import MistralRenderer
@@ -790,6 +793,7 @@ async def test_streaming_serialization_failure_emits_error_and_done(
     serving = _build_minimal_metrics_serving_chat(False)
     serving.parser_cls = HarmonyParser
     parser = MagicMock()
+    parser.create_reasoning_token_counter.return_value = None
     parser.parse_delta.return_value = DeltaMessage(
         content="Hello", extra_object=object()
     )
@@ -1190,6 +1194,8 @@ async def test_streaming_reasoning_usage_counts_across_deltas(
     request_outputs = []
     num_steps = 3 if separate_finish else 2
     for parser in parsers:
+        # No plugin counter: exercise the count_reasoning_tokens recount.
+        parser.create_reasoning_token_counter.return_value = None
         parser.parse_delta.side_effect = [
             DeltaMessage(reasoning="reasoning") if include_reasoning else None,
             DeltaMessage(content="answer"),
@@ -1419,6 +1425,7 @@ async def test_streaming_reasoning_usage_lifecycle_edges(
     serving._include_reasoning_tokens_details = True
     parsers = [MagicMock() for _ in range(n)]
     for parser in parsers:
+        parser.create_reasoning_token_counter.return_value = None
         parser.parse_delta.side_effect = lambda **kwargs: DeltaMessage(
             content=kwargs["delta_text"]
         )
@@ -1538,6 +1545,7 @@ async def test_streaming_logprobs_kept_when_parser_suppresses_delta(
 
     parser = MagicMock()
     parser.parse_delta.side_effect = [None, DeltaMessage(content="answer")]
+    parser.create_reasoning_token_counter.return_value = None
     parser.count_reasoning_tokens.return_value = 0
     serving.parser_cls = MagicMock(return_value=parser)
 
@@ -1631,6 +1639,95 @@ async def test_force_usage_stream_reports_incremental_reasoning_tokens():
         "total_tokens": 5,
         "completion_tokens_details": {"reasoning_tokens": 1},
     }
+
+
+class _PluginCounterReasoningParser(BaseThinkingReasoningParser):
+    """Plugin whose counter only promises ``update(token_ids, finished=)``."""
+
+    updates: list[tuple[list[int], bool]] = []
+
+    @property
+    def start_token(self) -> str:
+        return "<think>"
+
+    @property
+    def end_token(self) -> str:
+        return "</think>"
+
+    def create_reasoning_token_counter(self, prompt_token_ids):
+        updates = self.updates
+
+        def update(token_ids, finished=False):
+            updates.append((list(token_ids), finished))
+            return 7
+
+        return SimpleNamespace(update=update)
+
+
+def _plugin_counter_parser() -> DelegatingParser:
+    class PluginCounterParser(DelegatingParser):
+        reasoning_parser_cls = _PluginCounterReasoningParser
+
+    _PluginCounterReasoningParser.updates = []
+    return PluginCounterParser(get_tokenizer("Qwen/Qwen3-0.6B"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_nonstream_usage_uses_plugin_counter_with_open_prompt():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving._include_reasoning_tokens_details = True
+    parser = _plugin_counter_parser()
+
+    response = await serving.chat_completion_full_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=False,
+        ),
+        _single_request_output(_make_metrics_request_output()),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+        parser=parser,
+    )
+
+    assert not isinstance(response, ErrorResponse)
+    assert response.usage.completion_tokens_details is not None
+    assert response.usage.completion_tokens_details.reasoning_tokens == 7
+    assert _PluginCounterReasoningParser.updates == [([100, 101], True)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_stream_usage_uses_plugin_counter_with_open_prompt():
+    serving = _build_minimal_metrics_serving_chat(
+        enable_per_request_metrics=False,
+        enable_force_include_usage=True,
+    )
+    serving._include_reasoning_tokens_details = True
+    serving.parser_cls = MagicMock(return_value=_plugin_counter_parser())
+    serving.model_config = None
+
+    chunks = await _collect_metrics_stream_chunks(
+        serving,
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=True,
+        ),
+    )
+
+    usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
+    assert usage_chunks
+    assert usage_chunks[-1]["usage"]["completion_tokens_details"] == {
+        "reasoning_tokens": 7
+    }
+    assert _PluginCounterReasoningParser.updates == [([100, 101], True)]
 
 
 @dataclass

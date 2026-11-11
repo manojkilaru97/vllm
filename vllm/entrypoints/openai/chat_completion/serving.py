@@ -124,11 +124,10 @@ def _make_completion_tokens_details(
 def _create_reasoning_token_counter(
     parser: Parser, prompt_token_ids: GenericSequence[int] | None
 ) -> ReasoningTokenCounter | None:
-    # None (or a non-counter from a duck-typed parser) falls back to the
-    # parser's native count_reasoning_tokens recount.
+    # Any non-None result is a counter: plugins only promise update(..., finished=).
+    # None falls back to the parser's count_reasoning_tokens recount.
     factory = getattr(parser, "create_reasoning_token_counter", None)
-    counter = factory(prompt_token_ids) if factory is not None else None
-    return counter if isinstance(counter, ReasoningTokenCounter) else None
+    return factory(prompt_token_ids) if factory is not None else None
 
 
 class OpenAIServingChat(GenerateBaseServing):
