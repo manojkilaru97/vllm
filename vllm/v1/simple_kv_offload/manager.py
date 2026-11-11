@@ -219,7 +219,9 @@ class SimpleCPUOffloadScheduler:
             pcp_world_size=1,
             scheduler_block_size=self.block_size,
             hash_block_size=self.hash_block_size,
-            allow_partial_hash_hits=not lazy_offload,
+            # Lazy mode needs these too: align-mode Mamba may only retain a
+            # sub-block prompt-boundary state, so block-aligned lookups miss.
+            allow_partial_hash_hits=True,
             num_prefill_lookahead=vllm_config.num_prefill_lookahead_tokens,
         )
         self.group_block_sizes = self.cpu_coordinator.group_block_sizes

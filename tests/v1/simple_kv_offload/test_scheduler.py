@@ -2986,22 +2986,91 @@ def test_external_lookup_rejects_misaligned_local_prefix(caplog_vllm) -> None:
     assert "requires scheduler-block-aligned local tokens" in caplog_vllm.text
 
 
-def test_fine_grained_external_hits_require_eager_offload() -> None:
+@pytest.mark.parametrize("lazy", [False, True])
+def test_fine_grained_external_hits_in_both_offload_modes(lazy: bool) -> None:
     hash_block_size = BLOCK_SIZE
     scheduler_block_size = 4 * BLOCK_SIZE
 
-    eager = _make_hybrid_attention_mamba_scheduler(
+    fix = _make_hybrid_attention_mamba_scheduler(
         block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
-    )
-    lazy = _make_hybrid_attention_mamba_scheduler(
-        block_size=scheduler_block_size,
-        hash_block_size=hash_block_size,
-        lazy=True,
+        lazy=lazy,
     )
 
-    assert eager.scheduler.cpu_coordinator.enable_partial_hash_hits
-    assert not lazy.scheduler.cpu_coordinator.enable_partial_hash_hits
+    assert fix.scheduler.cpu_coordinator.enable_partial_hash_hits
+
+
+def test_lazy_store_serves_sub_block_mamba_boundary_hit() -> None:
+    """Lazy offload must serve the sub-block prompt-boundary Mamba state.
+
+    Align mode with retention interval 0 keeps no state at the scheduler-block
+    edge, so a block-aligned CPU lookup reconciles the hybrid hit to zero.
+    """
+    hash_block_size = BLOCK_SIZE
+    mamba_block_size = 4 * BLOCK_SIZE
+    boundary_tokens = 5 * BLOCK_SIZE
+    num_gpu_blocks = 16
+    fix = _make_hybrid_attention_mamba_scheduler(
+        num_cpu_blocks=16,
+        num_gpu_blocks=num_gpu_blocks,
+        block_size=mamba_block_size,
+        hash_block_size=hash_block_size,
+        dcp_world_size=1,
+        lazy=True,
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    sched._target_free = num_gpu_blocks
+
+    producer = _make_cp_request(num_blocks=5, virtual_block_size=hash_block_size)
+    attention_blocks = _allocate_cp_gpu_blocks(
+        gpu_pool, producer, 5, virtual_block_size=hash_block_size, group_id=0
+    )
+    mamba_blocks = gpu_pool.get_new_blocks(2)
+    gpu_pool.cache_partial_block(
+        request=producer,
+        block=mamba_blocks[1],
+        num_tokens=boundary_tokens,
+        kv_cache_group_id=1,
+        block_size=mamba_block_size,
+    )
+    gpu_pool.free_blocks(attention_blocks + mamba_blocks)
+
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert set(meta.store_gpu_blocks) == {
+        block.block_id for block in (*attention_blocks, mamba_blocks[1])
+    }
+    simulate_store_completion(sched, meta.store_event)
+
+    consumer = Request(
+        request_id="req-lazy-mamba-boundary-load",
+        prompt_token_ids=producer.prompt_token_ids,
+        sampling_params=producer.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=producer._block_hasher,
+    )
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(
+        consumer, num_computed_tokens=0
+    )
+    assert (hit_tokens, is_async) == (boundary_tokens, True)
+
+    load_blocks = KVCacheBlocks(
+        blocks=(gpu_pool.get_new_blocks(5), gpu_pool.get_new_blocks(2))
+    )
+    sched.update_state_after_alloc(
+        consumer, load_blocks, num_external_tokens=hit_tokens
+    )
+    load_meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {consumer.request_id: 1},
+            new_reqs={consumer.request_id: load_blocks.get_block_ids()},
+        )
+    )
+    assert load_meta.load_gpu_blocks == [
+        *(block.block_id for block in load_blocks.blocks[0]),
+        load_blocks.blocks[1][1].block_id,
+    ]
 
 
 def test_eager_store_does_not_scan_mamba_blocks_positionally() -> None:
