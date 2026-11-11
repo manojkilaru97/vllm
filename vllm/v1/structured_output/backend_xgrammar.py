@@ -81,6 +81,8 @@ class XgrammarBackend(StructuredOutputBackend):
                 self.tokenizer, full_vocab_tokenizer_info
             )
 
+        self.default_stop_token_ids = frozenset(tokenizer_info.stop_token_ids)
+
         # FIXME(arpera):
         # Here we create not one but TWO compilers
         # because xgrammar currently does not properly handle
@@ -203,6 +205,9 @@ class XgrammarBackend(StructuredOutputBackend):
             ),
             vocab_size=self.vocab_size,
             ctx=ctx,
+            extra_stop_token_ids=tuple(
+                sorted(set(stop_token_ids or ()) - self.default_stop_token_ids)
+            ),
         )
 
     def allocate_token_bitmask(self, max_num_seqs: int):
@@ -260,6 +265,8 @@ class XgrammarGrammar(StructuredOutputGrammar):
         default_factory=lambda: 0, repr=False, hash=False, init=False
     )
     _is_terminated: bool = field(default=False, repr=False, hash=False)
+    # Request stop tokens the tokenizer info does not know (e.g. Ultra's </s>).
+    extra_stop_token_ids: tuple[int, ...] = field(default=(), repr=False, hash=False)
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
@@ -314,6 +321,18 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(bitmask, idx)
+        # xgrammar < 0.2.8 leaves override stop tokens samplable as content
+        # mid-grammar; keep one only if the matcher can terminate on it now.
+        for token in self.extra_stop_token_ids:
+            word, bit = divmod(token, 32)
+            value = int(bitmask[idx, word]) & 0xFFFFFFFF
+            if not (value >> bit) & 1:
+                continue
+            if self.matcher.accept_token(token):
+                self.matcher.rollback(1)
+                continue
+            value &= ~(1 << bit)
+            bitmask[idx, word] = value - (1 << 32) if value >= 1 << 31 else value
 
     def is_terminated(self) -> bool:
         return self._is_terminated
