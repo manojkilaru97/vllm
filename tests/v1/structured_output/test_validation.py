@@ -442,6 +442,94 @@ def test_auto_backend_routes_key_patterns_to_guidance(
         validate()
 
 
+_DECISION_OBJECT = {
+    "type": "object",
+    "properties": {
+        "decision": {"enum": ["skip", "act"]},
+        "actions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["decision", "actions"],
+    "additionalProperties": False,
+}
+
+
+def _when(decision: str, then: dict) -> dict:
+    return {
+        "if": {"properties": {"decision": {"const": decision}}},
+        "then": {"properties": {"actions": then}},
+    }
+
+
+# A forced-tool schema from Omni traffic: conditionals in a multi-branch allOf.
+_CONDITIONAL_ALLOF = {
+    **_DECISION_OBJECT,
+    "allOf": [_when("act", {"minItems": 1}), _when("skip", {"maxItems": 0})],
+}
+
+
+def _validate(schema, backend: str, as_str: bool = True) -> StructuredOutputsParams:
+    spec = json.dumps(schema) if as_str else schema
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=spec))
+    params._validate_structured_outputs(
+        _StubModelConfig(is_diffusion=False),
+        StructuredOutputsConfig(backend=backend),
+        tokenizer=object.__new__(TokenizersBackend),
+    )
+    assert params.structured_outputs is not None
+    return params.structured_outputs
+
+
+@pytest.mark.parametrize("as_str", [True, False])
+@pytest.mark.parametrize("backend", ["auto", "xgrammar"])
+def test_conditional_allof_compiles_on_xgrammar(backend, as_str):
+    """vLLM 0.27 compiled this as any JSON on xgrammar; it must not become a 400
+    (guidance: Unimplemented keys if/then), but the object schema it constrains."""
+    so = _validate(_CONDITIONAL_ALLOF, backend, as_str)
+    assert so._backend == "xgrammar"
+    schema = json.loads(so.json) if as_str else so.json
+    assert schema == _DECISION_OBJECT
+
+
+def test_conditional_next_to_other_allof_constraints_goes_to_guidance():
+    schema = {
+        **_DECISION_OBJECT,
+        "allOf": [
+            {"required": ["decision"], **_when("act", {"minItems": 1})},
+            {"required": ["actions"]},
+        ],
+    }
+    so = _validate(schema, "auto")
+    assert so._backend == "guidance"
+    assert json.loads(so.json)["allOf"] == [
+        {"required": ["decision"]},
+        {"required": ["actions"]},
+    ]
+
+
+def test_conditional_keyword_names_are_not_stripped():
+    spec = json.dumps(
+        {
+            "type": "object",
+            "properties": {"if": {"type": "string"}, "then": {"const": "else"}},
+            "required": ["if", "then"],
+            "default": {"else": 1},
+            "dependentRequired": {"if": ["then"]},
+        }
+    )
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=spec))
+    params._validate_structured_outputs(
+        _StubModelConfig(is_diffusion=False),
+        StructuredOutputsConfig(backend="auto"),
+        tokenizer=object.__new__(TokenizersBackend),
+    )
+    assert params.structured_outputs.json is spec
+
+
+def test_explicit_guidance_still_rejects_conditionals():
+    with pytest.raises(VLLMValidationError, match="Unimplemented keys"):
+        _validate(_CONDITIONAL_ALLOF, "guidance")
+
+
 def _string_field(pattern: str) -> dict:
     return {
         "type": "object",
@@ -555,12 +643,8 @@ def test_auto_backend_keeps_xgrammar_for_long_repeats_without_guidance(
 
 
 def test_auto_backend_keeps_xgrammar_when_guidance_rejects_long_repeats():
-    # guidance rejects if/then/else; xgrammar accepts the schema.
-    schema = {
-        **_string_field(_LONG_REPEAT),
-        "if": {"required": ["s"]},
-        "then": {"required": ["s"]},
-    }
+    # guidance rejects dependentRequired; xgrammar accepts the schema.
+    schema = {**_string_field(_LONG_REPEAT), "dependentRequired": {"s": ["s"]}}
     params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
     assert _validate_auto(params) == "xgrammar"
 

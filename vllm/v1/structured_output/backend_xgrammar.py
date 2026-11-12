@@ -404,6 +404,50 @@ def has_key_pattern_keywords(schema: dict[str, Any]) -> bool:
     return any(has_key_pattern_keywords(sub) for sub in _subschemas(schema))
 
 
+_CONDITIONAL_KEYWORDS = ("if", "then", "else")
+
+
+def _drop_conditionals(obj: Any) -> Any:
+    if isinstance(obj, list):
+        return [_drop_conditionals(item) for item in obj]
+    if not isinstance(obj, dict):
+        return obj
+    out: dict[str, Any] = {}
+    for key, value in obj.items():
+        if key in _CONDITIONAL_KEYWORDS:
+            continue
+        if key in _SCHEMA_DATA_KEYWORDS or key == "dependentRequired":
+            out[key] = value
+        elif key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+            out[key] = {name: _drop_conditionals(sub) for name, sub in value.items()}
+        else:
+            out[key] = _drop_conditionals(value)
+    if isinstance(allof := out.get("allOf"), list):
+        if branches := [b for b in allof if b != {}]:
+            out["allOf"] = branches
+        else:
+            del out["allOf"]
+    return out
+
+
+def drop_conditional_keywords(spec: str | dict[str, Any]) -> str | dict[str, Any]:
+    """Drop if/then/else and the allOf branches they empty; ``spec`` if unchanged.
+    Guidance rejects conditionals; in allOf they make xgrammar accept any JSON."""
+    if isinstance(spec, str):
+        if not any(f'"{key}"' in spec for key in _CONDITIONAL_KEYWORDS):
+            return spec
+        try:
+            schema = json.loads(spec)
+        except json.JSONDecodeError:
+            return spec
+    else:
+        schema = spec
+    stripped = _drop_conditionals(schema)
+    if stripped == schema:
+        return spec
+    return json.dumps(stripped) if isinstance(spec, str) else stripped
+
+
 # xgrammar >= 0.2.8 fills each mask in ~35 ms inside counted repeats above this
 # (xgrammar#1054), and validating {0,5000} takes ~10 s.
 _XGRAMMAR_FAST_REPEAT_MAX = 128

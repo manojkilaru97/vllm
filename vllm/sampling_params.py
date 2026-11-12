@@ -1362,10 +1362,15 @@ class SamplingParams(
             validate_structured_output_request_outlines,
         )
         from vllm.v1.structured_output.backend_xgrammar import (
+            drop_conditional_keywords,
             has_key_pattern_keywords,
             validate_xgrammar_grammar,
         )
         from vllm.v1.structured_output.utils import grammar_is_likely_lark
+
+        so_json = self.structured_outputs.json
+        if so_json and (backend == "auto" or backend.startswith("xgrammar")):
+            self.structured_outputs.json = drop_conditional_keywords(so_json)
 
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback
