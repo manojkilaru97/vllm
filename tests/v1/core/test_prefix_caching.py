@@ -6586,3 +6586,73 @@ def test_get_unhashed_block_ids_all_groups():
     )
 
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 4], []]
+
+
+@pytest.mark.parametrize(
+    "retention_interval, expected_hit_blocks",
+    [
+        # Latest-only keeps SWA state at turn 1's prompt boundary, not its output.
+        (0, 19),
+        # Dense, or any interval up to the window, keeps every SWA tail.
+        (None, 26),
+        (32, 26),
+    ],
+)
+def test_hybrid_swa_multi_turn_reuses_previous_output(
+    retention_interval, expected_hit_blocks
+):
+    """A follow-up turn extends turn 1's prompt and output (chat history); its
+    hybrid hit stops wherever the SWA group last retained a window tail."""
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=400,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                    sliding_window=4 * block_size,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=retention_interval,
+    )
+
+    prompt = [i for i in range(20) for _ in range(block_size)]
+    output = [1000 + i for i in range(6) for _ in range(block_size)]
+    req0 = make_request("turn1", prompt, block_size, sha256)
+    computed_blocks, _, _ = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(req0, len(prompt), 0, computed_blocks) is not None
+    req0.num_computed_tokens = len(prompt)
+    req0.append_output_token_ids(output)
+    assert manager.allocate_slots(req0, len(output)) is not None
+    req0.num_computed_tokens = len(prompt) + len(output)
+    manager.free(req0)
+
+    pool = manager.block_pool
+    for i in range(len(prompt + output) // block_size):
+        assert pool.get_cached_block(req0.block_hashes[i], [0]) is not None
+
+    follow_up = prompt + output + [2000 + i for i in range(5 * block_size)]
+    req1 = make_request("turn2", follow_up, block_size, sha256)
+    _, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == expected_hit_blocks * block_size
