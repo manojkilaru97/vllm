@@ -127,25 +127,9 @@ class XgrammarBackend(StructuredOutputBackend):
         grammar_spec: str,
         stop_token_ids: set[int] | None = None,
     ) -> StructuredOutputGrammar:
-        # Note(arpera):
-        # Our flag disable_any_whitespace does NOT map directly to
-        # xgrammar's flag any_whitespace
-        # To achieve desired behavior of disable_any_whitespace
-        # we have to set not only any_whitespace
-        # but also specify a list of separators after which
-        # xgrammar must not insert spaces.
-        # This is a requirement of xgrammar's API, so we must comply with it.
-        #
-        # FIXME(arpera):
-        # Currently xgrammar v0.2.8 DOES emit spaces after comma
-        # even if we specify it in separators list.
-        # The bug has been reported to xgrammar team:
-        # https://github.com/mlc-ai/xgrammar/issues/945
-        # Please, track that issue, and once it is resolved remove this comment.
-        # Upd. this bug was fixed in xgrammar main branch on Oct 8, 2026
-        # and will be available in next release.
-        # So, remove this comment once xgrammar updates to v0.2.9
-        separators = (",", ":") if self.disable_any_whitespace else None
+        # Prod's json.dumps separators: compact "," / ":" (#58067) makes Nemotron
+        # and Gemma move the separator into string values ('"name":":Tokyo"').
+        separators = (", ", ": ") if self.disable_any_whitespace else None
         if request_type == StructuredOutputOptions.JSON:
             ctx = self.compiler.compile_json_schema(
                 grammar_spec,

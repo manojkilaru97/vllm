@@ -355,32 +355,32 @@ def _auto_manager(disable_any_whitespace: bool = True) -> StructuredOutputManage
     )
 
 
-# Both emit "," / ":" with no whitespace (xgrammar since #58067).
+# As on prod: xgrammar emits json.dumps() separators, guidance "," / ":".
 @pytest.mark.parametrize(
-    "params,spaced,compact",
+    "params,spaced,native",
     [
         pytest.param(
             {"json": '{"type": "object"}'},
             '{\n"a": "b"}',
-            {"xgrammar": '{"a":"b"}', "guidance": '{"a":"b"}'},
+            {"xgrammar": '{"a": "b", "c": 1}', "guidance": '{"a":"b","c":1}'},
             id="json",
         ),
         pytest.param(
             {"json_object": True},
             '{\n"a": "b"}',
-            {"xgrammar": '{"a":"b"}', "guidance": '{"a":"b"}'},
+            {"xgrammar": '{"a": "b", "c": 1}', "guidance": '{"a":"b","c":1}'},
             id="json_object",
         ),
         pytest.param(
             {"json": '{"type": "object", "properties": {"m": {}}, "required": ["m"]}'},
             '{"m":\n{"n": 1}}',
-            {"xgrammar": '{"m":{"n":1}}', "guidance": '{"m":{"n":1}}'},
+            {"xgrammar": '{"m": {"n": 1}}', "guidance": '{"m":{"n":1}}'},
             id="free_form",
         ),
     ],
 )
 def test_manager_compiles_each_request_with_its_selected_backend(
-    params, spaced, compact
+    params, spaced, native
 ):
     """Auto can select different backends per request; one engine must honour each,
     and disable_any_whitespace must hold on both."""
@@ -402,8 +402,11 @@ def test_manager_compiles_each_request_with_its_selected_backend(
     spaced_tokens = tokenizer.encode(spaced)
     for request_id, grammar in grammars.items():
         assert len(grammar.validate_tokens(spaced_tokens)) < len(spaced_tokens)
+        (other,) = set(native) - {request_id}
+        other_tokens = tokenizer.encode(native[other])
+        assert len(grammar.validate_tokens(other_tokens)) < len(other_tokens)
         assert grammar.accept_tokens(
-            request_id, tokenizer.encode(compact[request_id])
+            request_id, tokenizer.encode(native[request_id])
         ), request_id
 
 

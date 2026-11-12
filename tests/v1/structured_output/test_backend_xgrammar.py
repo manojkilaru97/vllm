@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
+import json
 from typing import ClassVar
 
 import pytest
@@ -608,10 +608,9 @@ class TestXgrammarBackend:
         _VOCAB_SIZE = 50257
         tokenizer: ClassVar[PreTrainedTokenizerBase]
 
-        @classmethod
         @pytest.fixture(scope="class", autouse=True)
-        def _shared_tokenizer(cls):
-            cls.tokenizer = AutoTokenizer.from_pretrained(cls._TOKENIZER)
+        def _shared_tokenizer(self, request):
+            request.cls.tokenizer = AutoTokenizer.from_pretrained(self._TOKENIZER)
 
         @classmethod
         def _backend(cls, *, disable_any_whitespace: bool) -> XgrammarBackend:
@@ -656,25 +655,38 @@ class TestXgrammarBackend:
             """Verify expected behavior of disable_any_whitespace=True"""
             backend = self._backend(disable_any_whitespace=True)
 
-            # Check that grammar accepts json with NO space after colon
-            assert self._accepts_json(backend, '{"no_space_after_me":"yes_ofcourse"}')
+            # Exactly json.dumps() spacing, as on prod (vLLM 0.27.1).
+            assert self._accepts_json(backend, '{"a": "b", "c": [1, 2], "d": {}}')
+            assert not self._accepts_json(backend, '{"a":"b","c":[1,2],"d":{}}')
+            assert not self._accepts_json(backend, '{"a": "b","c": 1}')
+            assert not self._accepts_json(backend, '{"a":"b", "c":1}')
+            assert not self._accepts_json(backend, '{"a":  "b"}')
+            assert not self._accepts_json(backend, '{\n"a": "b"}')
 
-            # Check that grammar rejects json with space after colon
-            assert not self._accepts_json(backend, '{"yes_space_after_me": true}')
-
-            # FIXME(arpera):
-            # Comma + separators=(",", ":") is wrong on xgrammar <=0.2.8
-            # Seehttps://github.com/mlc-ai/xgrammar/issues/945
-            # Re-enable both tests once vLLM pins xgrammar with the fix (>=0.2.9).
-            #
-            # # Check that grammar accepts json with NO space after comma
-            # assert self._accepts_json(
-            #     backend,
-            #     '{"never_space_after_comma":"accepted","good_boy":":3"}',
-            # )
-            #
-            # # Check that grammar rejects json with space after comma
-            # assert not self._accepts_json(
-            #     backend,
-            #     '{"where_space_after_comma":42, "wow_thats_cool":4242}',
-            # )
+        def test_disable_any_whitespace_schema_matches_json_dumps(self):
+            """A json_schema request accepts only json.dumps() output."""
+            backend = self._backend(disable_any_whitespace=True)
+            schema = json.dumps(
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "landmarks": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["name", "landmarks"],
+                    "additionalProperties": False,
+                }
+            )
+            doc = {"name": "Tokyo", "landmarks": ["Tokyo Tower", "Senso-ji"]}
+            for text, accepted in (
+                (json.dumps(doc), True),
+                (json.dumps(doc, separators=(",", ":")), False),
+                (json.dumps(doc, indent=2), False),
+            ):
+                grammar = backend.compile_grammar(StructuredOutputOptions.JSON, schema)
+                tokens = self.tokenizer.encode(text)
+                assert grammar.accept_tokens("req", tokens) == accepted, text
+                if accepted:
+                    eos = [self.tokenizer.eos_token_id]
+                    assert grammar.accept_tokens("req", eos)
+                    assert grammar.is_terminated()
