@@ -320,13 +320,14 @@ def serialize_guidance_grammar(
     disable_any_whitespace: bool = False,
     disable_additional_properties: bool = False,
 ) -> str:
-    # A schema's own x-guidance options must not re-enable flexible whitespace.
+    # json.dumps() separators, as xgrammar; compact ones corrupt strings on tokenizers
+    # with `":` + ` "` tokens. Schema x-guidance must not re-enable flexible whitespace.
     overrides = (
         {
             "whitespace_flexible": False,
             "whitespace_pattern": None,
-            "item_separator": ",",
-            "key_separator": ":",
+            "item_separator": ", ",
+            "key_separator": ": ",
         }
         if disable_any_whitespace
         else None
@@ -353,6 +354,7 @@ def serialize_guidance_grammar(
             defaults={
                 "whitespace_flexible": not disable_any_whitespace,
             },
+            overrides=overrides,
         )
     else:
         if request_type == StructuredOutputOptions.REGEX:
