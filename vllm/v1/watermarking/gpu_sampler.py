@@ -35,16 +35,34 @@ class GPUWatermarkSampler(Sampler):
         )
         self.watermarking.np.fill(True)
         self.watermarking.copy_to_uva()
+        # Requests whose sampling params keep SynthID's candidate count far below
+        # the watermarker's syncless cap; others keep the host-synchronized count.
+        self.bounded_support = np.zeros(self.sampling_states.max_num_reqs, dtype=bool)
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         super().add_request(req_idx, sampling_params)
         self.watermarking.np[req_idx] = sampling_params.watermarking
+        self.bounded_support[req_idx] = self._bounded_support(sampling_params)
         if sampling_params.watermarking and sampling_params.temperature == 0:
             logger.warning_once(
                 "Watermarking is enabled, but greedy decoding "
                 "(temperature=0) cannot be watermarked. This request will use "
                 "ordinary greedy sampling."
             )
+
+    def _bounded_support(self, sampling_params: SamplingParams) -> bool:
+        policy = getattr(self.watermarker, "syncless_policy", None)
+        if policy is None or sampling_params.logit_bias:
+            return False
+        if sampling_params.allowed_token_ids:
+            return False
+        top_k = sampling_params.top_k
+        if 0 < top_k <= policy["max_top_k"]:
+            return True
+        return (
+            sampling_params.temperature <= policy["max_temperature"]
+            and sampling_params.top_p <= policy["max_top_p"]
+        )
 
     def apply_staged_writes(self) -> None:
         super().apply_staged_writes()
@@ -104,6 +122,10 @@ class GPUWatermarkSampler(Sampler):
             positions=pos,
             use_fp64=self.use_fp64_gumbel,
         )
+        if hasattr(self.watermarker, "syncless_policy"):
+            self.watermarker.syncless_hint = bool(
+                np.all(self.bounded_support[idx_mapping_np][enabled])
+            )
         output = self.watermarker.sample(
             processed_logits,
             contexts,
