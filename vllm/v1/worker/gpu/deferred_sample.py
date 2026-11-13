@@ -25,6 +25,18 @@ def notify_host_sync() -> None:
         job.handoff.set()
 
 
+def kv_transfer_allows_deferral(kv_transfer_config: Any) -> bool:
+    """SimpleCPUOffload's CPU-backend worker hooks touch only worker state on the
+    step's stream, and every later worker entry joins the deferred step first."""
+    if kv_transfer_config is None:
+        return True
+    extra = kv_transfer_config.kv_connector_extra_config or {}
+    return (
+        kv_transfer_config.kv_connector == "SimpleCPUOffloadConnector"
+        and extra.get("kv_offload_backend", "cpu") == "cpu"
+    )
+
+
 def join_pending() -> None:
     """Finish any deferred sampling step before touching the worker."""
     if _active_runner is not None:

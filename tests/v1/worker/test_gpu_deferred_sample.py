@@ -107,6 +107,30 @@ def test_propagates_stream_and_context(runner):
     assert seen["inference"] is False  # callers decorate the body themselves
 
 
+@pytest.mark.parametrize(
+    "connector,extra,allowed",
+    [
+        (None, None, True),
+        ("SimpleCPUOffloadConnector", {"lazy_offload": True}, True),
+        ("SimpleCPUOffloadConnector", {"kv_offload_backend": "cpu"}, True),
+        ("SimpleCPUOffloadConnector", {"kv_offload_backend": "disk"}, False),
+        ("OffloadingConnector", {}, False),
+        ("NixlConnector", None, False),
+    ],
+)
+def test_kv_transfer_allows_deferral(connector, extra, allowed):
+    from vllm.config import KVTransferConfig
+
+    cfg = None
+    if connector is not None:
+        cfg = KVTransferConfig(
+            kv_connector=connector,
+            kv_role="kv_both",
+            kv_connector_extra_config=extra or {},
+        )
+    assert ds.kv_transfer_allows_deferral(cfg) is allowed
+
+
 def test_error_after_park_raises_at_join_and_output(runner):
     gate = threading.Event()
 

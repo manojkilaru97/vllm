@@ -116,7 +116,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
 )
-from vllm.v1.worker.gpu.deferred_sample import DeferredSampleRunner
+from vllm.v1.worker.gpu.deferred_sample import (
+    DeferredSampleRunner,
+    kv_transfer_allows_deferral,
+)
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -537,6 +540,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.deferred_sample is None and self._can_defer_sample():
                 self.deferred_sample = DeferredSampleRunner(self.device)
+                logger.info("Watermark count sync deferred to a helper thread")
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
@@ -615,7 +619,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and parallel_config.distributed_executor_backend == "uni"
             and parallel_config.world_size_across_dp == 1
             and self.pp_handler is None
-            and self.vllm_config.kv_transfer_config is None
+            and kv_transfer_allows_deferral(self.vllm_config.kv_transfer_config)
             and not self.vllm_config.aux_output_config.enabled
         )
 
