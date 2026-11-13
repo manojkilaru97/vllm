@@ -1118,6 +1118,38 @@ def test_lazy_store_completion_keeps_offloaded_blocks_evict_first() -> None:
     assert cpu_map.get_one_block(old_hash) is not None
 
 
+def test_lazy_walk_stays_in_head_window_across_steps() -> None:
+    """Later steps must not walk past the evict-next window into newer blocks:
+    offloading and prepending those would evict them before older ones (LIFO)."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    sched._target_free = 2
+
+    old = _allocate_gpu_blocks(gpu_pool, make_request(num_blocks=2), 2)
+    new = _allocate_gpu_blocks(gpu_pool, make_request(num_blocks=2), 2)
+    _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=3)
+    gpu_pool.free_blocks(old)
+    gpu_pool.free_blocks(new)
+
+    stored = []
+    for _ in range(3):
+        meta = sched.build_connector_meta(make_scheduler_output({}))
+        stored.append(list(meta.store_gpu_blocks))
+        if meta.store_event >= 0:
+            simulate_store_completion(sched, meta.store_event)
+
+    assert stored == [[b.block_id for b in old], [], []]
+    assert gpu_pool.free_block_queue.get_all_free_blocks() == old + new
+    cpu_map = sched.cpu_block_pool.cached_block_hash_to_block
+    assert all(cpu_map.get_one_block(b.block_hash) is None for b in new)
+
+    # Once the allocator takes the window, the next blocks become the window.
+    assert gpu_pool.get_new_blocks(2) == old
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_gpu_blocks == [b.block_id for b in new]
+
+
 # ---------------------------------------------------------------------------
 # Test 2c: Lazy duplicate store is skipped
 # ---------------------------------------------------------------------------
@@ -2086,7 +2118,6 @@ def test_reset_pending_lazy_stores() -> None:
     assert sched.reset() is False
     assert len(sched._store_event_to_blocks) == 0
     assert len(sched._abandoned_store_event_to_blocks) == 1
-    assert sched._cursor is None
 
     simulate_store_completion(sched, meta.store_event)
     assert len(sched._abandoned_store_event_to_blocks) == 0
