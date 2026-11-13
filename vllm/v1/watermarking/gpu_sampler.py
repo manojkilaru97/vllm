@@ -9,12 +9,17 @@ import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.sample.ops.topk_topp_triton import _SPLIT_MAX_BATCH
 from vllm.v1.watermarking.watermarker import RandomSampler, Watermarker
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.watermark import repeated_context_mask
 
 logger = init_logger(__name__)
+
+# Syncless-hint support kinds. top_k bounds SynthID's candidate count exactly; the
+# temperature/top-p bound holds only where the split top-p kernel runs (<= 64 rows).
+_UNBOUNDED, _BOUNDED_TOP_K, _BOUNDED_TOP_P = 0, 1, 2
 
 
 class GPUWatermarkSampler(Sampler):
@@ -37,12 +42,14 @@ class GPUWatermarkSampler(Sampler):
         self.watermarking.copy_to_uva()
         # Requests whose sampling params keep SynthID's candidate count far below
         # the watermarker's syncless cap; others keep the host-synchronized count.
-        self.bounded_support = np.zeros(self.sampling_states.max_num_reqs, dtype=bool)
+        self.bounded_support = np.zeros(
+            self.sampling_states.max_num_reqs, dtype=np.uint8
+        )
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         super().add_request(req_idx, sampling_params)
         self.watermarking.np[req_idx] = sampling_params.watermarking
-        self.bounded_support[req_idx] = self._bounded_support(sampling_params)
+        self.bounded_support[req_idx] = self._support_kind(sampling_params)
         if sampling_params.watermarking and sampling_params.temperature == 0:
             logger.warning_once(
                 "Watermarking is enabled, but greedy decoding "
@@ -50,23 +57,70 @@ class GPUWatermarkSampler(Sampler):
                 "ordinary greedy sampling."
             )
 
-    def _bounded_support(self, sampling_params: SamplingParams) -> bool:
+    def _support_kind(self, sampling_params: SamplingParams) -> int:
         policy = getattr(self.watermarker, "syncless_policy", None)
         if policy is None or sampling_params.logit_bias:
-            return False
+            return _UNBOUNDED
         if sampling_params.allowed_token_ids:
-            return False
+            return _UNBOUNDED
         top_k = sampling_params.top_k
         if 0 < top_k <= policy["max_top_k"]:
-            return True
-        return (
+            return _BOUNDED_TOP_K
+        if 0 < top_k < self.sampling_states.vocab_size:
+            return _UNBOUNDED
+        if (
             sampling_params.temperature <= policy["max_temperature"]
             and sampling_params.top_p <= policy["max_top_p"]
+        ):
+            return _BOUNDED_TOP_P
+        return _UNBOUNDED
+
+    def _bounded_support(self, sampling_params: SamplingParams) -> bool:
+        return self._support_kind(sampling_params) != _UNBOUNDED
+
+    def _step_bounded(self, idx_mapping_np: np.ndarray, num_rows: int) -> bool:
+        enabled = self.watermarking.np[idx_mapping_np] & (
+            self.sampling_states.temperature.np[idx_mapping_np] != 0
         )
+        kinds = self.bounded_support[idx_mapping_np][enabled]
+        if num_rows > _SPLIT_MAX_BATCH:
+            # Above 64 rows top-p runs in the monolithic kernel, which can leave a
+            # row unmasked (exp overflow on large logit gaps); only top_k is safe.
+            return bool(np.all(kinds == _BOUNDED_TOP_K))
+        return bool(np.all(kinds != _UNBOUNDED))
 
     def apply_staged_writes(self) -> None:
         super().apply_staged_writes()
         self.watermarking.copy_to_uva()
+
+    def apply_sampling_params(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        seq_lens_upper_bound_np: np.ndarray,
+        skip_top_k_top_p: bool = False,
+    ) -> torch.Tensor:
+        if not skip_top_k_top_p and hasattr(self.watermarker, "syncless_policy"):
+            # Speculative verification: this chunk's recovery draw may skip the sync.
+            self.watermarker.syncless_hint = self._step_bounded(
+                idx_mapping_np, logits.shape[0]
+            )
+        return super().apply_sampling_params(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+            seq_lens_upper_bound_np,
+            skip_top_k_top_p=skip_top_k_top_p,
+        )
 
     def _sample_random(
         self,
@@ -123,8 +177,8 @@ class GPUWatermarkSampler(Sampler):
             use_fp64=self.use_fp64_gumbel,
         )
         if hasattr(self.watermarker, "syncless_policy"):
-            self.watermarker.syncless_hint = bool(
-                np.all(self.bounded_support[idx_mapping_np][enabled])
+            self.watermarker.syncless_hint = self._step_bounded(
+                idx_mapping_np, processed_logits.shape[0]
             )
         output = self.watermarker.sample(
             processed_logits,
