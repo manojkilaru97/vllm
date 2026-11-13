@@ -107,6 +107,127 @@ def test_propagates_stream_and_context(runner):
     assert seen["inference"] is False  # callers decorate the body themselves
 
 
+def test_kv_connector_output_returned_while_parked(runner):
+    gate = threading.Event()
+    kv = object()
+
+    def body():
+        ds.publish_kv_connector_output(kv)
+        ds.notify_host_sync()
+        gate.wait()
+        return _output("kv")
+
+    try:
+        out = runner.run(body)
+        assert isinstance(out, ds.DeferredSampleOutput)
+        assert out.get_kv_connector_output() is kv
+        assert runner._pending is not None  # sampling still parked
+    finally:
+        gate.set()
+    assert out.get_output().req_ids == ["kv"]
+
+
+def test_unpublished_kv_connector_output_waits_for_step(runner):
+    gate = threading.Event()
+
+    def body():
+        ds.notify_host_sync()
+        gate.wait()
+        out = _output("late")
+        out.kv_connector_output = "late-kv"
+        return out
+
+    out = runner.run(body)
+    gate.set()
+    assert out.get_kv_connector_output() == "late-kv"
+
+
+class _FakeConnector:
+    """Records worker-side connector calls in the order they were made."""
+
+    def __init__(self, log, lock):
+        self.log, self.lock = log, lock
+
+    def _rec(self, what):
+        with self.lock:
+            self.log.append(what)
+
+    def pre_forward(self, step):
+        self._rec(f"pre_forward {step}")
+
+    def post_forward(self, step):
+        self._rec(f"save {step}")
+        self._rec(f"load {step}")
+        return f"kv {step}"
+
+
+def test_step_n_transfers_ordered_before_step_n1_forward(runner):
+    # Mirrors model_runner: execute_model joins the helper before pre_forward.
+    log, lock = [], threading.Lock()
+    conn = _FakeConnector(log, lock)
+    gates = {n: threading.Event() for n in range(3)}
+
+    def sample_body(n):
+        def body():
+            ds.publish_kv_connector_output(conn.post_forward(n))
+            ds.notify_host_sync()
+            gates[n].wait()
+            with lock:
+                log.append(f"sampled {n}")
+            return _output(str(n))
+
+        return body
+
+    outs = []
+    try:
+        for n in range(3):
+            ds.join_pending()
+            conn.pre_forward(n)
+            with lock:
+                log.append(f"forward {n}")
+            out = runner.run(sample_body(n))
+            assert out.get_kv_connector_output() == f"kv {n}"
+            with lock:
+                log.append(f"schedule {n + 1}")
+            gates[n].set()
+            outs.append(out)
+    finally:
+        for g in gates.values():
+            g.set()
+    ds.join_pending()
+    for n in range(3):
+        assert outs[n].get_output().req_ids == [str(n)]
+        i = log.index
+        assert (
+            i(f"forward {n}") < i(f"save {n}") < i(f"load {n}") < i(f"schedule {n + 1}")
+        )
+        if n < 2:
+            assert i(f"sampled {n}") < i(f"pre_forward {n + 1}") < i(f"forward {n + 1}")
+
+
+def test_store_launched_on_helper_waits_for_step_forward(runner):
+    # A store issued from the helper must see step N's forward output.
+    x = torch.zeros(1 << 20, device="cuda")
+    dst = torch.empty_like(x)
+    store_stream = torch.cuda.Stream()
+
+    def body():
+        done = torch.cuda.Event()
+        done.record(torch.cuda.current_stream())
+        store_stream.wait_event(done)
+        with torch.cuda.stream(store_stream):
+            dst.copy_(x, non_blocking=True)
+        ds.notify_host_sync()
+        return _output("s")
+
+    torch.cuda._sleep(50_000_000)  # long "forward" N
+    x.fill_(1.0)
+    runner.run(body)
+    ds.join_pending()
+    store_stream.synchronize()
+    assert bool((dst == 1.0).all())
+
+
 @pytest.mark.parametrize(
     "connector,extra,allowed",
     [

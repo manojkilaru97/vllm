@@ -25,6 +25,14 @@ def notify_host_sync() -> None:
         job.handoff.set()
 
 
+def publish_kv_connector_output(output: Any) -> None:
+    """Called once the step's KV connector output is final, before the host sync."""
+    job = getattr(_local, "job", None)
+    if job is not None:
+        job.kv_connector_output = output
+        job.kv_published = True
+
+
 def kv_transfer_allows_deferral(kv_transfer_config: Any) -> bool:
     """SimpleCPUOffload's CPU-backend worker hooks touch only worker state on the
     step's stream, and every later worker entry joins the deferred step first."""
@@ -53,6 +61,8 @@ class _Job:
         self.finished = threading.Event()
         self.value: Any = None
         self.error: BaseException | None = None
+        self.kv_connector_output: Any = None
+        self.kv_published = False
 
     def run(self) -> None:
         _local.job = self
@@ -88,6 +98,9 @@ class DeferredSampleOutput(AsyncModelRunnerOutput):
         return output
 
     def get_kv_connector_output(self):
+        # Published before the park, so this does not wait for sampling.
+        if self._job.kv_published:
+            return self._job.kv_connector_output
         output = self._result()
         if isinstance(output, AsyncModelRunnerOutput):
             return output.get_kv_connector_output()

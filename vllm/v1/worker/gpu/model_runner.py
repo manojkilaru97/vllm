@@ -119,6 +119,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.deferred_sample import (
     DeferredSampleRunner,
     kv_transfer_allows_deferral,
+    publish_kv_connector_output,
 )
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
@@ -2230,6 +2231,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
+        # Collect KV transfer results now; finalize saves after the drafter runs.
+        defer_kv_finalize = self.speculator is not None
+        kv_connector_output = None
+        if self.deferred_sample is not None:
+            # Final after the forward; taken before the sampler's host sync so a
+            # parked step hands it back without waiting for sampled tokens.
+            kv_connector_output = self.kv_connector.post_forward(
+                finished_req_ids, defer_finalize=defer_kv_finalize
+            )
+            publish_kv_connector_output(kv_connector_output)
+
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
@@ -2287,11 +2299,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             pending_aux_output=pending_aux_output,
         )
 
-        # Collect KV transfer results now; finalize saves after the drafter runs.
-        defer_kv_finalize = self.speculator is not None
-        model_runner_output.kv_connector_output = self.kv_connector.post_forward(
-            finished_req_ids, defer_finalize=defer_kv_finalize
-        )
+        if self.deferred_sample is None:
+            kv_connector_output = self.kv_connector.post_forward(
+                finished_req_ids, defer_finalize=defer_kv_finalize
+            )
+        model_runner_output.kv_connector_output = kv_connector_output
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         # The encoder runner exists only on the first PP rank, so later ranks
