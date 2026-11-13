@@ -49,7 +49,9 @@ from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
     CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+    alloc_driver_pinned_tensor,
     build_params,
+    host_pages_can_migrate_to_device,
 )
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 from vllm.v1.simple_kv_offload.metadata import (
@@ -890,3 +892,22 @@ def test_disk_backend_alignment_only_required_for_direct_io(
         assert disk_path.stat().st_size == num_blocks * block_bytes
     finally:
         backend.shutdown()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="cuMemHostAlloc is CUDA-only"
+)
+@pytest.mark.parametrize("dtype", [torch.int8, torch.bfloat16])
+def test_driver_pinned_cpu_tier_round_trips(dtype):
+    """The cuMemHostAlloc CPU tier used on ATS (Grace) GPUs is zeroed, pinned and
+    keeps the requested shape and dtype through a GPU round trip."""
+    shape = (NUM_BLOCKS, 3, BLOCK_BYTES // 8)
+    assert isinstance(host_pages_can_migrate_to_device(torch.device("cuda")), bool)
+    cpu = alloc_driver_pinned_tensor(shape, dtype)
+    assert cpu.shape == shape and cpu.dtype == dtype
+    assert cpu.is_pinned() and not cpu.any()
+    src = torch.randn(shape, device="cuda").to(dtype)
+    cpu.copy_(src, non_blocking=True)
+    back = cpu.to("cuda", non_blocking=True)
+    torch.cuda.synchronize()
+    assert torch.equal(back, src)

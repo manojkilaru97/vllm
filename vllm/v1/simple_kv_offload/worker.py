@@ -11,7 +11,11 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.kv_offload.cpu import transfer_verifier
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
-from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.simple_kv_offload.cuda_mem_ops import (
+    alloc_driver_pinned_tensor,
+    host_pages_can_migrate_to_device,
+    pin_tensor,
+)
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -244,9 +248,19 @@ class SimpleCPUOffloadWorker:
 
         if transfer_verifier.ENABLED:
             logger.info("KV offload verify tensors: %s", list(unique_gpu_caches))
+        driver_pinned = pin_memory and host_pages_can_migrate_to_device(device)
+        if driver_pinned:
+            logger.info(
+                "SimpleCPUOffloadWorker [CPU]: ATS device, allocating the CPU "
+                "tier with cuMemHostAlloc so its pages cannot migrate into HBM"
+            )
         self.cpu_kv_caches = {}
         for name, gpu_tensor in unique_gpu_caches.items():
             cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
+            if driver_pinned:
+                tensor = alloc_driver_pinned_tensor(cpu_shape, gpu_tensor.dtype)
+                self.cpu_kv_caches[name] = tensor
+                continue
             # Allocate non-pinned first, then pin via cudaHostRegister to
             # bypass PyTorch's CUDACachingHostAllocator which rounds up to
             # the next power of 2 (e.g. 100 GB -> 128 GB).

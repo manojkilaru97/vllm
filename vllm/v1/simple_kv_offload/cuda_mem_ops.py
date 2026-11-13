@@ -33,6 +33,51 @@ def pin_tensor(tensor: torch.Tensor) -> None:
         raise RuntimeError(f"cudaHostRegister failed: {err}")
 
 
+# Driver-pinned buffers are never freed; they live as long as the worker.
+_driver_pinned_buffers: list[Any] = []
+
+
+def host_pages_can_migrate_to_device(device: torch.device) -> bool:
+    """True when the GPU reaches pageable host memory through ATS.
+
+    On Grace systems (GH200, GB200, GB300) HBM is a NUMA node, and the
+    driver migrates hot cudaHostRegister'd pageable pages into it under DMA.
+    That silently consumes the HBM the KV cache left free.
+    """
+    if current_platform.is_rocm() or not torch.cuda.is_available():
+        return False
+    from cuda.bindings import driver as drv
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    err, dev = drv.cuDeviceGet(index)
+    if err != drv.CUresult.CUDA_SUCCESS:
+        return False
+    attr = drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES  # noqa: E501
+    err, value = drv.cuDeviceGetAttribute(attr, dev)
+    return err == drv.CUresult.CUDA_SUCCESS and value == 1
+
+
+def alloc_driver_pinned_tensor(
+    shape: tuple[int, ...], dtype: torch.dtype
+) -> torch.Tensor:
+    """Allocate a zeroed host tensor with cuMemHostAlloc.
+
+    Driver-pinned pages stay in host memory (no migration into HBM) and, unlike
+    ``pin_memory=True``, are not rounded up to a power of 2.
+    """
+    from cuda.bindings import driver as drv
+
+    nbytes = int(np.prod(shape)) * torch.empty((), dtype=dtype).element_size()
+    err, ptr = drv.cuMemHostAlloc(nbytes, 0)
+    if err != drv.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuMemHostAlloc({nbytes} bytes) failed: {err}")
+    buf = (ctypes.c_uint8 * nbytes).from_address(int(ptr))
+    _driver_pinned_buffers.append(buf)
+    tensor = torch.frombuffer(buf, dtype=torch.uint8).view(dtype).view(shape)
+    tensor.zero_()
+    return tensor
+
+
 class _CUmemLocation(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint), ("id", ctypes.c_int)]
 
