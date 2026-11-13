@@ -1125,6 +1125,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
+        sampler_graph_bytes = 0
         start_time = time.perf_counter()
         with freeze_gc_for_cudagraph_capture():
             torch.accelerator.empty_cache()
@@ -1162,6 +1163,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
+                    sampler_graph_bytes = self._capture_sampler_graphs(profile_only)
                     if self.adaptive_verification is not None and not profile_only:
                         with self.step_timing.collect() as timings:
                             for batch in self.adaptive_verification.batches_to_profile(
@@ -1184,6 +1186,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        if profile_only:
+            # Profiling releases the watermark sampler graphs; count what they held.
+            cuda_graph_size += sampler_graph_bytes
         # This usually takes 5~20 seconds.
         logger.info(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
@@ -1191,6 +1196,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def _capture_sampler_graphs(self, profile_only: bool) -> int:
+        watermarker = getattr(self.sampler, "watermarker", None)
+        capture = getattr(watermarker, "capture_sampling_graphs", None)
+        if capture is None:
+            return 0
+        return capture(
+            self.sampler,
+            self.rejection_sampler,
+            getattr(self.speculator, "draft_logits", None),
+            keep=not profile_only,
+        )
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
