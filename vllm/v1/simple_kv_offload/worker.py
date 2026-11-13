@@ -252,7 +252,7 @@ class SimpleCPUOffloadWorker:
         if driver_pinned:
             logger.info(
                 "SimpleCPUOffloadWorker [CPU]: ATS device, allocating the CPU "
-                "tier with cuMemHostAlloc so its pages cannot migrate into HBM"
+                "tier with cudaHostAlloc so its pages cannot migrate into HBM"
             )
         self.cpu_kv_caches = {}
         for name, gpu_tensor in unique_gpu_caches.items():

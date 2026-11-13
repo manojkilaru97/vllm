@@ -60,17 +60,19 @@ def host_pages_can_migrate_to_device(device: torch.device) -> bool:
 def alloc_driver_pinned_tensor(
     shape: tuple[int, ...], dtype: torch.dtype
 ) -> torch.Tensor:
-    """Allocate a zeroed host tensor with cuMemHostAlloc.
+    """Allocate a zeroed, portable pinned host tensor with cudaHostAlloc.
 
     Driver-pinned pages stay in host memory (no migration into HBM) and, unlike
-    ``pin_memory=True``, are not rounded up to a power of 2.
+    ``pin_memory=True``, are not rounded up to a power of 2. The runtime call
+    creates the primary context if this thread has none yet.
     """
-    from cuda.bindings import driver as drv
+    from cuda.bindings import runtime as cudart
 
+    torch.cuda.init()
     nbytes = int(np.prod(shape)) * torch.empty((), dtype=dtype).element_size()
-    err, ptr = drv.cuMemHostAlloc(nbytes, 0)
-    if err != drv.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"cuMemHostAlloc({nbytes} bytes) failed: {err}")
+    err, ptr = cudart.cudaHostAlloc(nbytes, cudart.cudaHostAllocPortable)
+    if err != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaHostAlloc({nbytes} bytes) failed: {err}")
     buf = (ctypes.c_uint8 * nbytes).from_address(int(ptr))
     _driver_pinned_buffers.append(buf)
     tensor = torch.frombuffer(buf, dtype=torch.uint8).view(dtype).view(shape)

@@ -894,16 +894,14 @@ def test_disk_backend_alignment_only_required_for_direct_io(
         backend.shutdown()
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="cuMemHostAlloc is CUDA-only"
-)
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="cudaHostAlloc is CUDA-only")
 @pytest.mark.parametrize("dtype", [torch.int8, torch.bfloat16])
 def test_driver_pinned_cpu_tier_round_trips(dtype):
-    """The cuMemHostAlloc CPU tier used on ATS (Grace) GPUs is zeroed, pinned and
+    """The driver-pinned CPU tier used on ATS (Grace) GPUs is zeroed, pinned and
     keeps the requested shape and dtype through a GPU round trip."""
     shape = (NUM_BLOCKS, 3, BLOCK_BYTES // 8)
-    assert isinstance(host_pages_can_migrate_to_device(torch.device("cuda")), bool)
     cpu = alloc_driver_pinned_tensor(shape, dtype)
+    assert isinstance(host_pages_can_migrate_to_device(torch.device("cuda")), bool)
     assert cpu.shape == shape and cpu.dtype == dtype
     assert cpu.is_pinned() and not cpu.any()
     src = torch.randn(shape, device="cuda").to(dtype)
