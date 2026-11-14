@@ -933,6 +933,55 @@ class TestTritonTopkTopp:
         num_kept_ties = kept_ties.sum(dim=-1, keepdim=True)
         assert torch.equal(kept_ties, torch.arange(num_ties) < num_kept_ties)
 
+    def _lm_like_logits(self, rows: int, vocab_size: int) -> torch.Tensor:
+        """Gaussian tail plus a lifted head of 1-96 tokens, bf16-rounded."""
+        g = self.generator
+        logits = torch.randn(rows, vocab_size, generator=g)
+        logits *= torch.empty(rows, 1).uniform_(1.0, 2.5, generator=g)
+        head = int(torch.randint(1, 97, (1,), generator=g))
+        idx = torch.rand(rows, vocab_size, generator=g).topk(head, dim=-1).indices
+        lift = torch.empty(rows, 1).uniform_(10.0, 60.0, generator=g)
+        decay = torch.linspace(1.0, 0.35, head)
+        top = logits.amax(-1, keepdim=True)
+        logits.scatter_(-1, idx, top + lift * decay)
+        return logits.to(torch.bfloat16).float()
+
+    @pytest.mark.parametrize("temperature", [0.6, 0.2, 0.05])
+    def test_monolithic_topp_masks_rows_stock_leaves_unmasked(
+        self, monkeypatch, temperature: float
+    ):
+        """Above _SPLIT_MAX_BATCH rows the stock top-p kernel returns some rows
+        unmasked (exp under/overflow, a top probability rounding above 1.0;
+        vllm#60030). The fix masks them to the exact nucleus and leaves every
+        row that stock masks bit-identical."""
+        from vllm.v1.sample.ops import topk_topp_triton as tt
+
+        if not current_platform.is_cuda():
+            pytest.skip("Triton top-k/top-p kernel")
+        rows, vocab_size = 256, 131072
+        assert rows > tt._SPLIT_MAX_BATCH
+        logits = self._lm_like_logits(rows, vocab_size) / temperature
+        p = torch.full((rows,), 0.95)
+        monkeypatch.setattr(tt, "_TOPP_SAFE", False)
+        stock = tt.apply_top_k_top_p_triton(logits.clone(), None, p)
+        monkeypatch.setattr(tt, "_TOPP_SAFE", True)
+        safe = tt.apply_top_k_top_p_triton(logits.clone(), None, p)
+
+        probs, order = torch.softmax(logits.double(), dim=-1).sort(-1, True)
+        exact = torch.zeros_like(logits, dtype=torch.bool).scatter_(
+            1, order, (probs.cumsum(-1) - probs) < 0.95
+        )
+        truncated = exact.sum(-1) < vocab_size
+        stock_unmasked = torch.isfinite(stock).all(-1) & truncated
+        assert stock_unmasked.any(), "inputs no longer reach the stock bug"
+        safe_kept = torch.isfinite(safe)
+        assert not (safe_kept.all(-1) & truncated).any()
+        assert torch.equal(safe_kept[stock_unmasked], exact[stock_unmasked])
+        masked = ~stock_unmasked
+        assert torch.equal(
+            safe[masked].view(torch.int32), stock[masked].view(torch.int32)
+        )
+
 
 # =============================================================================
 # FlashInfer top-k/top-p robustness tests

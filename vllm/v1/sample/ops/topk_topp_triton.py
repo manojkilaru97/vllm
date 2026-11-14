@@ -8,6 +8,7 @@ using Pivot-based Truncation and Selection" By Park et al.
 
 """
 
+import os
 from typing import Any
 
 import torch
@@ -120,6 +121,7 @@ def _topk_topp_kernel(
     TOPK_ENABLED: tl.constexpr,
     TOPP_ENABLED: tl.constexpr,
     SPLIT_COVERS_PONLY: tl.constexpr,
+    SAFE_MAX: tl.constexpr = False,
 ):
     NUM_TILES: tl.constexpr = (VOCAB_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
     pid = tl.program_id(0)
@@ -668,6 +670,25 @@ def _topk_topp_kernel(
                 # max so the search converges to -inf (no masking).
                 min_logit = tl.minimum(min_logit, max_logit)
 
+                if SAFE_MAX:
+                    # The estimated max over/underflowed exp (sum 0, denormal, inf
+                    # or NaN), so the row would come back unmasked: redo it.
+                    bad = sum_exp_logits < 1.1754943508222875e-38  # FLT_MIN
+                    bad = bad | (sum_exp_logits == float("inf"))
+                    bad = bad | (sum_exp_logits != sum_exp_logits)
+                    if bad & (max_logit > -float("inf")):
+                        max_sample = max_logit
+                        sum_exp_logits = 0.0
+                        for i in range(0, NUM_TILES):
+                            offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                            mask_n = offs_n < VOCAB_SIZE
+                            logits_blk = tl.load(
+                                LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
+                            )
+                            probs_blk = tl.exp(logits_blk - max_sample)
+                            probs_blk = tl.where(mask_n, probs_blk, 0.0)
+                            sum_exp_logits += tl.sum(probs_blk)
+
                 idx = tl.cast(p * 200, tl.int32)
                 idx = tl.maximum(0, tl.minimum(idx, 199))
                 sigma = tl.load(NORMAL_CDF_TO_SIGMA_TABLE + idx)
@@ -698,6 +719,12 @@ def _topk_topp_kernel(
                     write_pos = tl.where(outlier_mask, cumulative_pos, -1)
                     tl.store(BUFFER_ROW + write_pos, probs_blk, mask=outlier_mask)
 
+                # A near-one-hot row's top probability can round above 1.0, which
+                # a 1.0 sentinel hides from the pivot search (row left unmasked).
+                if SAFE_MAX:
+                    prob_sentinel = 2.0
+                else:
+                    prob_sentinel = 1.0
                 max_range = tl.exp(max_logit - max_sample) / sum_exp_logits
                 min_range = tl.exp(min_logit - max_sample) / sum_exp_logits
 
@@ -720,7 +747,7 @@ def _topk_topp_kernel(
                     while found_pivot == 0:
                         p_pivot_0 = (max_range - min_range) * 0.5 + min_range
                         p_pivots_sum_0 = 0.0
-                        min_larger_0 = 1.0
+                        min_larger_0 = prob_sentinel
                         num_min_larger_0 = tl.zeros((), dtype=tl.uint32)
 
                         # Single fused pass: compute p_pivots_sum,
@@ -744,7 +771,7 @@ def _topk_topp_kernel(
                                 above_0,
                                 min_larger_0,
                                 num_min_larger_0,
-                                1.0,
+                                prob_sentinel,
                             )
 
                         # Check if the pivot satisfies termination condition
@@ -788,7 +815,7 @@ def _topk_topp_kernel(
                     while found_pivot == 0:
                         p_pivot_0 = (max_range - min_range) * 0.5 + min_range
                         p_pivots_sum_0 = 0.0
-                        min_larger_0 = 1.0
+                        min_larger_0 = prob_sentinel
                         num_min_larger_0 = tl.zeros((), dtype=tl.uint32)
 
                         # Single fused pass: compute p_pivots_sum,
@@ -810,7 +837,7 @@ def _topk_topp_kernel(
                                 above_0,
                                 min_larger_0,
                                 num_min_larger_0,
-                                1.0,
+                                prob_sentinel,
                             )
 
                         # Check if the pivot satisfies termination condition
@@ -958,6 +985,7 @@ def _topk_topp(
         TOPK_ENABLED=topk_enabled,
         TOPP_ENABLED=topp_enabled,
         SPLIT_COVERS_PONLY=split_covers_ponly,
+        SAFE_MAX=_TOPP_SAFE,
         num_warps=num_warps,
     )
 
@@ -984,6 +1012,9 @@ def _topk_topp(
 # ---------------------------------------------------------------------------
 
 _SPLIT_MAX_BATCH = 64
+# Monolithic top-p fixes for rows the stock kernel leaves unmasked (vllm#60030).
+# VLLM_TOPP_SAFE=0 restores the stock kernel.
+_TOPP_SAFE = os.environ.get("VLLM_TOPP_SAFE", "1") != "0"
 _SPLIT_MAX_SPLITS = 32  # power of two
 _SPLIT_FANOUT = 8
 _SPLIT_ROUNDS = 5
