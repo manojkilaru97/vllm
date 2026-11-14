@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,6 +21,7 @@ from vllm.v1.watermarking import (
     SupportsSpeculativeDecoding,
     create_watermarker,
     derive_watermark_key,
+    gpu_sampler,
 )
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.gumbel import GumbelWatermarker
@@ -374,6 +378,95 @@ def test_gpu_sampler_respects_mixed_request_watermarking(
     assert torch.equal(sampled, torch.tensor([3, 7]))
     assert torch.equal(output_logits[0], logits[0])
     assert torch.equal(output_logits[1], torch.full((8,), 10.0))
+
+
+class SynclessStubWatermarker(StubWatermarker):
+    syncless_policy = {"max_temperature": 0.8, "max_top_p": 0.95, "max_top_k": 512}
+    syncless_hint = False
+
+    def __init__(self, policy=True):
+        if not policy:
+            self.syncless_policy = None
+        self.hints = []
+
+    def _sample_watermarked(self, logits, contexts):
+        self.hints.append(self.syncless_hint)
+        return super()._sample_watermarked(logits, contexts)
+
+
+def _unbounded_sampler(make_gpu_watermark_sampler, watermarker):
+    sampler = make_gpu_watermark_sampler(watermarker, deduplicate_contexts="none")
+    sampler.add_request(0, SamplingParams(temperature=1.0, top_p=1.0))
+    sampler.add_request(1, SamplingParams(temperature=1.2, top_p=0.95))
+    sampler.apply_staged_writes()
+    return sampler
+
+
+def test_syncless_every_step_switch_defaults_off():
+    code = (
+        "from vllm.v1.watermarking import gpu_sampler as g; "
+        "print(g._SYNCLESS_EVERY_STEP)"
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("VLLM_SYNTHID_")}
+
+    def read(**extra):
+        out = subprocess.check_output(
+            [sys.executable, "-c", code], env={**env, **extra}, text=True
+        )
+        return out.strip().splitlines()[-1]
+
+    assert read() == "False"
+    assert read(VLLM_SYNTHID_SYNCLESS_EVERY_STEP="0") == "False"
+    assert read(VLLM_SYNTHID_SYNCLESS_EVERY_STEP="1") == "True"
+
+
+@pytest.mark.parametrize("every_step", [False, True])
+@pytest.mark.parametrize("num_rows", [2, 64, 65, 512])
+def test_syncless_every_step_hints_unbounded_steps(
+    monkeypatch, make_gpu_watermark_sampler, every_step, num_rows
+):
+    """Off keeps rc14's per-step policy; on hints every step at any row count."""
+    monkeypatch.setattr(gpu_sampler, "_SYNCLESS_EVERY_STEP", every_step)
+    sampler = _unbounded_sampler(make_gpu_watermark_sampler, SynclessStubWatermarker())
+
+    assert sampler._step_bounded(np.array([0, 1]), num_rows) is every_step
+
+
+def test_syncless_every_step_respects_count_sync(
+    monkeypatch, make_gpu_watermark_sampler
+):
+    """SYNTHID_COUNT_SYNC=1 (no syncless policy) still wins over the switch."""
+    monkeypatch.setattr(gpu_sampler, "_SYNCLESS_EVERY_STEP", True)
+    watermarker = SynclessStubWatermarker(policy=False)
+    sampler = _unbounded_sampler(make_gpu_watermark_sampler, watermarker)
+
+    assert sampler._step_bounded(np.array([0, 1]), 512) is False
+
+
+@pytest.mark.parametrize("every_step", [False, True])
+def test_syncless_every_step_reaches_the_watermarker(
+    monkeypatch, make_gpu_watermark_sampler, every_step
+):
+    monkeypatch.setattr(gpu_sampler, "_SYNCLESS_EVERY_STEP", every_step)
+    watermarker = SynclessStubWatermarker()
+    sampler = _unbounded_sampler(make_gpu_watermark_sampler, watermarker)
+    sampler._get_contexts = lambda expanded_idx_mapping: torch.zeros(
+        2, 1, dtype=torch.int64
+    )
+
+    sampled, _ = sampler._sample_random(
+        torch.zeros(2, 8),
+        torch.tensor([0, 1]),
+        np.array([0, 1]),
+        torch.zeros(2, dtype=torch.int64),
+        None,
+        None,
+        False,
+        False,
+    )
+
+    assert torch.equal(sampled, torch.tensor([7, 7]))
+    assert watermarker.hints == [every_step]
 
 
 @pytest.mark.parametrize(

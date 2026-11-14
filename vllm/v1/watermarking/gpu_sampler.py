@@ -24,6 +24,9 @@ logger = init_logger(__name__)
 _UNBOUNDED, _BOUNDED_TOP_K, _BOUNDED_TOP_P = 0, 1, 2
 # Opt-in: also hint top-p rows above 64 rows (needs the fixed top-p kernel).
 _TOPP_HINT_ABOVE_SPLIT = os.environ.get("VLLM_SYNTHID_TOPP_HINT_ABOVE_64", "0") == "1"
+# Release switch (default off): hint every step; rows above 1024 candidates take
+# the streaming kernel (token-identical, watermarked logits not bit-identical).
+_SYNCLESS_EVERY_STEP = os.environ.get("VLLM_SYNTHID_SYNCLESS_EVERY_STEP", "0") == "1"
 
 
 class GPUWatermarkSampler(Sampler):
@@ -49,6 +52,8 @@ class GPUWatermarkSampler(Sampler):
         self.bounded_support = np.zeros(
             self.sampling_states.max_num_reqs, dtype=np.uint8
         )
+        if _SYNCLESS_EVERY_STEP and getattr(watermarker, "syncless_policy", None):
+            logger.info("SynthID syncless hint on every step (per-row routing)")
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         super().add_request(req_idx, sampling_params)
@@ -83,6 +88,8 @@ class GPUWatermarkSampler(Sampler):
         return self._support_kind(sampling_params) != _UNBOUNDED
 
     def _step_bounded(self, idx_mapping_np: np.ndarray, num_rows: int) -> bool:
+        if _SYNCLESS_EVERY_STEP:
+            return getattr(self.watermarker, "syncless_policy", None) is not None
         enabled = self.watermarking.np[idx_mapping_np] & (
             self.sampling_states.temperature.np[idx_mapping_np] != 0
         )
