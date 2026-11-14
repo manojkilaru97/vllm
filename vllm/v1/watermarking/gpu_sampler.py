@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Literal
 
 import numpy as np
@@ -8,6 +9,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.ops import topk_topp_triton
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.ops.topk_topp_triton import _SPLIT_MAX_BATCH
 from vllm.v1.watermarking.watermarker import RandomSampler, Watermarker
@@ -20,6 +22,8 @@ logger = init_logger(__name__)
 # Syncless-hint support kinds. top_k bounds SynthID's candidate count exactly; the
 # temperature/top-p bound holds only where the split top-p kernel runs (<= 64 rows).
 _UNBOUNDED, _BOUNDED_TOP_K, _BOUNDED_TOP_P = 0, 1, 2
+# Opt-in: also hint top-p rows above 64 rows (needs the fixed top-p kernel).
+_TOPP_HINT_ABOVE_SPLIT = os.environ.get("VLLM_SYNTHID_TOPP_HINT_ABOVE_64", "0") == "1"
 
 
 class GPUWatermarkSampler(Sampler):
@@ -83,7 +87,8 @@ class GPUWatermarkSampler(Sampler):
             self.sampling_states.temperature.np[idx_mapping_np] != 0
         )
         kinds = self.bounded_support[idx_mapping_np][enabled]
-        if num_rows > _SPLIT_MAX_BATCH:
+        lift = _TOPP_HINT_ABOVE_SPLIT and topk_topp_triton._TOPP_SAFE
+        if num_rows > _SPLIT_MAX_BATCH and not lift:
             # Above 64 rows top-p runs in the monolithic kernel, which can leave a
             # row unmasked (exp overflow on large logit gaps); only top_k is safe.
             return bool(np.all(kinds == _BOUNDED_TOP_K))
