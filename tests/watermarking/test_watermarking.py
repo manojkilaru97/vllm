@@ -396,8 +396,12 @@ class SynclessStubWatermarker(StubWatermarker):
 
 def _unbounded_sampler(make_gpu_watermark_sampler, watermarker):
     sampler = make_gpu_watermark_sampler(watermarker, deduplicate_contexts="none")
-    sampler.add_request(0, SamplingParams(temperature=1.0, top_p=1.0))
-    sampler.add_request(1, SamplingParams(temperature=1.2, top_p=0.95))
+    sampler.add_request(
+        0, SamplingParams(temperature=1.0, top_p=1.0, watermarking=True)
+    )
+    sampler.add_request(
+        1, SamplingParams(temperature=1.2, top_p=0.95, watermarking=True)
+    )
     sampler.apply_staged_writes()
     return sampler
 
