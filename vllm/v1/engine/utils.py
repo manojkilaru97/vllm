@@ -1403,16 +1403,9 @@ def launch_core_engines(
 
 
 def _arm_startup_exit_backstop(grace_s: float) -> None:
-    # The caller may swallow the startup error, or engine cleanup may block.
-    def _force_exit() -> None:
-        logger.error(
-            "Engine startup deadline exceeded %g s ago and the process is still "
-            "running; exiting with status 1.",
-            grace_s,
-        )
-        os._exit(1)
-
-    backstop = threading.Timer(grace_s, _force_exit)
+    # The caller may swallow the startup error, or cleanup or logging may block;
+    # so the timer does not log.
+    backstop = threading.Timer(grace_s, os._exit, args=(1,))
     backstop.daemon = True
     backstop.start()
 
@@ -1420,6 +1413,7 @@ def _arm_startup_exit_backstop(grace_s: float) -> None:
 def _startup_deadline_exceeded(
     deadline_min: float, conn_pending: list[int], start_pending: list[int]
 ) -> None:
+    _arm_startup_exit_backstop(STARTUP_DEADLINE_EXIT_GRACE_S)
     logger.error(
         "Engine startup deadline exceeded: engine core not ready after %g min "
         "(VLLM_ENGINE_STARTUP_DEADLINE_MIN); %d local / %d remote engine(s) "
@@ -1429,7 +1423,6 @@ def _startup_deadline_exceeded(
         *conn_pending,
         *start_pending,
     )
-    _arm_startup_exit_backstop(STARTUP_DEADLINE_EXIT_GRACE_S)
     raise TimeoutError(
         f"Engine core startup did not finish within {deadline_min:g} min "
         "(VLLM_ENGINE_STARTUP_DEADLINE_MIN)."

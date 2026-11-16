@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import subprocess
+import sys
 import time
 from contextlib import nullcontext
 from multiprocessing import connection
@@ -395,18 +397,30 @@ def test_wait_for_engine_startup_deadline_fails_a_hung_start(
     assert "1 local / 0 remote engine(s) never connected" in errors[0]
 
 
-def test_startup_exit_backstop_exits_with_status_1(monkeypatch: pytest.MonkeyPatch):
-    exited = Event()
-    codes = []
+_BLOCKED_LOG_SCRIPT = """
+import logging, threading
+from vllm.v1.engine import utils as engine_utils
 
-    def fake_exit(code):
-        codes.append(code)
-        exited.set()
+class Blocked(logging.Handler):
+    def emit(self, record):
+        threading.Event().wait()
 
-    monkeypatch.setattr(engine_utils.os, "_exit", fake_exit)
-    engine_utils._arm_startup_exit_backstop(0.01)
-    assert exited.wait(5)
-    assert codes == [1]
+engine_utils.logger.addHandler(Blocked())
+engine_utils.STARTUP_DEADLINE_EXIT_GRACE_S = 0.5
+engine_utils._startup_deadline_exceeded(0.1, [1, 0], [1, 0])
+"""
+
+
+def test_startup_exit_backstop_exits_while_logging_blocks():
+    """The backstop exits with status 1 even if the startup error log hangs."""
+    start = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-c", _BLOCKED_LOG_SCRIPT],
+        capture_output=True,
+        timeout=120,
+    )
+    assert proc.returncode == 1, proc.stderr.decode()[-2000:]
+    assert time.monotonic() - start < 110
 
 
 @pytest.mark.parametrize("deadline_min", ["0", "45"])
