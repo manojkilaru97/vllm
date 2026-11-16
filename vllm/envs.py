@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
+    VLLM_ENGINE_STARTUP_DEADLINE_MIN: float = 45.0
     VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT: float = 30.0
     VLLM_CHAT_TEMPLATE_FUEL: int = 500000
     VLLM_API_KEY: str | None = None
@@ -818,6 +819,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # during startup. Default is 600 seconds (10 minutes).
     "VLLM_ENGINE_READY_TIMEOUT_S": lambda: int(
         os.environ.get("VLLM_ENGINE_READY_TIMEOUT_S", "600")
+    ),
+    # Minutes engine cores may take to report READY (load, compile, KV profiling)
+    # before startup fails and the process exits non-zero. 0 disables it.
+    "VLLM_ENGINE_STARTUP_DEADLINE_MIN": lambda: float(
+        os.environ.get("VLLM_ENGINE_STARTUP_DEADLINE_MIN", "45")
     ),
     # Maximum wall-clock seconds allowed for a single chat template render.
     # Set to 0 to disable the timeout.

@@ -4,6 +4,7 @@
 import contextlib
 import os
 import threading
+import time
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
+STARTUP_DEADLINE_EXIT_GRACE_S = 120.0
 ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S = 15.0
 
 
@@ -1400,6 +1402,40 @@ def launch_core_engines(
         )
 
 
+def _arm_startup_exit_backstop(grace_s: float) -> None:
+    # The caller may swallow the startup error, or engine cleanup may block.
+    def _force_exit() -> None:
+        logger.error(
+            "Engine startup deadline exceeded %g s ago and the process is still "
+            "running; exiting with status 1.",
+            grace_s,
+        )
+        os._exit(1)
+
+    backstop = threading.Timer(grace_s, _force_exit)
+    backstop.daemon = True
+    backstop.start()
+
+
+def _startup_deadline_exceeded(
+    deadline_min: float, conn_pending: list[int], start_pending: list[int]
+) -> None:
+    logger.error(
+        "Engine startup deadline exceeded: engine core not ready after %g min "
+        "(VLLM_ENGINE_STARTUP_DEADLINE_MIN); %d local / %d remote engine(s) "
+        "never connected, %d local / %d remote never finished initializing. "
+        "Shutting down; the process exits non-zero so it can be restarted.",
+        deadline_min,
+        *conn_pending,
+        *start_pending,
+    )
+    _arm_startup_exit_backstop(STARTUP_DEADLINE_EXIT_GRACE_S)
+    raise TimeoutError(
+        f"Engine core startup did not finish within {deadline_min:g} min "
+        "(VLLM_ENGINE_STARTUP_DEADLINE_MIN)."
+    )
+
+
 def wait_for_engine_startup(
     handshake_socket: zmq.Socket,
     core_engines: list[CoreEngine],
@@ -1436,8 +1472,16 @@ def wait_for_engine_startup(
         frontend_process_by_fd[fd] = proc
         poller.register(fd, zmq.POLLIN)
 
+    deadline_min = envs.VLLM_ENGINE_STARTUP_DEADLINE_MIN
+    deadline = time.monotonic() + deadline_min * 60 if deadline_min > 0 else None
     while any(conn_pending) or any(start_pending):
-        events = poller.poll(STARTUP_POLL_PERIOD_MS)
+        poll_ms = STARTUP_POLL_PERIOD_MS
+        if deadline is not None:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                _startup_deadline_exceeded(deadline_min, conn_pending, start_pending)
+            poll_ms = max(1, min(poll_ms, int(remaining_s * 1000)))
+        events = poller.poll(poll_ms)
         if not events:
             if any(conn_pending):
                 logger.debug(

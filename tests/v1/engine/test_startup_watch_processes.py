@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import time
 from contextlib import nullcontext
 from multiprocessing import connection
 from threading import Event
@@ -341,3 +342,93 @@ def test_wait_for_engine_startup_reports_watched_process_exit():
         exc_info.value
     )
     assert "Failed frontend proc(s): {'RustFrontend': 1}" in str(exc_info.value)
+
+
+def _wait_for_silent_engine(
+    monkeypatch: pytest.MonkeyPatch, deadline_min: str, armed: list
+) -> None:
+    monkeypatch.setenv("VLLM_ENGINE_STARTUP_DEADLINE_MIN", deadline_min)
+    monkeypatch.setattr(engine_utils, "_arm_startup_exit_backstop", armed.append)
+    ctx = zmq.Context()
+    handshake_socket = ctx.socket(zmq.ROUTER)
+    parallel_config = SimpleNamespace(
+        data_parallel_size_local=1,
+        data_parallel_hybrid_lb=False,
+        data_parallel_external_lb=False,
+    )
+    launch = CoreEngineLaunch(
+        engine_manager=None,
+        coordinator=None,
+        addresses=EngineZmqAddresses(inputs=[], outputs=[]),
+        tensor_queue=None,
+    )
+    try:
+        wait_for_engine_startup(
+            handshake_socket,
+            [CoreEngine()],
+            parallel_config,
+            coordinated_dp=False,
+            cache_config=None,
+            launch=launch,
+        )
+    finally:
+        handshake_socket.close(linger=0)
+        ctx.term()
+
+
+def test_wait_for_engine_startup_deadline_fails_a_hung_start(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An engine that never reports READY fails startup at the deadline."""
+    armed: list = []
+    errors: list[str] = []
+    monkeypatch.setattr(
+        engine_utils.logger, "error", lambda msg, *args: errors.append(msg % args)
+    )
+    start = time.monotonic()
+    with pytest.raises(TimeoutError, match="VLLM_ENGINE_STARTUP_DEADLINE_MIN"):
+        _wait_for_silent_engine(monkeypatch, "0.005", armed)
+    assert time.monotonic() - start < engine_utils.STARTUP_POLL_PERIOD_MS / 1000
+    assert armed == [engine_utils.STARTUP_DEADLINE_EXIT_GRACE_S]
+    assert len(errors) == 1
+    assert "Engine startup deadline exceeded" in errors[0]
+    assert "1 local / 0 remote engine(s) never connected" in errors[0]
+
+
+def test_startup_exit_backstop_exits_with_status_1(monkeypatch: pytest.MonkeyPatch):
+    exited = Event()
+    codes = []
+
+    def fake_exit(code):
+        codes.append(code)
+        exited.set()
+
+    monkeypatch.setattr(engine_utils.os, "_exit", fake_exit)
+    engine_utils._arm_startup_exit_backstop(0.01)
+    assert exited.wait(5)
+    assert codes == [1]
+
+
+@pytest.mark.parametrize("deadline_min", ["0", "45"])
+def test_wait_for_engine_startup_deadline_keeps_poll_period(
+    monkeypatch: pytest.MonkeyPatch, deadline_min: str
+):
+    """Off, or far away, the deadline leaves the startup poll loop as it was."""
+    polls = []
+
+    class _Poller:
+        def register(self, *_args):
+            pass
+
+        def poll(self, timeout):
+            polls.append(timeout)
+            if len(polls) == 3:
+                raise KeyboardInterrupt
+            return []
+
+    armed: list = []
+    monkeypatch.setattr(engine_utils.zmq, "Poller", _Poller)
+    with pytest.raises(KeyboardInterrupt):
+        _wait_for_silent_engine(monkeypatch, deadline_min, armed)
+    assert polls == [engine_utils.STARTUP_POLL_PERIOD_MS] * 3
+    assert armed == []
