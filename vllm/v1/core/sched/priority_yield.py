@@ -111,10 +111,10 @@ class YieldStats:
         self.capped_chunks = 0
         self.skipped_chunks = 0
         self.deferred_tokens = 0
-        # "normal" = priority <= 0, "low" = priority > 0.
-        self.admitted = {"normal": 0, "low": 0}
-        self.wait_sum = {"normal": 0.0, "low": 0.0}
-        self.wait_max = {"normal": 0.0, "low": 0.0}
+        # "high" = priority < 0, "normal" = priority == 0, "low" = priority > 0.
+        self.admitted = {"high": 0, "normal": 0, "low": 0}
+        self.wait_sum = {"high": 0.0, "normal": 0.0, "low": 0.0}
+        self.wait_max = {"high": 0.0, "normal": 0.0, "low": 0.0}
 
     def record_cap(self, requested: int, allowed: int) -> None:
         self.deferred_tokens += requested - max(allowed, 0)
@@ -124,7 +124,12 @@ class YieldStats:
             self.capped_chunks += 1
 
     def record_admit(self, priority: int, wait_s: float) -> None:
-        tier = "low" if priority > 0 else "normal"
+        if priority < 0:
+            tier = "high"
+        elif priority > 0:
+            tier = "low"
+        else:
+            tier = "normal"
         self.admitted[tier] += 1
         self.wait_sum[tier] += wait_s
         self.wait_max[tier] = max(self.wait_max[tier], wait_s)
@@ -133,7 +138,12 @@ class YieldStats:
         now = time.monotonic() if now is None else now
         if now - self._window_start < LOG_INTERVAL_S:
             return False
-        if self.reserve_steps or self.admitted["low"] or self.low_capped_chunks:
+        if (
+            self.reserve_steps
+            or self.admitted["high"]
+            or self.admitted["low"]
+            or self.low_capped_chunks
+        ):
 
             def mean(tier: str) -> float:
                 return self.wait_sum[tier] / max(self.admitted[tier], 1)
@@ -141,15 +151,18 @@ class YieldStats:
             logger.info(
                 "Priority prefill yield (%.0fs): reserve_steps=%d capped_chunks=%d "
                 "skipped_chunks=%d deferred_tokens=%d low_capped_chunks=%d | "
-                "admitted normal=%d "
-                "wait_mean=%.2fs wait_max=%.2fs | low=%d wait_mean=%.2fs "
-                "wait_max=%.2fs",
+                "admitted high=%d wait_mean=%.2fs wait_max=%.2fs | "
+                "normal=%d wait_mean=%.2fs wait_max=%.2fs | "
+                "low=%d wait_mean=%.2fs wait_max=%.2fs",
                 now - self._window_start,
                 self.reserve_steps,
                 self.capped_chunks,
                 self.skipped_chunks,
                 self.deferred_tokens,
                 self.low_capped_chunks,
+                self.admitted["high"],
+                mean("high"),
+                self.wait_max["high"],
                 self.admitted["normal"],
                 mean("normal"),
                 self.wait_max["normal"],

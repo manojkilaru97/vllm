@@ -1102,6 +1102,64 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        def _preempt_lowest_priority_runner(request: Request) -> bool:
+            nonlocal token_budget, input_budget, encoder_compute_budget
+            if not self.running:
+                return False
+            preempted_req = max(
+                self.running,
+                key=lambda r: (r.priority, r.arrival_time),
+            )
+            if request.priority >= preempted_req.priority:
+                return False
+            if not self._request_blocks_can_be_freed(preempted_req):
+                return False
+
+            preempted_req_id = preempted_req.request_id
+            self.running.remove(preempted_req)
+
+            scheduled_this_step = False
+            for scheduled_list in (
+                scheduled_running_reqs,
+                scheduled_new_reqs,
+                scheduled_resumed_reqs,
+            ):
+                if preempted_req in scheduled_list:
+                    scheduled_list.remove(preempted_req)
+                    scheduled_this_step = True
+                    break
+            if scheduled_this_step:
+                restored = num_scheduled_tokens.pop(preempted_req_id)
+                token_budget += restored
+                input_budget += restored + draft_slots
+                req_to_new_blocks.pop(preempted_req_id)
+                scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                    preempted_req_id, None
+                )
+                if preempted_encoder_inputs:
+                    encoder_compute_budget += sum(
+                        preempted_req.get_num_encoder_embeds(i)
+                        for i in preempted_encoder_inputs
+                    )
+                if self.lora_config and preempted_req.lora_request:
+                    lora_id = preempted_req.lora_request.lora_int_id
+                    still_used = any(
+                        req.lora_request is not None
+                        and req.lora_request.lora_int_id == lora_id
+                        for req in self.running
+                    )
+                    if not still_used:
+                        scheduled_loras.discard(lora_id)
+
+            self._preempt_request(
+                preempted_req,
+                scheduled_timestamp,
+                drop_stale_output=self.requires_kv_delivery,
+            )
+            preempted_reqs.append(preempted_req)
+            return True
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
             step_skipped_waiting: deque[Request] = deque()
@@ -1126,7 +1184,8 @@ class Scheduler(SchedulerInterface):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_active_reqs:
+                queue_full = num_running >= self.max_num_active_reqs
+                if queue_full and self.policy != SchedulingPolicy.PRIORITY:
                     break
 
                 request = request_queue.peek_request()
@@ -1155,6 +1214,11 @@ class Scheduler(SchedulerInterface):
                 ):
                     # Scheduling would exceed max_loras, skip.
                     skip_request(request_queue)
+                    continue
+
+                if queue_full:
+                    if not _preempt_lowest_priority_runner(request):
+                        break
                     continue
 
                 num_external_computed_tokens = 0
