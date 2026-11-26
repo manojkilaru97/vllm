@@ -60,6 +60,19 @@ request. You may also choose a specific backend, along with
 some options. A full set of options is available in the `vllm serve --help`
 text.
 
+When compiling object schemas, XGrammar currently cannot enforce `required`
+keys that are absent from the same schema object's `properties` map.
+For `structured_outputs.json` and `response_format` JSON schemas, vLLM rejects
+these object schemas when `xgrammar` is selected, and `auto` attempts another
+compatible backend.
+Such schemas are valid JSON Schema; whether an object can satisfy them depends
+on `additionalProperties` and other constraints. A dependency upgrade to
+XGrammar 0.2.9 does not resolve this limitation.
+
+This validation guard covers schemas that XGrammar treats as objects.
+Type-less schemas containing only `required`, including nested schemas,
+remain affected by the upstream limitation.
+
 Now let's see an example for each of the cases, starting with the `choice`, as it's the easiest one:
 
 ??? code

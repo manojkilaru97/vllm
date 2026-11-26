@@ -499,6 +499,28 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
 
         schema_types = _schema_types(obj)
 
+        # Match XGrammar's inferred object type as well as explicit object types.
+        is_object = "object" in schema_types or (
+            not schema_types
+            and any(
+                key in obj
+                for key in (
+                    "properties",
+                    "additionalProperties",
+                    "unevaluatedProperties",
+                )
+            )
+        )
+        # JSON Schema permits required keys outside properties. XGrammar only
+        # tracks required named properties when compiling an object.
+        if (
+            is_object
+            and isinstance(required := obj.get("required"), list)
+            and isinstance(properties := obj.get("properties", {}), dict)
+            and any(isinstance(key, str) and key not in properties for key in required)
+        ):
+            return True
+
         # integer/number + multipleOf is unsupported by xgrammar
         # This is known behavior and xgrammar emits warning in logs:
         #   [21:18:08] /project/cpp/json_schema_converter.cc:1053:

@@ -10,6 +10,7 @@ from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
 from vllm.config import StructuredOutputsConfig, VllmConfig
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 from vllm.v1.structured_output.backend_xgrammar import (
@@ -430,6 +431,58 @@ def supported_allof_anyof_and_oneof():
 
 
 class TestHasXGrammarUnsupportedJsonFeatures:
+    @pytest.mark.parametrize("as_string", [False, True])
+    @pytest.mark.parametrize("additional", [True, False, {"type": "integer"}, None])
+    @pytest.mark.parametrize(
+        "shape", ["object", "nullable", "implicit", "empty", "missing", "nested"]
+    )
+    def test_undeclared_required_property_is_unsupported(
+        self, as_string, additional, shape
+    ):
+        """Valid schemas must not silently lose required keys in XGrammar."""
+        schema = {
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "required": ["absent"],
+        }
+        if additional is not None:
+            schema["additionalProperties"] = additional
+        if shape == "nullable":
+            schema["type"] = ["object", "null"]
+        elif shape == "implicit":
+            del schema["type"]
+        elif shape == "empty":
+            schema["properties"] = {}
+        elif shape == "missing":
+            del schema["properties"]
+        elif shape == "nested":
+            schema = {"type": "array", "items": schema}
+        params = SamplingParams(
+            structured_outputs=StructuredOutputsParams(
+                json=json.dumps(schema) if as_string else schema
+            )
+        )
+        with pytest.raises(VLLMValidationError, match="not supported by xgrammar"):
+            validate_xgrammar_grammar(params)
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            {"type": "object", "properties": {"absent": {}}, "required": ["absent"]},
+            {"type": "string", "required": ["absent"]},
+            {"required": ["absent"], "const": {"absent": 1}},
+            {"required": ["absent"], "enum": [{"absent": 1}, None]},
+            {"const": {"required": ["absent"]}},
+            {"enum": [{"required": ["absent"]}]},
+            {"type": "object", "properties": {"required": {"type": "string"}}},
+        ],
+    )
+    def test_required_keywords_and_instance_data_remain_supported(self, schema):
+        assert not has_xgrammar_unsupported_json_features(schema)
+        validate_xgrammar_grammar(
+            SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+        )
+
     @pytest.mark.parametrize(
         "schema_type",
         [

@@ -102,6 +102,32 @@ async def test_invalid_regex(client: openai.AsyncOpenAI, model_name: str):
         )
 
 
+def test_xgrammar_rejects_undeclared_required_property(default_server_args):
+    """An unsupported required key must produce a 400 before generation."""
+    args = [*default_server_args, "--structured-outputs-config.backend", "xgrammar"]
+    with RemoteOpenAIServer(MODEL_NAME, args) as server, server.get_client() as client:
+        for additional in (True, False, {"type": "integer"}):
+            schema = {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["absent"],
+                "additionalProperties": additional,
+            }
+            with pytest.raises(
+                openai.BadRequestError, match="not supported by xgrammar"
+            ):
+                client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[{"role": "user", "content": 'Return {"x":"OK"}.'}],
+                    temperature=0,
+                    max_completion_tokens=16,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"name": "required_key", "schema": schema},
+                    },
+                )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model_name",
