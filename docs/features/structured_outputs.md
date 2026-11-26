@@ -71,7 +71,10 @@ non-Tekken Mistral tokenizers rejects it. This applies to
 These are valid JSON Schemas; satisfiability depends on `additionalProperties`
 and other constraints. Upgrading XGrammar to 0.2.9 does not fix its converter.
 The guard covers the root and nested named `properties` and homogeneous
-array `items`, pruning simple unreachable children. It does not follow
+array `items`. Object-count bounds prune unreachable children only for
+XGrammar, which enforces those bounds. Outlines ignores object-count bounds,
+so the guard still examines those children on the Outlines path. A zero
+`maxItems` can prune array items for both backends. The guard does not follow
 references, composition (`anyOf`, `oneOf`, `allOf`), dependencies, or other
 applicators. In particular, type-less `$ref`/`anyOf` object selection and
 schemas containing only `required` remain outside this mitigation.

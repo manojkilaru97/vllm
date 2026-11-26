@@ -218,7 +218,7 @@ def validate_structured_output_request_outlines(params: SamplingParams):
                 raise VLLMValidationError(
                     f"Error serializing structured outputs jsonschema: {e}"
                 ) from e
-        if has_undeclared_required_keys(schema_obj):
+        if has_undeclared_required_keys(schema_obj, supports_object_bounds=False):
             raise VLLMValidationError(
                 "The provided JSON schema contains required keys "
                 "not supported by outlines."

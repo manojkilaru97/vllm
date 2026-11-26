@@ -621,7 +621,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
         try:
             if has_xgrammar_unsupported_json_features(
                 schema
-            ) or has_undeclared_required_keys(schema):
+            ) or has_undeclared_required_keys(schema, supports_object_bounds=True):
                 raise VLLMValidationError(
                     "The provided JSON schema contains features not supported "
                     "by xgrammar."

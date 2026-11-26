@@ -45,11 +45,14 @@ _T = TypeVar("_T")
 CACHE = None
 
 
-def has_undeclared_required_keys(schema: object) -> bool:
+def has_undeclared_required_keys(
+    schema: object, *, supports_object_bounds: bool
+) -> bool:
     """Detect unenforced required keys in plain object/array schema trees.
 
     This is a capability check for XGrammar and Outlines, not schema validation.
     References, composition, dependencies, and annotations are not traversed.
+    Object bounds prune children only for a backend that enforces those bounds.
     """
     if not isinstance(schema, dict) or any(
         key in schema for key in ("$ref", "$dynamicRef", "allOf", "anyOf", "oneOf")
@@ -104,24 +107,29 @@ def has_undeclared_required_keys(schema: object) -> bool:
         )
     ):
         return False
-    if is_object and schema.get("maxProperties") != 0:
+    if is_object and (not supports_object_bounds or schema.get("maxProperties") != 0):
         limit = schema.get("maxProperties")
         required_names = {key for key in required if isinstance(key, str)}
         for name, child in properties.items():
             if (
-                isinstance(limit, int)
+                supports_object_bounds
+                and isinstance(limit, int)
                 and limit <= len(required_names)
                 and name not in required_names
             ):
                 continue
-            if has_undeclared_required_keys(child):
+            if has_undeclared_required_keys(
+                child, supports_object_bounds=supports_object_bounds
+            ):
                 return True
     is_array = "array" in types or (not types and "items" in schema)
     if is_array and schema.get("maxItems") != 0:
         items = schema.get("items")
         # Tuple items and prefixItems have separate reachability rules.
         if isinstance(items, dict) and "prefixItems" not in schema:
-            return has_undeclared_required_keys(items)
+            return has_undeclared_required_keys(
+                items, supports_object_bounds=supports_object_bounds
+            )
     return False
 
 

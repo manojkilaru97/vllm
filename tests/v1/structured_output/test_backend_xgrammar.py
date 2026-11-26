@@ -27,12 +27,56 @@ from vllm.v1.structured_output.backend_xgrammar import (
 from vllm.v1.structured_output.utils import choice_as_grammar
 
 _UNDECLARED_REQUIRED = {"type": "object", "required": ["absent"]}
+_BOUNDED_REQUIRED_OBJECTS = [
+    pytest.param(
+        {
+            "type": "object",
+            "maxProperties": 0,
+            "properties": {"child": _UNDECLARED_REQUIRED},
+        },
+        "{}",
+        '{"child":{}}',
+        id="zero-properties",
+    ),
+    pytest.param(
+        {
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 1,
+            "required": ["x"],
+            "properties": {
+                "x": {"type": "integer"},
+                "child": _UNDECLARED_REQUIRED,
+            },
+        },
+        '{"x":2}',
+        '{"x":2,"child":{}}',
+        id="one-property",
+    ),
+]
 
 pytestmark = pytest.mark.cpu_test
 
 
 def grammar_accepts(schema: dict, text: str) -> bool:
     return _is_grammar_accept_string(Grammar.from_json_schema(schema), text)
+
+
+def outlines_accepts(schema: dict, text: str) -> bool:
+    import outlines_core as oc
+    from outlines_core.json_schema import build_regex_from_schema
+
+    vocab = {bytes([code]): [code - 32] for code in range(32, 127)}
+    index = oc.Index(
+        build_regex_from_schema(json.dumps(schema)), oc.Vocabulary(95, vocab)
+    )
+    guide = oc.Guide(index)
+    tokens = [ord(char) - 32 for char in text]
+    if not guide.accepts_tokens(tokens):
+        return False
+    for token in tokens:
+        guide.advance(token)
+    return guide.is_finished()
 
 
 @pytest.fixture(scope="module")
@@ -504,6 +548,61 @@ def supported_allof_anyof_and_oneof():
 
 
 class TestHasXGrammarUnsupportedJsonFeatures:
+    @pytest.mark.parametrize("schema,valid,invalid", _BOUNDED_REQUIRED_OBJECTS)
+    def test_required_guard_respects_backend_object_bounds(
+        self, schema, valid, invalid
+    ):
+        """Outlines reaches invalid children despite object-count bounds."""
+        from jsonschema import Draft202012Validator
+
+        validator = Draft202012Validator(schema)
+        assert validator.is_valid(json.loads(valid))
+        assert not validator.is_valid(json.loads(invalid))
+        assert grammar_accepts(schema, valid)
+        assert not grammar_accepts(schema, invalid)
+        assert outlines_accepts(schema, valid)
+        assert outlines_accepts(schema, invalid)
+        params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+        validate_xgrammar_grammar(params)
+        with pytest.raises(VLLMValidationError, match="not supported by outlines"):
+            validate_structured_output_request_outlines(params)
+
+    @pytest.mark.parametrize("schema,valid,invalid", _BOUNDED_REQUIRED_OBJECTS)
+    @pytest.mark.parametrize("as_string", [False, True])
+    def test_auto_legacy_required_key_guard_ignores_object_bounds(
+        self, required_key_context, schema, valid, invalid, as_string
+    ):
+        model_config, _, legacy = required_key_context
+        assert not legacy.is_tekken
+        # multipleOf selects the Outlines fallback for this legacy tokenizer.
+        schema = {
+            **schema,
+            "properties": {
+                **schema["properties"],
+                "x": {"type": "integer", "multipleOf": 2},
+            },
+        }
+        assert outlines_accepts(schema, valid)
+        assert outlines_accepts(schema, invalid)
+        params = SamplingParams(
+            structured_outputs=StructuredOutputsParams(
+                json=json.dumps(schema) if as_string else schema
+            )
+        )
+        with pytest.raises(VLLMValidationError, match="not supported by outlines"):
+            params._validate_structured_outputs(
+                model_config, StructuredOutputsConfig(backend="auto"), legacy
+            )
+
+    def test_required_guard_preserves_enforced_array_bounds(self):
+        schema = {"type": "array", "maxItems": 0, "items": _UNDECLARED_REQUIRED}
+        params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+        validate_xgrammar_grammar(params)
+        validate_structured_output_request_outlines(params)
+        for accepts in (grammar_accepts, outlines_accepts):
+            assert accepts(schema, "[]")
+            assert not accepts(schema, "[{}]")
+
     @pytest.mark.parametrize(
         "schema,text",
         [
@@ -521,28 +620,16 @@ class TestHasXGrammarUnsupportedJsonFeatures:
                 },
                 "{}",
             ),
-            (
-                {
-                    "type": "object",
-                    "maxProperties": 0,
-                    "properties": {"child": _UNDECLARED_REQUIRED},
-                },
-                "{}",
-            ),
-            ({"type": "array", "maxItems": 0, "items": _UNDECLARED_REQUIRED}, "[]"),
         ],
     )
     def test_required_guard_preserves_enforced_and_unreachable_cases(
         self, schema, text
     ):
-        import regex
-        from outlines_core.json_schema import build_regex_from_schema
-
         params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
         validate_xgrammar_grammar(params)
         validate_structured_output_request_outlines(params)
         assert grammar_accepts(schema, text)
-        assert regex.fullmatch(build_regex_from_schema(json.dumps(schema)), text)
+        assert outlines_accepts(schema, text)
 
     @pytest.mark.parametrize(
         "finite",
