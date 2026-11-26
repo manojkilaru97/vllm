@@ -24,6 +24,7 @@ from vllm.v1.structured_output.utils import (
     choice_as_grammar,
     compile_regex_with_timeout,
     grammar_is_likely_lark,
+    has_undeclared_required_keys,
 )
 
 if TYPE_CHECKING:
@@ -499,28 +500,6 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
 
         schema_types = _schema_types(obj)
 
-        # Match XGrammar's inferred object type as well as explicit object types.
-        is_object = "object" in schema_types or (
-            not schema_types
-            and any(
-                key in obj
-                for key in (
-                    "properties",
-                    "additionalProperties",
-                    "unevaluatedProperties",
-                )
-            )
-        )
-        # JSON Schema permits required keys outside properties. XGrammar only
-        # tracks required named properties when compiling an object.
-        if (
-            is_object
-            and isinstance(required := obj.get("required"), list)
-            and isinstance(properties := obj.get("properties", {}), dict)
-            and any(isinstance(key, str) and key not in properties for key in required)
-        ):
-            return True
-
         # integer/number + multipleOf is unsupported by xgrammar
         # This is known behavior and xgrammar emits warning in logs:
         #   [21:18:08] /project/cpp/json_schema_converter.cc:1053:
@@ -640,7 +619,9 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
             schema = so_params.json
 
         try:
-            if has_xgrammar_unsupported_json_features(schema):
+            if has_xgrammar_unsupported_json_features(
+                schema
+            ) or has_undeclared_required_keys(schema):
                 raise VLLMValidationError(
                     "The provided JSON schema contains features not supported "
                     "by xgrammar."

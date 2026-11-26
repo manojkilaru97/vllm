@@ -12,7 +12,7 @@ import torch
 from regex import escape as regex_escape
 
 from vllm.exceptions import VLLMValidationError
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, check_json_nesting
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.structured_output.backend_types import (
@@ -25,6 +25,7 @@ from vllm.v1.structured_output.utils import (
     compile_regex_with_timeout,
     get_outlines_cache,
     get_outlines_vocabulary,
+    has_undeclared_required_keys,
 )
 
 if TYPE_CHECKING:
@@ -201,20 +202,27 @@ def validate_structured_output_request_outlines(params: SamplingParams):
     if so_params.regex is not None:
         validate_regex_is_buildable(so_params.regex)
     elif so_params.json is not None:
+        check_json_nesting(so_params.json)
         if isinstance(so_params.json, str):
             try:
                 # make sure schema is valid json
-                json.loads(so_params.json)
+                schema_obj = json.loads(so_params.json)
                 schema = so_params.json
             except json.JSONDecodeError as e:
                 raise VLLMValidationError("Invalid JSON grammar specification.") from e
         else:
+            schema_obj = so_params.json
             try:
                 schema = json.dumps(so_params.json)
             except Exception as e:
                 raise VLLMValidationError(
                     f"Error serializing structured outputs jsonschema: {e}"
                 ) from e
+        if has_undeclared_required_keys(schema_obj):
+            raise VLLMValidationError(
+                "The provided JSON schema contains required keys "
+                "not supported by outlines."
+            )
         try:
             pattern = json_schema.build_regex_from_schema(schema)
         except Exception as e:

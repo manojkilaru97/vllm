@@ -60,18 +60,23 @@ request. You may also choose a specific backend, along with
 some options. A full set of options is available in the `vllm serve --help`
 text.
 
-When compiling object schemas, XGrammar currently cannot enforce `required`
-keys that are absent from the same schema object's `properties` map.
-For `structured_outputs.json` and `response_format` JSON schemas, vLLM rejects
-these object schemas when `xgrammar` is selected, and `auto` attempts another
-compatible backend.
-Such schemas are valid JSON Schema; whether an object can satisfy them depends
-on `additionalProperties` and other constraints. A dependency upgrade to
-XGrammar 0.2.9 does not resolve this limitation.
+The Python frontend rejects plain object JSON schemas with `required` names
+outside their `properties` map when using `xgrammar` or `outlines`: both
+converters can silently drop these constraints. Finite `const`/`enum` schemas
+remain usable when every emitted value satisfies the schema. In `auto` mode,
+Guidance enforces or rejects the constraint; the Outlines fallback used by
+non-Tekken Mistral tokenizers rejects it. This applies to
+`structured_outputs.json` and `response_format` JSON schemas.
 
-This validation guard covers schemas that XGrammar treats as objects.
-Type-less schemas containing only `required`, including nested schemas,
-remain affected by the upstream limitation.
+These are valid JSON Schemas; satisfiability depends on `additionalProperties`
+and other constraints. Upgrading XGrammar to 0.2.9 does not fix its converter.
+The guard covers the root and nested named `properties` and homogeneous
+array `items`, pruning simple unreachable children. It does not follow
+references, composition (`anyOf`, `oneOf`, `allOf`), dependencies, or other
+applicators. In particular, type-less `$ref`/`anyOf` object selection and
+schemas containing only `required` remain outside this mitigation.
+Structural-tag schemas and the independent Rust frontend validator are also
+outside its scope.
 
 Now let's see an example for each of the cases, starting with the `choice`, as it's the easiest one:
 

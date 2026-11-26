@@ -2,16 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from importlib.resources import files
 from typing import ClassVar
 
 import pytest
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer, MistralCommonBackend, PreTrainedTokenizerBase
 from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
-from vllm.config import StructuredOutputsConfig, VllmConfig
+from vllm.config import ModelConfig, StructuredOutputsConfig, VllmConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.tokenizers import mistral as mistral_tokenizers
+from vllm.v1.structured_output.backend_guidance import GuidanceBackend, GuidanceGrammar
+from vllm.v1.structured_output.backend_outlines import (
+    validate_structured_output_request_outlines,
+)
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 from vllm.v1.structured_output.backend_xgrammar import (
     XgrammarBackend,
@@ -20,11 +26,78 @@ from vllm.v1.structured_output.backend_xgrammar import (
 )
 from vllm.v1.structured_output.utils import choice_as_grammar
 
+_UNDECLARED_REQUIRED = {"type": "object", "required": ["absent"]}
+
 pytestmark = pytest.mark.cpu_test
 
 
 def grammar_accepts(schema: dict, text: str) -> bool:
     return _is_grammar_accept_string(Grammar.from_json_schema(schema), text)
+
+
+@pytest.fixture(scope="module")
+def required_key_context():
+    legacy_path = files("mistral_common").joinpath(
+        "data", "mistral_instruct_tokenizer_240323.model.v3"
+    )
+    return (
+        ModelConfig(max_model_len=128),
+        AutoTokenizer.from_pretrained("openai-community/gpt2"),
+        mistral_tokenizers.MistralTokenizer(MistralCommonBackend(str(legacy_path))),
+    )
+
+
+@pytest.mark.parametrize("as_string", [False, True])
+@pytest.mark.parametrize("additional", [True, False, {"type": "integer"}])
+def test_auto_required_key_fallback_is_enforced(
+    required_key_context, additional, as_string
+):
+    """Guidance enforces the key; non-Tekken Mistral's Outlines route rejects it."""
+    model_config, fast, legacy = required_key_context
+    assert not legacy.is_tekken
+    schema = {
+        "type": "object",
+        "properties": {"x": {"type": "string"}},
+        "required": ["absent"],
+        "additionalProperties": additional,
+    }
+    spec = json.dumps(schema) if as_string else schema
+    for tokenizer in (legacy, fast):
+        params = SamplingParams(structured_outputs=StructuredOutputsParams(json=spec))
+        if tokenizer is legacy or additional is False:
+            match = "outlines" if tokenizer is legacy else "Grammar error"
+            with pytest.raises(VLLMValidationError, match=match):
+                params._validate_structured_outputs(
+                    model_config, StructuredOutputsConfig(backend="auto"), tokenizer
+                )
+            continue
+        params._validate_structured_outputs(
+            model_config, StructuredOutputsConfig(backend="auto"), tokenizer
+        )
+        assert params.structured_outputs is not None
+        assert params.structured_outputs._backend == "guidance"
+        backend = GuidanceBackend(
+            VllmConfig(
+                structured_outputs_config=StructuredOutputsConfig(backend="guidance")
+            ),
+            tokenizer=tokenizer,
+            vocab_size=len(tokenizer),
+        )
+        for text, expected in [
+            ("{}", False),
+            ('{"x":"OK"}', False),
+            ('{"absent":1}', True),
+        ]:
+            grammar = backend.compile_grammar(
+                StructuredOutputOptions.JSON, json.dumps(schema)
+            )
+            assert isinstance(grammar, GuidanceGrammar)
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            accepted = (
+                grammar.accept_tokens("required-key", tokens)
+                and grammar.ll_matcher.is_accepting()
+            )
+            assert accepted == expected, text
 
 
 # ================================================
@@ -431,13 +504,76 @@ def supported_allof_anyof_and_oneof():
 
 
 class TestHasXGrammarUnsupportedJsonFeatures:
+    @pytest.mark.parametrize(
+        "schema,text",
+        [
+            ({**_UNDECLARED_REQUIRED, "const": {"absent": 1}}, '{"absent":1}'),
+            (
+                {**_UNDECLARED_REQUIRED, "enum": [{"absent": 1}, {"absent": 2}]},
+                '{"absent":1}',
+            ),
+            ({"type": "object", "x-annotation": _UNDECLARED_REQUIRED}, "{}"),
+            ({"type": "object", "$defs": {"unused": _UNDECLARED_REQUIRED}}, "{}"),
+            (
+                {
+                    "type": "object",
+                    "dependentSchemas": {"unused": _UNDECLARED_REQUIRED},
+                },
+                "{}",
+            ),
+            (
+                {
+                    "type": "object",
+                    "maxProperties": 0,
+                    "properties": {"child": _UNDECLARED_REQUIRED},
+                },
+                "{}",
+            ),
+            ({"type": "array", "maxItems": 0, "items": _UNDECLARED_REQUIRED}, "[]"),
+        ],
+    )
+    def test_required_guard_preserves_enforced_and_unreachable_cases(
+        self, schema, text
+    ):
+        import regex
+        from outlines_core.json_schema import build_regex_from_schema
+
+        params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+        validate_xgrammar_grammar(params)
+        validate_structured_output_request_outlines(params)
+        assert grammar_accepts(schema, text)
+        assert regex.fullmatch(build_regex_from_schema(json.dumps(schema)), text)
+
+    @pytest.mark.parametrize(
+        "finite",
+        [
+            {"const": {}},
+            {"enum": [{"absent": 1}, {}]},
+            {"const": {"absent": 1}, "additionalProperties": False},
+        ],
+    )
+    @pytest.mark.parametrize(
+        "validate",
+        [validate_xgrammar_grammar, validate_structured_output_request_outlines],
+    )
+    def test_required_guard_rejects_finite_invalid_outputs(self, finite, validate):
+        schema = {**_UNDECLARED_REQUIRED, **finite}
+        with pytest.raises(VLLMValidationError, match="not supported by"):
+            validate(
+                SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+            )
+
+    @pytest.mark.parametrize(
+        "validate",
+        [validate_xgrammar_grammar, validate_structured_output_request_outlines],
+    )
     @pytest.mark.parametrize("as_string", [False, True])
     @pytest.mark.parametrize("additional", [True, False, {"type": "integer"}, None])
     @pytest.mark.parametrize(
         "shape", ["object", "nullable", "implicit", "empty", "missing", "nested"]
     )
     def test_undeclared_required_property_is_unsupported(
-        self, as_string, additional, shape
+        self, validate, as_string, additional, shape
     ):
         """Valid schemas must not silently lose required keys in XGrammar."""
         schema = {
@@ -462,8 +598,8 @@ class TestHasXGrammarUnsupportedJsonFeatures:
                 json=json.dumps(schema) if as_string else schema
             )
         )
-        with pytest.raises(VLLMValidationError, match="not supported by xgrammar"):
-            validate_xgrammar_grammar(params)
+        with pytest.raises(VLLMValidationError, match="not supported by"):
+            validate(params)
 
     @pytest.mark.parametrize(
         "schema",
@@ -472,6 +608,12 @@ class TestHasXGrammarUnsupportedJsonFeatures:
             {"type": "string", "required": ["absent"]},
             {"required": ["absent"], "const": {"absent": 1}},
             {"required": ["absent"], "enum": [{"absent": 1}, None]},
+            {"type": "object", "required": ["absent"], "const": {"absent": 1}},
+            {
+                "type": "object",
+                "required": ["absent"],
+                "enum": [{"absent": 1}, {"absent": 2}],
+            },
             {"const": {"required": ["absent"]}},
             {"enum": [{"required": ["absent"]}]},
             {"type": "object", "properties": {"required": {"type": "string"}}},

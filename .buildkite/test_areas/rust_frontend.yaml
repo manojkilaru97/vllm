@@ -37,7 +37,8 @@ steps:
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn
   - pytest -v -s benchmarks/test_serve_cli.py
   # The Rust frontend re-renders messages instead of reusing kv_transfer_params["prompt_token_ids"].
-  - pytest -v -s entrypoints/openai/chat_completion/test_chat_completion.py -k "not test_kv_transfer_prompt_token_ids_round_trip and not test_kv_transfer_prompt_token_ids_streaming"
+  # The undeclared-required guard is in Python backend validation, not the Rust validator.
+  - pytest -v -s entrypoints/openai/chat_completion/test_chat_completion.py -k "not test_kv_transfer_prompt_token_ids_round_trip and not test_kv_transfer_prompt_token_ids_streaming and not test_xgrammar_rejects_undeclared_required_property"
   - pytest -v -s entrypoints/openai/chat_completion/test_include_reasoning.py
   - pytest -v -s entrypoints/openai/chat_completion/test_chat_logit_bias_validation.py
   - pytest -v -s entrypoints/openai/chat_completion/test_chat_echo.py
