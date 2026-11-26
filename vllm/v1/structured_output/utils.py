@@ -45,14 +45,12 @@ _T = TypeVar("_T")
 CACHE = None
 
 
-def has_undeclared_required_keys(
-    schema: object, *, supports_object_bounds: bool
-) -> bool:
-    """Detect unenforced required keys in plain object/array schema trees.
+def has_undeclared_required_keys(schema: object) -> bool:
+    """Conservatively detect unsupported required keys in plain schema trees.
 
-    This is a capability check for XGrammar and Outlines, not schema validation.
-    References, composition, dependencies, and annotations are not traversed.
-    Object bounds prune children only for a backend that enforces those bounds.
+    This scans schema structure only: it never validates finite instances or
+    evaluates user patterns. Finite values, types, and count bounds do not
+    exempt child schemas. Excluded applicators deliberately stop child scans.
     """
     if not isinstance(schema, dict) or any(
         key in schema for key in ("$ref", "$dynamicRef", "allOf", "anyOf", "oneOf")
@@ -62,37 +60,22 @@ def has_undeclared_required_keys(
     properties = schema.get("properties", {})
     if not isinstance(required, list) or not isinstance(properties, dict):
         return False
-    missing = [
-        key for key in required if isinstance(key, str) and key not in properties
-    ]
-    # Both converters select finite values before processing object properties.
-    if "const" in schema or "enum" in schema:
-        from jsonschema.exceptions import SchemaError
-        from jsonschema.validators import validator_for
-        from referencing import Registry
-        from referencing.exceptions import Unresolvable
-
-        values = [schema["const"]] if "const" in schema else schema["enum"]
-        if not missing or not isinstance(values, list):
-            return False
-        try:
-            # An empty registry prevents fetching remote references.
-            validator_type = validator_for(schema)
-            validator_type.check_schema(schema)
-            validator = validator_type(schema, registry=Registry())
-            return any(not validator.is_valid(value) for value in values)
-        except (SchemaError, Unresolvable):
-            return False
     kind = schema.get("type")
     types = {kind} if isinstance(kind, str) else kind if isinstance(kind, list) else []
-    is_object = "object" in types or (
-        not types
-        and any(
-            key in schema
-            for key in ("properties", "additionalProperties", "unevaluatedProperties")
+    check_presence = (
+        "object" in types
+        or any(key in schema for key in ("properties", "const", "enum"))
+        or (
+            not types
+            and any(
+                key in schema
+                for key in ("additionalProperties", "unevaluatedProperties")
+            )
         )
     )
-    if is_object and missing:
+    if check_presence and any(
+        isinstance(key, str) and key not in properties for key in required
+    ):
         return True
     if any(
         key in schema
@@ -107,30 +90,14 @@ def has_undeclared_required_keys(
         )
     ):
         return False
-    if is_object and (not supports_object_bounds or schema.get("maxProperties") != 0):
-        limit = schema.get("maxProperties")
-        required_names = {key for key in required if isinstance(key, str)}
-        for name, child in properties.items():
-            if (
-                supports_object_bounds
-                and isinstance(limit, int)
-                and limit <= len(required_names)
-                and name not in required_names
-            ):
-                continue
-            if has_undeclared_required_keys(
-                child, supports_object_bounds=supports_object_bounds
-            ):
-                return True
-    is_array = "array" in types or (not types and "items" in schema)
-    if is_array and schema.get("maxItems") != 0:
-        items = schema.get("items")
-        # Tuple items and prefixItems have separate reachability rules.
-        if isinstance(items, dict) and "prefixItems" not in schema:
-            return has_undeclared_required_keys(
-                items, supports_object_bounds=supports_object_bounds
-            )
-    return False
+    if any(has_undeclared_required_keys(child) for child in properties.values()):
+        return True
+    items = schema.get("items")
+    return (
+        isinstance(items, dict)
+        and "prefixItems" not in schema
+        and has_undeclared_required_keys(items)
+    )
 
 
 def strip_speculative_padding(token_ids: list[int]) -> list[int]:

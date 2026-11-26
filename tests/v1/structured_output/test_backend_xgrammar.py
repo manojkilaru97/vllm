@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import subprocess
+import sys
 from importlib.resources import files
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -147,6 +150,63 @@ def test_auto_required_key_fallback_is_enforced(
 # ================================================
 # Unsupported schemas
 # ================================================
+
+
+@pytest.mark.parametrize("route", ["fast", "legacy"])
+@pytest.mark.parametrize("container", ["array", "object"])
+def test_auto_invalid_finite_parent_is_rejected(required_key_context, route, container):
+    model_config, fast, legacy = required_key_context
+    schema = (
+        {"type": "array", "items": _UNDECLARED_REQUIRED, "const": [{}]}
+        if container == "array"
+        else {
+            "type": "object",
+            "properties": {"child": _UNDECLARED_REQUIRED},
+            "const": {"child": {}},
+        }
+    )
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+    match = "Grammar error" if route == "fast" else "not supported by outlines"
+    with pytest.raises(VLLMValidationError, match=match):
+        params._validate_structured_outputs(
+            model_config,
+            StructuredOutputsConfig(backend="auto"),
+            fast if route == "fast" else legacy,
+        )
+
+
+def test_auto_finite_enum_guidance_filters_invalid_alternative(required_key_context):
+    model_config, fast, _ = required_key_context
+    schema = {
+        "type": "array",
+        "items": _UNDECLARED_REQUIRED,
+        "enum": [[{"absent": 1}], [{}]],
+    }
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+    params._validate_structured_outputs(
+        model_config, StructuredOutputsConfig(backend="auto"), fast
+    )
+    assert params.structured_outputs is not None
+    assert params.structured_outputs._backend == "guidance"
+    backend = GuidanceBackend(
+        VllmConfig(
+            structured_outputs_config=StructuredOutputsConfig(backend="guidance")
+        ),
+        tokenizer=fast,
+        vocab_size=len(fast),
+    )
+    for text, expected in [('[{"absent":1}]', True), ("[{}]", False)]:
+        grammar = backend.compile_grammar(
+            StructuredOutputOptions.JSON, json.dumps(schema)
+        )
+        assert isinstance(grammar, GuidanceGrammar)
+        accepted = (
+            grammar.accept_tokens(
+                "finite-enum", fast.encode(text, add_special_tokens=False)
+            )
+            and grammar.ll_matcher.is_accepting()
+        )
+        assert accepted == expected, text
 
 
 @pytest.fixture
@@ -548,11 +608,154 @@ def supported_allof_anyof_and_oneof():
 
 
 class TestHasXGrammarUnsupportedJsonFeatures:
+    def test_finite_guard_does_not_evaluate_catastrophic_python_regex(self):
+        """Bound a worker process so a backtracking regression cannot hang pytest."""
+        script = """
+import json
+from vllm.exceptions import VLLMValidationError
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
+
+print("finite-regex-ready", flush=True)
+payload = "a" * 34 + "!"
+pattern = "^(a+)+$"
+schemas = [
+    {"type": "string", "const": payload, "pattern": pattern},
+    {
+        "type": "object",
+        "properties": {"payload": {"type": "string", "pattern": pattern}},
+        "required": ["absent"],
+        "const": {"payload": payload},
+    },
+]
+rejected_undeclared = False
+for index, schema in enumerate(schemas):
+    try:
+        validate_xgrammar_grammar(
+            SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+        )
+    except VLLMValidationError as error:
+        if index == 1:
+            rejected_undeclared = "not supported by xgrammar" in str(error)
+print(json.dumps({
+    "completed": len(schemas),
+    "rejected_undeclared": rejected_undeclared,
+}))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[3],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        lines = result.stdout.splitlines()
+        assert "finite-regex-ready" in lines
+        assert json.loads(lines[-1]) == {
+            "completed": 2,
+            "rejected_undeclared": True,
+        }
+
+    @pytest.mark.parametrize(
+        "schema,invalid",
+        [
+            ({"type": "array", "items": _UNDECLARED_REQUIRED, "const": [{}]}, "[{}]"),
+            ({"items": _UNDECLARED_REQUIRED, "const": [{}]}, "[{}]"),
+            ({"type": "array", "items": _UNDECLARED_REQUIRED, "enum": [[{}]]}, "[{}]"),
+            (
+                {
+                    "type": "object",
+                    "properties": {"child": _UNDECLARED_REQUIRED},
+                    "const": {"child": {}},
+                },
+                '{"child":{}}',
+            ),
+            (
+                {
+                    "type": "object",
+                    "properties": {"child": _UNDECLARED_REQUIRED},
+                    "enum": [{"child": {}}],
+                },
+                '{"child":{}}',
+            ),
+            (
+                {
+                    "type": "array",
+                    "maxItems": 0,
+                    "items": _UNDECLARED_REQUIRED,
+                    "const": [{}],
+                },
+                "[{}]",
+            ),
+            (
+                {
+                    "type": "object",
+                    "maxProperties": 0,
+                    "properties": {"child": _UNDECLARED_REQUIRED},
+                    "const": {"child": {}},
+                },
+                '{"child":{}}',
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "validate",
+        [validate_xgrammar_grammar, validate_structured_output_request_outlines],
+    )
+    def test_finite_parent_cannot_hide_nested_required_keys(
+        self, schema, invalid, validate
+    ):
+        from jsonschema import Draft202012Validator
+
+        assert not Draft202012Validator(schema).is_valid(json.loads(invalid))
+        assert grammar_accepts(schema, invalid)
+        assert outlines_accepts(schema, invalid)
+        params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+        with pytest.raises(VLLMValidationError, match="not supported by"):
+            validate(params)
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            {
+                **_UNDECLARED_REQUIRED,
+                "properties": {"x": {"type": "integer"}},
+                "const": {"absent": 1},
+            },
+            {
+                **_UNDECLARED_REQUIRED,
+                "const": {"absent": 1},
+                "enum": [{"absent": 1}, {}],
+            },
+            {
+                "required": ["absent"],
+                "const": {"absent": 1},
+                "enum": [{"absent": 1}, {}],
+            },
+        ],
+    )
+    def test_outlines_finite_precedence_cannot_bypass_required_guard(self, schema):
+        from jsonschema import Draft202012Validator
+
+        assert Draft202012Validator(schema).is_valid({"absent": 1})
+        assert not Draft202012Validator(schema).is_valid({})
+        assert grammar_accepts(schema, '{"absent":1}')
+        assert not grammar_accepts(schema, "{}")
+        assert outlines_accepts(schema, "{}")
+        params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+        for validate in (
+            validate_xgrammar_grammar,
+            validate_structured_output_request_outlines,
+        ):
+            with pytest.raises(VLLMValidationError, match="not supported by"):
+                validate(params)
+
     @pytest.mark.parametrize("schema,valid,invalid", _BOUNDED_REQUIRED_OBJECTS)
-    def test_required_guard_respects_backend_object_bounds(
+    def test_required_guard_conservatively_scans_bounded_object_children(
         self, schema, valid, invalid
     ):
-        """Outlines reaches invalid children despite object-count bounds."""
+        """Count bounds no longer exempt children from the structural guard."""
         from jsonschema import Draft202012Validator
 
         validator = Draft202012Validator(schema)
@@ -563,9 +766,12 @@ class TestHasXGrammarUnsupportedJsonFeatures:
         assert outlines_accepts(schema, valid)
         assert outlines_accepts(schema, invalid)
         params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
-        validate_xgrammar_grammar(params)
-        with pytest.raises(VLLMValidationError, match="not supported by outlines"):
-            validate_structured_output_request_outlines(params)
+        for validate in (
+            validate_xgrammar_grammar,
+            validate_structured_output_request_outlines,
+        ):
+            with pytest.raises(VLLMValidationError, match="not supported by"):
+                validate(params)
 
     @pytest.mark.parametrize("schema,valid,invalid", _BOUNDED_REQUIRED_OBJECTS)
     @pytest.mark.parametrize("as_string", [False, True])
@@ -594,11 +800,15 @@ class TestHasXGrammarUnsupportedJsonFeatures:
                 model_config, StructuredOutputsConfig(backend="auto"), legacy
             )
 
-    def test_required_guard_preserves_enforced_array_bounds(self):
+    def test_required_guard_conservatively_scans_bounded_array_items(self):
         schema = {"type": "array", "maxItems": 0, "items": _UNDECLARED_REQUIRED}
         params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
-        validate_xgrammar_grammar(params)
-        validate_structured_output_request_outlines(params)
+        for validate in (
+            validate_xgrammar_grammar,
+            validate_structured_output_request_outlines,
+        ):
+            with pytest.raises(VLLMValidationError, match="not supported by"):
+                validate(params)
         for accepts in (grammar_accepts, outlines_accepts):
             assert accepts(schema, "[]")
             assert not accepts(schema, "[{}]")
@@ -611,6 +821,62 @@ class TestHasXGrammarUnsupportedJsonFeatures:
                 {**_UNDECLARED_REQUIRED, "enum": [{"absent": 1}, {"absent": 2}]},
                 '{"absent":1}',
             ),
+            (
+                {
+                    "type": "array",
+                    "items": _UNDECLARED_REQUIRED,
+                    "const": [{"absent": 1}],
+                },
+                '[{"absent":1}]',
+            ),
+            (
+                {
+                    "type": "array",
+                    "items": _UNDECLARED_REQUIRED,
+                    "enum": [[{"absent": 1}]],
+                },
+                '[{"absent":1}]',
+            ),
+            (
+                {"type": "string", "items": _UNDECLARED_REQUIRED, "const": "valid"},
+                '"valid"',
+            ),
+        ],
+    )
+    def test_finite_values_do_not_exempt_required_constraints(self, schema, text):
+        """Valid finite values deliberately get no request-time proof exception."""
+        from jsonschema import Draft202012Validator
+
+        assert Draft202012Validator(schema).is_valid(json.loads(text))
+        assert grammar_accepts(schema, text)
+        assert outlines_accepts(schema, text)
+        params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+        for validate in (
+            validate_xgrammar_grammar,
+            validate_structured_output_request_outlines,
+        ):
+            with pytest.raises(VLLMValidationError, match="not supported by"):
+                validate(params)
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            {"required": ["absent"], "const": {"absent": 1}},
+            {"required": ["absent"], "enum": [{"absent": 1}, None]},
+        ],
+    )
+    def test_untyped_finite_required_entries_are_conservatively_rejected(self, schema):
+        params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+        for validate in (
+            validate_xgrammar_grammar,
+            validate_structured_output_request_outlines,
+        ):
+            with pytest.raises(VLLMValidationError, match="not supported by"):
+                validate(params)
+
+    @pytest.mark.parametrize(
+        "schema,text",
+        [
             ({"type": "object", "x-annotation": _UNDECLARED_REQUIRED}, "{}"),
             ({"type": "object", "$defs": {"unused": _UNDECLARED_REQUIRED}}, "{}"),
             (
@@ -693,14 +959,6 @@ class TestHasXGrammarUnsupportedJsonFeatures:
         [
             {"type": "object", "properties": {"absent": {}}, "required": ["absent"]},
             {"type": "string", "required": ["absent"]},
-            {"required": ["absent"], "const": {"absent": 1}},
-            {"required": ["absent"], "enum": [{"absent": 1}, None]},
-            {"type": "object", "required": ["absent"], "const": {"absent": 1}},
-            {
-                "type": "object",
-                "required": ["absent"],
-                "enum": [{"absent": 1}, {"absent": 2}],
-            },
             {"const": {"required": ["absent"]}},
             {"enum": [{"required": ["absent"]}]},
             {"type": "object", "properties": {"required": {"type": "string"}}},

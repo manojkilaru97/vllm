@@ -62,24 +62,34 @@ text.
 
 The Python frontend rejects plain object JSON schemas with `required` names
 outside their `properties` map when using `xgrammar` or `outlines`: both
-converters can silently drop these constraints. Finite `const`/`enum` schemas
-remain usable when every emitted value satisfies the schema. In `auto` mode,
-Guidance enforces or rejects the constraint; the Outlines fallback used by
-non-Tekken Mistral tokenizers rejects it. This applies to
+converters can silently drop these constraints. Neither backend receives a
+finite `const`/`enum` exemption. The guard inspects schema structure only; it
+does not validate finite instances or run their regex patterns. In `auto`
+mode, Guidance enforces or rejects the constraint; the Outlines fallback used
+by non-Tekken Mistral tokenizers rejects it. This applies to
 `structured_outputs.json` and `response_format` JSON schemas.
 
 These are valid JSON Schemas; satisfiability depends on `additionalProperties`
 and other constraints. Upgrading XGrammar to 0.2.9 does not fix its converter.
-The guard covers the root and nested named `properties` and homogeneous
-array `items`. Object-count bounds prune unreachable children only for
-XGrammar, which enforces those bounds. Outlines ignores object-count bounds,
-so the guard still examines those children on the Outlines path. A zero
-`maxItems` can prune array items for both backends. The guard does not follow
-references, composition (`anyOf`, `oneOf`, `allOf`), dependencies, or other
-applicators. In particular, type-less `$ref`/`anyOf` object selection and
-schemas containing only `required` remain outside this mitigation.
-Structural-tag schemas and the independent Rust frontend validator are also
-outside its scope.
+The guard scans named `properties` and homogeneous array `items` without
+using finite values, count bounds, or declared container types to prove
+children unreachable. It can therefore reject valid finite schemas with
+undeclared `required` entries, and otherwise valid schemas whose inactive
+`properties` or `items` children contain those entries. These are
+unsupported-schema errors, not claims that the schema is invalid.
+
+The guard has explicit subtree exclusions. References (`$ref`, `$dynamicRef`)
+and composition (`anyOf`, `oneOf`, `allOf`) exclude their entire schema object,
+including sibling constraints. After checking direct required entries, a
+schema object containing a dependency or conditional keyword (such as
+`dependentSchemas`, `dependentRequired`, `dependencies`, `not`, `if`, `then`,
+or `else`) skips all child scans, including sibling `properties` and `items`.
+A `prefixItems` keyword skips both its own tuple schemas and that node's
+`items` subtree; named `properties` siblings are still scanned. Other
+applicator subtrees, definitions, and annotations are not traversed.
+Consequently, type-less `$ref`/`anyOf` object selection and schemas containing
+only `required` remain outside this mitigation. Structural-tag schemas and
+the independent Rust frontend validator are also outside its scope.
 
 Now let's see an example for each of the cases, starting with the `choice`, as it's the easiest one:
 
